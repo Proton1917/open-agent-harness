@@ -18,10 +18,10 @@ pub struct WriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Creates a new file or replaces a fully-read file. Rejects stale writes if the file changed after Read."
     }
     fn input_schema(&self) -> Value {

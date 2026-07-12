@@ -22,10 +22,10 @@ pub struct GlobTool;
 
 #[async_trait]
 impl Tool for GlobTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Glob"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Finds files by glob pattern, returning up to 100 paths relative to the working directory."
     }
     fn input_schema(&self) -> Value {
@@ -54,7 +54,7 @@ impl Tool for GlobTool {
         let input: Input = parse_input(input)?;
         let root = match input.path {
             Some(path) => context.resolve_path(&path)?,
-            None => context.cwd.clone(),
+            None => context.cwd(),
         };
         if !root.is_dir() {
             bail!("搜索根目录不存在或不是目录: {}", root.display())
@@ -121,7 +121,7 @@ fn include_entry(entry: &DirEntry) -> bool {
 }
 
 fn display_relative(context: &ToolContext, path: &std::path::Path) -> String {
-    path.strip_prefix(&context.cwd)
+    path.strip_prefix(context.cwd())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| path.display().to_string())
 }

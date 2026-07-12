@@ -23,6 +23,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::process::{ProcessTreeGuard, terminate_process_tree};
+
 use super::{
     BackgroundTask, Tool, ToolContext, ToolOutput, ensure_private_directory, object_schema,
     parse_input,
@@ -49,11 +51,11 @@ pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Bash"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Executes a shell command in the working directory with timeout support. Long commands may run in the background."
     }
 
@@ -102,7 +104,7 @@ impl Tool for BashTool {
             bail!("command 不能为空")
         }
         let _description = input.description;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let shell = default_shell();
         if input.run_in_background {
             return spawn_background(context, &shell, input.command).await;
         }
@@ -112,7 +114,7 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
         let (output_path, output_file) = create_private_output("foreground")?;
-        let mut command = shell_command(&shell, &input.command, &context.cwd);
+        let mut command = shell_command(&shell, &input.command, &context.cwd());
         let (mut child, drains, capture_truncated) =
             match spawn_captured(&mut command, output_file).await {
                 Ok(spawned) => spawned,
@@ -122,14 +124,18 @@ impl Tool for BashTool {
                 }
             };
         let process_group_id = child.id();
+        let mut process_guard = ProcessTreeGuard::new(process_group_id);
         let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
             Ok(status) => Some(status.context("等待 shell 命令失败")?),
             Err(_) => {
-                terminate_child(&mut child, process_group_id).await;
+                process_guard.terminate();
+                let _ = child.start_kill();
+                let _ = child.wait().await;
                 None
             }
         };
         await_foreground_drains(drains, process_group_id).await;
+        process_guard.disarm();
         let capture_was_truncated = capture_truncated.load(Ordering::Relaxed);
         let (mut preview, preview_truncated, size) =
             read_output_preview(&output_path, MAX_OUTPUT_BYTES)?;
@@ -185,7 +191,7 @@ async fn spawn_background(
     }
     let id = Uuid::new_v4().to_string();
     let (output_path, output_file) = create_private_output(&id)?;
-    let mut command = shell_command(shell, &command_text, &context.cwd);
+    let mut command = shell_command(shell, &command_text, &context.cwd());
     let (child, drains, output_truncated) = match spawn_captured(&mut command, output_file).await {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -217,9 +223,24 @@ async fn spawn_background(
 
 fn shell_command(shell: &str, command_text: &str, cwd: &Path) -> Command {
     let mut command = Command::new(shell);
+    #[cfg(windows)]
+    {
+        let executable = Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(shell)
+            .to_ascii_lowercase();
+        if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
+            command.args(["-NoProfile", "-NonInteractive", "-Command", command_text]);
+        } else if executable == "cmd" || executable == "cmd.exe" {
+            command.args(["/D", "/S", "/C", command_text]);
+        } else {
+            command.args(["-lc", command_text]);
+        }
+    }
+    #[cfg(not(windows))]
+    command.args(["-lc", command_text]);
     command
-        .arg("-lc")
-        .arg(command_text)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -229,6 +250,19 @@ fn shell_command(shell: &str, command_text: &str, cwd: &Path) -> Command {
     #[cfg(unix)]
     command.process_group(0);
     command
+}
+
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC")
+            .or_else(|_| std::env::var("SHELL"))
+            .unwrap_or_else(|_| "cmd.exe".to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
+    }
 }
 
 async fn spawn_captured(
@@ -287,7 +321,7 @@ async fn await_foreground_drains(mut drains: Vec<JoinHandle<()>>, process_group_
             .await
             .is_err()
         {
-            kill_process_group(process_group_id);
+            terminate_process_tree(process_group_id);
             for drain in drains.iter_mut().skip(index) {
                 let _ = timeout(Duration::from_secs(1), &mut *drain).await;
                 drain.abort();
@@ -299,38 +333,29 @@ async fn await_foreground_drains(mut drains: Vec<JoinHandle<()>>, process_group_
 
 pub(super) async fn terminate_task(task: &mut BackgroundTask) {
     let child_running = task.child.try_wait().ok().flatten().is_none();
-    let drains_running = task.drains.iter().any(|drain| !drain.is_finished());
-    if child_running || drains_running {
-        kill_process_group(task.process_group_id);
+    let mut tree_terminated = false;
+    if child_running {
+        terminate_process_tree(task.process_group_id);
+        tree_terminated = true;
         let _ = task.child.start_kill();
         let _ = task.child.wait().await;
     }
     let drains = std::mem::take(&mut task.drains);
     for mut drain in drains {
-        let _ = timeout(Duration::from_secs(1), &mut drain).await;
+        if timeout(Duration::from_millis(100), &mut drain)
+            .await
+            .is_err()
+        {
+            if !tree_terminated {
+                terminate_process_tree(task.process_group_id);
+                tree_terminated = true;
+                let _ = task.child.start_kill();
+                let _ = task.child.wait().await;
+            }
+            let _ = timeout(Duration::from_secs(1), &mut drain).await;
+        }
         drain.abort();
     }
-}
-
-async fn terminate_child(child: &mut Child, process_group_id: Option<u32>) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
-    kill_process_group(process_group_id);
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-fn kill_process_group(process_group_id: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(group) = process_group_id {
-        // SAFETY: commands are placed in a dedicated process group at spawn time.
-        unsafe {
-            libc::kill(-(group as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = process_group_id;
 }
 
 fn create_private_output(prefix: &str) -> Result<(PathBuf, File)> {

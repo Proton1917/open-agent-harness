@@ -21,10 +21,10 @@ pub struct EditTool;
 
 #[async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Performs an exact string replacement in a fully-read file, with uniqueness and stale-read checks."
     }
     fn input_schema(&self) -> Value {

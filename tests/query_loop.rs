@@ -43,6 +43,11 @@ async fn query_engine_round_trips_tool_use_and_result() {
 
     let temp = tempdir().unwrap();
     std::fs::write(temp.path().join("fixture.txt"), "rust migration evidence\n").unwrap();
+    std::fs::write(
+        temp.path().join("AGENTS.md"),
+        "workspace-system-context-marker",
+    )
+    .unwrap();
     let client = ModelClient::new(EndpointConfig {
         token: Some("test-key".into()),
         base_url: format!("http://{address}"),
@@ -59,6 +64,7 @@ async fn query_engine_round_trips_tool_use_and_result() {
             Vec::new(),
         ),
     );
+    context.reload_workspace_context().await.unwrap();
     let deltas = Arc::new(Mutex::new(String::new()));
     let captured_deltas = Arc::clone(&deltas);
     let mut engine = QueryEngine::new(
@@ -89,6 +95,12 @@ async fn query_engine_round_trips_tool_use_and_result() {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["model"], "test-model");
+    assert!(
+        requests[0]["system"]
+            .as_str()
+            .unwrap()
+            .contains("workspace-system-context-marker")
+    );
     let second = serde_json::to_string(&requests[1]).unwrap();
     assert!(second.contains("tool_result"));
     assert!(second.contains("rust migration evidence"));
@@ -283,6 +295,7 @@ fn text_stream() -> String {
     .collect()
 }
 
+#[cfg(unix)]
 fn background_tool_stream() -> String {
     [
         serde_json::json!({"type":"message_start","message":{"id":"msg_background","usage":{}}}),

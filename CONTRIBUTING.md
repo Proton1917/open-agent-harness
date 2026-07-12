@@ -67,6 +67,7 @@ The repository-level `.cargo/config.toml` promotes every compiler warning to an 
 
 ```bash
 cargo fmt --all -- --check
+cargo +1.85.0 check --locked --all-targets
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
@@ -161,6 +162,7 @@ By submitting a contribution, you agree that your original contribution is licen
 
 ```bash
 cargo fmt --all -- --check
+cargo +1.85.0 check --locked --all-targets
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release

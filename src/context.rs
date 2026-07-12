@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
 
 const MAX_INSTRUCTION_BYTES: u64 = 256 * 1024;
+const MAX_INSTRUCTION_FILES: usize = 64;
+const MAX_TOTAL_INSTRUCTION_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionFile {
@@ -85,6 +87,18 @@ pub async fn discover_agent_instructions(cwd: &Path, bare: bool) -> Result<Vec<I
         let content = String::from_utf8(bytes)
             .with_context(|| format!("工程指令不是有效 UTF-8: {}", path.display()))?;
         if !content.trim().is_empty() {
+            let next_total = instructions
+                .iter()
+                .map(|entry| entry.content.len())
+                .sum::<usize>()
+                .saturating_add(content.len());
+            if instructions.len() >= MAX_INSTRUCTION_FILES
+                || next_total > MAX_TOTAL_INSTRUCTION_BYTES
+            {
+                anyhow::bail!(
+                    "工程指令超过 {MAX_INSTRUCTION_FILES} 个文件或 {MAX_TOTAL_INSTRUCTION_BYTES} 字节总限制"
+                );
+            }
             instructions.push(InstructionFile { path, content });
         }
     }

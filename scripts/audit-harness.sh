@@ -3,6 +3,14 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
+for required in cargo file git jq rg strings; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    printf 'missing_audit_dependency=%s\n' "$required" >&2
+    exit 1
+  fi
+done
+echo 'audit_dependencies_present=true'
+
 if [[ "$(basename "$root")" != "open-agent-harness" ]]; then
   echo 'project_directory_name_valid=false' >&2
   exit 1
@@ -34,8 +42,36 @@ if [[ -n "$non_rust_runtime" ]]; then
 fi
 echo 'runtime_is_rust=true'
 
+unexpected_core_sources="$({
+  git -C "$root" ls-files \
+    | rg '\.(py|pyi|js|jsx|ts|tsx|go|c|cc|cpp|cxx|swift|java|kt|kts|rb|php|lua)$' \
+    | rg -v '^(scripts/|tests/fixtures/)' || true
+})"
+if [[ -n "$unexpected_core_sources" ]]; then
+  printf 'unexpected_non_rust_core_sources=%s\n' "$unexpected_core_sources" >&2
+  exit 1
+fi
+
+non_rust_code_lines=0
+while IFS= read -r helper; do
+  [[ -n "$helper" && -f "$root/$helper" ]] || continue
+  lines="$(wc -l < "$root/$helper" | tr -d ' ')"
+  non_rust_code_lines=$((non_rust_code_lines + lines))
+done < <(
+  git -C "$root" ls-files \
+    | rg '\.(sh|bash|zsh|py|pyi|js|jsx|ts|tsx|go|c|cc|cpp|cxx|swift|java|kt|kts|rb|php|lua)$' || true
+)
+if (( rust_lines < non_rust_code_lines * 4 )); then
+  printf 'rust_primary=false rust_lines=%s helper_lines=%s\n' "$rust_lines" "$non_rust_code_lines" >&2
+  exit 1
+fi
+printf 'helper_code_lines=%s\n' "$non_rust_code_lines"
+echo 'rust_primary=true'
+
 if ! rg -q 'rustflags = \["-D", "warnings"\]' "$root/.cargo/config.toml" \
-  || ! rg -q 'RUSTFLAGS: -D warnings' "$root/.github/workflows/ci.yml"; then
+  || ! rg -q 'RUSTFLAGS: -D warnings' "$root/.github/workflows/ci.yml" \
+  || ! rg -q 'rust-version = "1\.85"' "$root/Cargo.toml" \
+  || ! rg -q 'cargo \+1\.85\.0 check --locked --all-targets' "$root/.github/workflows/ci.yml"; then
   echo 'warnings_are_errors=false' >&2
   exit 1
 fi
@@ -47,7 +83,7 @@ if rg -n \
   -e 'unimplemented!\(' \
   -e 'dbg!\(' \
   -e '\b(TODO|FIXME|XXX)\b' \
-  "$root/src"; then
+  "$root/src" "$root/tests"; then
   echo 'source_quality_shortcut_free=false' >&2
   exit 1
 fi
@@ -94,6 +130,13 @@ if [[ -n "$(git -C "$root" ls-files reference)" ]]; then
   exit 1
 fi
 echo 'reference_untracked=true'
+if git -C "$root" rev-list --objects --all \
+  | sed -n 's/^[0-9a-f][0-9a-f]* //p' \
+  | rg -q '^reference/'; then
+  echo 'reference_absent_from_history=false' >&2
+  exit 1
+fi
+echo 'reference_absent_from_history=true'
 
 if [[ -n "$(git -C "$root" ls-files 'AGENTS.md' '**/AGENTS.md')" ]] \
   || ! git -C "$root" check-ignore --no-index -q AGENTS.md; then
@@ -116,7 +159,10 @@ fi
 echo 'reference_clean=true'
 
 if rg -n 'https?://' "$root/src" \
-  | rg -v -e 'http://127\.0\.0\.1:8080' -e 'https?://[^[:space:]\"]*\.invalid'; then
+  | rg -v \
+    -e 'http://127\.0\.0\.1(:[0-9]+)?' \
+    -e 'http://\{address\}' \
+    -e 'https?://[^[:space:]\"]*\.invalid'; then
   echo 'hardcoded_remote_endpoint_free=false' >&2
   exit 1
 fi
@@ -140,6 +186,37 @@ for term in "${sensitive_runtime_terms[@]}"; do
 done
 echo 'hidden_metadata_free=true'
 
+if git -C "$root" ls-files -z \
+  | xargs -0 rg -n -I \
+    -e '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' \
+    -e '\bAKIA[0-9A-Z]{16}\b' \
+    -e '\bgh[pousr]_[A-Za-z0-9]{30,}\b' \
+    -e 'Bearer[[:space:]]+[A-Za-z0-9._=-]{24,}'; then
+  echo 'tracked_secret_pattern_free=false' >&2
+  exit 1
+fi
+echo 'tracked_secret_pattern_free=true'
+
+missing_licenses="$(
+  cargo metadata --locked --format-version 1 \
+    | jq -r '.packages[] | select(.source != null and ((.license // "") == "")) | .name'
+)"
+if [[ -n "$missing_licenses" ]]; then
+  printf 'dependency_license_missing=%s\n' "$missing_licenses" >&2
+  exit 1
+fi
+echo 'dependency_licenses_declared=true'
+
+non_open_licenses="$(
+  cargo metadata --locked --format-version 1 \
+    | jq -r '.packages[] | select(.source != null) | select((.license // "") | test("BUSL|SSPL|Commons-Clause|Elastic-License|LicenseRef|Proprietary|UNLICENSED"; "i")) | "\(.name):\(.license)"'
+)"
+if [[ -n "$non_open_licenses" ]]; then
+  printf 'dependency_license_rejected=%s\n' "$non_open_licenses" >&2
+  exit 1
+fi
+echo 'dependency_licenses_open=true'
+
 while IFS= read -r tracked; do
   [[ -f "$root/$tracked" ]] || continue
   size="$(wc -c < "$root/$tracked" | tr -d ' ')"
@@ -147,5 +224,12 @@ while IFS= read -r tracked; do
     printf 'tracked_file_too_large=%s:%s\n' "$tracked" "$size" >&2
     exit 1
   fi
+  kind="$(file -b "$root/$tracked")"
+  if printf '%s\n' "$kind" \
+    | rg -q '(^| )(ELF|Mach-O|PE32|shared object|current ar archive|Java class data|WebAssembly|Zip archive|7-zip archive|Zstandard compressed data|gzip compressed data)'; then
+    printf 'tracked_opaque_artifact=%s:%s\n' "$tracked" "$kind" >&2
+    exit 1
+  fi
 done < <(git -C "$root" ls-files)
 echo 'tracked_files_open_source_sized=true'
+echo 'tracked_opaque_artifact_free=true'

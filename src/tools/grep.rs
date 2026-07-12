@@ -65,11 +65,11 @@ pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Grep"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Searches text file contents with Rust regexes. Supports content, files_with_matches, and count modes plus pagination."
     }
 
@@ -115,7 +115,7 @@ impl Tool for GrepTool {
         let input: Input = parse_input(input)?;
         let root = match &input.path {
             Some(path) => context.resolve_path(path)?,
-            None => context.cwd.clone(),
+            None => context.cwd(),
         };
         if !root.exists() {
             bail!("搜索路径不存在: {}", context.display_path(&root))
@@ -126,7 +126,7 @@ impl Tool for GrepTool {
                 context.display_path(&root)
             )
         }
-        let cwd = context.cwd.clone();
+        let cwd = context.cwd();
         let result = tokio::task::spawn_blocking(move || search(root, cwd, input))
             .await
             .context("Rust Grep worker 失败")??;
@@ -298,13 +298,13 @@ fn scan_candidate(
 }
 
 fn matches_filters(path: &Path, relative: &Path, options: &SearchOptions) -> bool {
-    if let Some(glob) = &options.glob
-        && !glob.is_match(relative)
-        && !path
+    if let Some(glob) = &options.glob {
+        let file_name_matches = path
             .file_name()
-            .is_some_and(|file_name| glob.is_match(Path::new(file_name)))
-    {
-        return false;
+            .is_some_and(|file_name| glob.is_match(Path::new(file_name)));
+        if !glob.is_match(relative) && !file_name_matches {
+            return false;
+        }
     }
     options
         .kind
@@ -590,8 +590,8 @@ fn display_path(path: &Path, cwd: &Path) -> String {
             relative.display().to_string()
         };
     }
-    if let Some(home) = dirs::home_dir()
-        && let Ok(relative) = path.strip_prefix(home)
+    if let Some(relative) =
+        dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
     {
         return format!("~/{}", relative.display());
     }

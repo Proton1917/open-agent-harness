@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use open_agent_harness::{
     permissions::{PermissionManager, PermissionMode},
     skills::discover_skills,
@@ -199,12 +197,12 @@ async fn bash_captures_stdout_stderr_and_exit_status() {
     let temp = tempdir().unwrap();
     let context = context(temp.path());
     let registry = ToolRegistry::default();
+    #[cfg(windows)]
+    let command = "echo ok & echo problem 1>&2 & exit /b 7";
+    #[cfg(not(windows))]
+    let command = "printf ok; printf problem >&2; exit 7";
     let output = registry
-        .execute(
-            &context,
-            "Bash",
-            json!({"command": "printf ok; printf problem >&2; exit 7"}),
-        )
+        .execute(&context, "Bash", json!({"command": command}))
         .await;
     assert!(output.is_error);
     assert!(output.content.contains("ok"));
@@ -215,15 +213,10 @@ async fn bash_captures_stdout_stderr_and_exit_status() {
 #[tokio::test]
 async fn default_noninteractive_permissions_deny_mutation() {
     let temp = tempdir().unwrap();
-    let context = ToolContext {
-        permissions: Arc::new(PermissionManager::new(
-            PermissionMode::Default,
-            false,
-            Vec::new(),
-            Vec::new(),
-        )),
-        ..context(temp.path())
-    };
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+    );
     let output = ToolRegistry::default()
         .execute(
             &context,
@@ -238,11 +231,11 @@ async fn default_noninteractive_permissions_deny_mutation() {
 #[tokio::test]
 async fn todo_and_persistent_tasks_work_without_permission_prompts() {
     let temp = tempdir().unwrap();
-    let mut context = ToolContext::new(
+    let context = ToolContext::new(
         temp.path().to_owned(),
         PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
     );
-    context.task_store_path = temp.path().join("tasks.json");
+    context.set_task_store_path(temp.path().join("tasks.json"));
     let registry = ToolRegistry::default();
 
     let todo = registry
@@ -289,12 +282,12 @@ async fn todo_and_persistent_tasks_work_without_permission_prompts() {
         .execute(&context, "TaskGet", json!({"taskId":"2"}))
         .await;
     assert!(fetched.content.contains("Blocked by: #1"));
-    assert!(context.task_store_path.exists());
+    assert!(context.task_store_path().exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(&context.task_store_path)
+            std::fs::metadata(context.task_store_path())
                 .unwrap()
                 .permissions()
                 .mode()
@@ -311,8 +304,8 @@ async fn todo_and_persistent_tasks_work_without_permission_prompts() {
 #[tokio::test]
 async fn task_relations_reject_missing_or_self_targets() {
     let temp = tempdir().unwrap();
-    let mut context = context(temp.path());
-    context.task_store_path = temp.path().join("tasks.json");
+    let context = context(temp.path());
+    context.set_task_store_path(temp.path().join("tasks.json"));
     let registry = ToolRegistry::default();
     registry
         .execute(
@@ -543,12 +536,12 @@ async fn notebook_edit_replaces_inserts_and_deletes_cells() {
 #[tokio::test]
 async fn bash_large_output_is_bounded_and_retained_privately() {
     let temp = tempdir().unwrap();
+    #[cfg(windows)]
+    let command = "for /L %i in (1,1,10000) do @echo 0123456789";
+    #[cfg(not(windows))]
+    let command = "yes 0123456789 | head -c 100000";
     let output = ToolRegistry::default()
-        .execute(
-            &context(temp.path()),
-            "Bash",
-            json!({"command":"yes 0123456789 | head -c 100000"}),
-        )
+        .execute(&context(temp.path()), "Bash", json!({"command":command}))
         .await;
     assert!(!output.is_error, "{}", output.content);
     assert!(output.content.len() < 32_000);
@@ -563,7 +556,7 @@ async fn bash_large_output_is_bounded_and_retained_privately() {
         .unwrap()
         .join(retained.trim_start_matches("~/"));
     let metadata = std::fs::metadata(&retained).unwrap();
-    assert_eq!(metadata.len(), 100_000);
+    assert!((100_000..=8 * 1024 * 1024).contains(&metadata.len()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -597,6 +590,78 @@ async fn bash_timeout_terminates_descendant_processes() {
         wait_for_process_exit(pid).await,
         "descendant process {pid} survived timeout"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_foreground_bash_terminates_descendant_processes() {
+    let temp = tempdir().unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+    let execution = tokio::spawn({
+        let context = context.clone();
+        let registry = registry.clone();
+        async move {
+            registry
+                .execute(
+                    &context,
+                    "Bash",
+                    json!({
+                        "command":"sh -c 'sleep 30 & echo $! > cancelled.pid; wait'"
+                    }),
+                )
+                .await
+        }
+    });
+    let pid_path = temp.path().join("cancelled.pid");
+    for _ in 0..100 {
+        if pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    execution.abort();
+    let _ = execution.await;
+    assert!(
+        wait_for_process_exit(pid).await,
+        "foreground descendant process {pid} survived task cancellation"
+    );
+}
+
+#[tokio::test]
+async fn task_output_blocks_until_background_command_finishes() {
+    let temp = tempdir().unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+    let started = registry
+        .execute(
+            &context,
+            "Bash",
+            json!({"command":"echo task-output-ready","run_in_background":true}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let task_id = started
+        .content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Command running in background with ID: "))
+        .unwrap();
+    let output = registry
+        .execute(
+            &context,
+            "TaskOutput",
+            json!({"task_id":task_id,"block":true,"timeout":5000}),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("completed"));
+    assert!(output.content.contains("task-output-ready"));
 }
 
 #[cfg(unix)]
@@ -656,8 +721,8 @@ async fn local_skill_loads_text_without_executing_bundled_files() {
     )
     .unwrap();
     std::fs::write(skill_root.join("must-not-run.sh"), "touch executed").unwrap();
-    let mut context = context(temp.path());
-    context.skills = Arc::new(discover_skills(temp.path(), false).unwrap());
+    let context = context(temp.path());
+    context.set_skills(discover_skills(temp.path(), false).unwrap());
     let output = ToolRegistry::default()
         .execute(
             &context,

@@ -1,2 +1,5 @@
 [build]
 rustflags = ["-D", "warnings"]
+
+[resolver]
+incompatible-rust-versions = "fallback"

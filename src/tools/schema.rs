@@ -15,20 +15,23 @@ fn validate_at(schema: &Value, input: &Value, path: String) -> Result<(), String
         return Err(format!("{path}: 不匹配 anyOf 中的任何 schema"));
     }
 
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
-        && !allowed.iter().any(|value| value == input)
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|allowed| !allowed.iter().any(|value| value == input))
     {
         return Err(format!("{path}: 值不在允许的枚举中"));
     }
 
-    if let Some(expected) = schema.get("type")
-        && !matches_type(expected, input)
-    {
-        return Err(format!(
-            "{path}: 期望 {}，实际为 {}",
-            render_expected_type(expected),
-            actual_type(input)
-        ));
+    match schema.get("type") {
+        Some(expected) if !matches_type(expected, input) => {
+            return Err(format!(
+                "{path}: 期望 {}，实际为 {}",
+                render_expected_type(expected),
+                actual_type(input)
+            ));
+        }
+        _ => {}
     }
 
     match input {
@@ -39,13 +42,17 @@ fn validate_at(schema: &Value, input: &Value, path: String) -> Result<(), String
             let number = value
                 .as_f64()
                 .ok_or_else(|| format!("{path}: 数字无法表示"))?;
-            if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
-                && number < minimum
+            if let Some(minimum) = schema
+                .get("minimum")
+                .and_then(Value::as_f64)
+                .filter(|minimum| number < *minimum)
             {
                 return Err(format!("{path}: 必须大于或等于 {minimum}"));
             }
-            if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
-                && number > maximum
+            if let Some(maximum) = schema
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .filter(|maximum| number > *maximum)
             {
                 return Err(format!("{path}: 必须小于或等于 {maximum}"));
             }
@@ -85,13 +92,17 @@ fn validate_object(
 }
 
 fn validate_array(schema: &Value, items: &[Value], path: &str) -> Result<(), String> {
-    if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
-        && items.len() < minimum as usize
+    if let Some(minimum) = schema
+        .get("minItems")
+        .and_then(Value::as_u64)
+        .filter(|minimum| items.len() < *minimum as usize)
     {
         return Err(format!("{path}: 至少需要 {minimum} 项"));
     }
-    if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
-        && items.len() > maximum as usize
+    if let Some(maximum) = schema
+        .get("maxItems")
+        .and_then(Value::as_u64)
+        .filter(|maximum| items.len() > *maximum as usize)
     {
         return Err(format!("{path}: 最多允许 {maximum} 项"));
     }
@@ -105,13 +116,17 @@ fn validate_array(schema: &Value, items: &[Value], path: &str) -> Result<(), Str
 
 fn validate_string(schema: &Value, value: &str, path: &str) -> Result<(), String> {
     let length = value.chars().count();
-    if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
-        && length < minimum as usize
+    if let Some(minimum) = schema
+        .get("minLength")
+        .and_then(Value::as_u64)
+        .filter(|minimum| length < *minimum as usize)
     {
         return Err(format!("{path}: 长度至少为 {minimum}"));
     }
-    if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
-        && length > maximum as usize
+    if let Some(maximum) = schema
+        .get("maxLength")
+        .and_then(Value::as_u64)
+        .filter(|maximum| length > *maximum as usize)
     {
         return Err(format!("{path}: 长度最多为 {maximum}"));
     }

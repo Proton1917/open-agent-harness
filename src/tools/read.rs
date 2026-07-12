@@ -43,10 +43,10 @@ pub struct ReadTool;
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Reads a text file with 1-based line numbers. Use offset and limit for targeted ranges."
     }
     fn input_schema(&self) -> Value {

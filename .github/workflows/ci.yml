@@ -9,6 +9,22 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.85 minimum-version check
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install declared minimum Rust
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Check every target without warnings
+        run: cargo +1.85.0 check --locked --all-targets
+
   rust:
     name: Rust source and release audit
     runs-on: ubuntu-latest
@@ -25,7 +41,7 @@ jobs:
       - name: Install repository audit tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ripgrep
+          sudo apt-get install --yes file jq ripgrep
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
@@ -41,3 +57,26 @@ jobs:
 
       - name: Audit tracked source and release artifact
         run: scripts/audit-harness.sh
+
+  portable:
+    name: Zero-warning ${{ matrix.os }} build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Run all tests without warnings
+        run: cargo test --locked --all-targets
+
+      - name: Run clippy without warnings
+        run: cargo clippy --locked --all-targets -- -D warnings

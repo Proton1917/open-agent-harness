@@ -15,16 +15,21 @@ use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 
 use open_agent_harness::{
+    agents::configure_agents,
     api::ModelClient,
     cli::{Cli, OutputFormat},
     commands::{self, CommandOutcome},
     config::{DEFAULT_MODEL, EndpointConfig, Settings, endpoint_config},
-    context::{discover_agent_instructions, render_agent_instructions},
+    hooks::HookRunner,
+    lsp::configure_lsp,
+    mcp::connect_mcp,
     permissions::{PermissionManager, PermissionMode},
+    plan::plan_tools,
     query::{QueryEngine, QueryOptions, TextDeltaSink, default_system_prompt},
     session::SessionStore,
-    skills::{discover_skills, render_skill_index},
     tools::{ToolContext, ToolRegistry},
+    web_tools::configure_web,
+    worktree::configure_worktree,
 };
 
 fn main() {
@@ -73,16 +78,70 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
         settings.allow_rules(),
         settings.deny_rules(),
     );
-    let skills = discover_skills(&cwd, cli.bare)?;
     let mut tool_context = ToolContext::new(cwd.clone(), permissions);
-    tool_context.skills = Arc::new(skills.clone());
-    let system = build_system_prompt(&cli, &cwd, &skills).await?;
+    tool_context.set_bare(cli.bare);
+    let hooks = Arc::new(HookRunner::from_settings(&settings)?);
+    tool_context.set_hooks(Arc::clone(&hooks));
+    let agents = configure_agents(&settings)?;
+    tool_context.set_agent_limits(agents.limits);
+    let mut active_tools = Vec::new();
+    let mut deferred_tools = Vec::new();
+    let mut services = Vec::new();
+    let mut discoveries = Vec::new();
+    deferred_tools.extend(agents.deferred_tools);
+    deferred_tools.extend(plan_tools());
+    if let Some(integration) = connect_mcp(&settings, &cwd, cli.debug).await? {
+        if cli.debug {
+            eprintln!(
+                "[debug] connected {} MCP server(s), {} deferred tool(s)",
+                integration.server_count,
+                integration.deferred_tools.len()
+            );
+        }
+        active_tools.extend(integration.active_tools);
+        deferred_tools.extend(integration.deferred_tools);
+        services.push(integration.service);
+        discoveries.push(integration.discovery);
+    }
+    if let Some(integration) = configure_lsp(&settings, &cwd, cli.debug)? {
+        if cli.debug {
+            eprintln!(
+                "[debug] configured {} lazy LSP server(s)",
+                integration.server_count
+            );
+        }
+        deferred_tools.extend(integration.deferred_tools);
+        services.push(integration.service);
+    }
+    deferred_tools.extend(configure_worktree(&settings, &cwd)?.deferred_tools);
+    deferred_tools.extend(configure_web(&settings)?.deferred_tools);
+    let registry =
+        ToolRegistry::with_integrations(active_tools, deferred_tools, services, discoveries)?;
     let (store, history) = open_session(&cli, &cwd)?;
+    let mut system = build_base_system_prompt(&cli).await?;
+    let session_start = hooks
+        .run(
+            "SessionStart",
+            None,
+            json!({"session_id": store.id, "model": &model}),
+            &cwd,
+        )
+        .await?;
+    if !session_start.additional_context.is_empty() {
+        system.push_str("\n\n<session-start-hook-context>\n");
+        system.push_str(&session_start.additional_context.join("\n"));
+        system.push_str("\n</session-start-hook-context>");
+    }
+    if system.len() > MAX_SYSTEM_CONTEXT_BYTES {
+        bail!("base system context 超过 {MAX_SYSTEM_CONTEXT_BYTES} 字节限制")
+    }
+    tool_context.set_workspace_context_budget(MAX_SYSTEM_CONTEXT_BYTES - system.len());
+    tool_context.reload_workspace_context().await?;
     let text_delta_sink = output_sink(&cli, store.id);
     let client = ModelClient::new(endpoint)?;
     let mut engine = QueryEngine::new(
         client,
-        ToolRegistry::default(),
+        registry,
         tool_context,
         QueryOptions {
             model,
@@ -100,6 +159,7 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
         let result = engine.run_turn(prompt).await?;
         persist_turn(&store, &engine, &result)?;
         print_result(&cli, &engine, &store, &result.text, result.streamed_text)?;
+        run_session_end_hook(&hooks, store.id, &cwd, "print_complete", cli.debug).await;
         engine.shutdown().await;
         return Ok(());
     }
@@ -136,7 +196,7 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
             }
             continue;
         }
-        match commands::handle(input.trim(), &mut engine, mode) {
+        match commands::handle(input.trim(), &mut engine) {
             CommandOutcome::Exit => break,
             CommandOutcome::Cleared => {
                 store.clear_history()?;
@@ -157,8 +217,29 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
             Err(error) => eprintln!("Error: {error:#}"),
         }
     }
+    run_session_end_hook(&hooks, store.id, &cwd, "interactive_exit", cli.debug).await;
     engine.shutdown().await;
     Ok(())
+}
+
+async fn run_session_end_hook(
+    hooks: &HookRunner,
+    session_id: Uuid,
+    cwd: &std::path::Path,
+    reason: &str,
+    debug: bool,
+) {
+    let outcome = hooks
+        .run(
+            "SessionEnd",
+            None,
+            json!({"session_id": session_id, "reason": reason}),
+            cwd,
+        )
+        .await;
+    if let (true, Err(error)) = (debug, outcome) {
+        eprintln!("[debug] SessionEnd hook failed: {error:#}");
+    }
 }
 
 fn persist_turn(
@@ -204,11 +285,7 @@ fn open_session(
     Ok((SessionStore::create(cwd, enabled)?, Vec::new()))
 }
 
-async fn build_system_prompt(
-    cli: &Cli,
-    cwd: &std::path::Path,
-    skills: &open_agent_harness::skills::SkillCatalog,
-) -> Result<String> {
+async fn build_base_system_prompt(cli: &Cli) -> Result<String> {
     let mut system = if let Some(prompt) = &cli.system_prompt {
         prompt.clone()
     } else if let Some(path) = &cli.system_prompt_file {
@@ -227,19 +304,8 @@ async fn build_system_prompt(
         system.push_str("\n\n");
         system.push_str(&append);
     }
-    let instructions = discover_agent_instructions(cwd, cli.bare).await?;
-    let rendered = render_agent_instructions(&instructions);
-    if !rendered.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&rendered);
-    }
-    let skill_index = render_skill_index(skills);
-    if !skill_index.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&skill_index);
-    }
     if system.len() > MAX_SYSTEM_CONTEXT_BYTES {
-        bail!("system context 超过 {MAX_SYSTEM_CONTEXT_BYTES} 字节限制")
+        bail!("base system context 超过 {MAX_SYSTEM_CONTEXT_BYTES} 字节限制")
     }
     Ok(system)
 }

@@ -1,4 +1,4 @@
-use crate::{permissions::PermissionMode, query::QueryEngine};
+use crate::query::QueryEngine;
 
 pub enum CommandOutcome {
     Handled,
@@ -7,7 +7,7 @@ pub enum CommandOutcome {
     NotCommand,
 }
 
-pub fn handle(input: &str, engine: &mut QueryEngine, mode: PermissionMode) -> CommandOutcome {
+pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
     if !input.starts_with('/') {
         return CommandOutcome::NotCommand;
     }
@@ -39,7 +39,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine, mode: PermissionMode) -> Co
             CommandOutcome::Handled
         }
         "/permissions" => {
-            println!("Permission mode: {mode:?}");
+            println!("Permission mode: {:?}", engine.permission_mode());
             CommandOutcome::Handled
         }
         "/context" => {

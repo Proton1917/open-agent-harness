@@ -141,14 +141,13 @@ fn tool_use_ids(content: &Value) -> Vec<String> {
 fn merge_adjacent_roles(messages: Vec<Message>) -> Vec<Message> {
     let mut merged: Vec<Message> = Vec::new();
     for message in messages {
-        if let Some(previous) = merged.last_mut()
-            && previous.role == message.role
-        {
-            let mut blocks = content_blocks(&previous.content);
-            blocks.extend(content_blocks(&message.content));
-            previous.content = Value::Array(blocks);
-        } else {
-            merged.push(message);
+        match merged.last_mut() {
+            Some(previous) if previous.role == message.role => {
+                let mut blocks = content_blocks(&previous.content);
+                blocks.extend(content_blocks(&message.content));
+                previous.content = Value::Array(blocks);
+            }
+            _ => merged.push(message),
         }
     }
     merged

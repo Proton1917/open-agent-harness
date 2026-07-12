@@ -187,12 +187,13 @@ async fn parse_sse(
             bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
         }
     }
-    if !buffer.iter().all(u8::is_ascii_whitespace)
-        && let Some(data) = frame_data(&buffer)?
-        && data != "[DONE]"
-    {
-        let event: Value = serde_json::from_str(&data)?;
-        streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
+    if !buffer.iter().all(u8::is_ascii_whitespace) {
+        if let Some(data) = frame_data(&buffer)? {
+            if data != "[DONE]" {
+                let event: Value = serde_json::from_str(&data)?;
+                streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
+            }
+        }
     }
     let mut response = accumulator.finish()?;
     redact_response(&mut response, secret);
@@ -261,10 +262,11 @@ impl StreamAccumulator {
                     .then(|| block.get("text").and_then(Value::as_str).unwrap_or(""))
                     .map(|text| redact_text(text, secret))
                     .unwrap_or_default();
-                if let Some(object) = block.as_object_mut()
-                    && !initial_text.is_empty()
-                {
-                    object.insert("text".into(), Value::String(initial_text.clone()));
+                match block.as_object_mut() {
+                    Some(object) if !initial_text.is_empty() => {
+                        object.insert("text".into(), Value::String(initial_text.clone()));
+                    }
+                    _ => {}
                 }
                 self.blocks.insert(index, block);
                 if !initial_text.is_empty() {

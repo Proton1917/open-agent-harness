@@ -15,11 +15,11 @@ pub struct SkillTool;
 
 #[async_trait]
 impl Tool for SkillTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Skill"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Loads a user-provided local workflow by name. Loading is read-only and never executes bundled scripts automatically."
     }
 
@@ -52,8 +52,7 @@ impl Tool for SkillTool {
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: Input = parse_input(input)?;
         let skill = context
-            .skills
-            .get(&input.name)
+            .skill(&input.name)
             .with_context(|| format!("未知 skill: {}", input.name))?;
         let base = skill.path.parent().unwrap_or(&skill.path);
         let base = context.display_path(base);

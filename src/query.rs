@@ -4,9 +4,11 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
+    agents::AgentRuntime,
     api::ModelClient,
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     messages::normalize_for_api,
+    permissions::PermissionMode,
     tokens::{estimate_messages, rough_token_count},
     tools::{ToolContext, ToolRegistry},
     types::{Message, SessionUsage},
@@ -57,6 +59,20 @@ impl QueryEngine {
         tool_context: ToolContext,
         options: QueryOptions,
     ) -> Self {
+        if tool_context.agent_depth() == 0 && tool_context.agent_runtime().is_err() {
+            let runtime = AgentRuntime::new(
+                client.clone(),
+                registry.clone(),
+                options.model.clone(),
+                options.max_tokens,
+                options.system.clone(),
+                options.debug,
+                tool_context.agent_limits(),
+            );
+            tool_context
+                .install_agent_runtime(runtime)
+                .expect("root agent runtime initialization must be unique");
+        }
         Self {
             client,
             model: options.model,
@@ -79,6 +95,12 @@ impl QueryEngine {
         let message_checkpoint = self.messages.clone();
         let compaction_checkpoint = self.compaction_count;
         let task_checkpoint = self.tool_context.background_task_ids().await;
+        let agent_runtime = self.tool_context.agent_runtime().ok();
+        let agent_scope = self.tool_context.agent_scope();
+        let agent_checkpoint = match &agent_runtime {
+            Some(runtime) => runtime.background_ids(agent_scope).await,
+            None => Default::default(),
+        };
         match self.run_turn_inner(prompt).await {
             Ok(result) => Ok(result),
             Err(error) => {
@@ -87,12 +109,39 @@ impl QueryEngine {
                 self.tool_context
                     .rollback_background_tasks(&task_checkpoint)
                     .await;
+                if let Some(runtime) = agent_runtime {
+                    runtime
+                        .rollback_background(agent_scope, &agent_checkpoint)
+                        .await;
+                }
                 Err(error)
             }
         }
     }
 
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.tool_context.permissions.effective_mode()
+    }
+
     async fn run_turn_inner(&mut self, prompt: String) -> Result<TurnResult> {
+        let hook_outcome = self
+            .tool_context
+            .hooks()
+            .run(
+                "UserPromptSubmit",
+                None,
+                json!({"prompt": &prompt}),
+                &self.tool_context.cwd(),
+            )
+            .await?;
+        let prompt = if hook_outcome.additional_context.is_empty() {
+            prompt
+        } else {
+            format!(
+                "{prompt}\n\n<user-prompt-hook-context>\n{}\n</user-prompt-hook-context>",
+                hook_outcome.additional_context.join("\n")
+            )
+        };
         let start = self.messages.len();
         self.messages.push(Message::user_text(prompt));
         let mut final_text = String::new();
@@ -123,12 +172,13 @@ impl QueryEngine {
                 );
             }
             let api_messages = normalize_for_api(&self.messages);
+            let system = self.effective_system_prompt();
             let message_result = self
                 .client
                 .messages(
                     &self.model,
                     self.max_tokens,
-                    &self.system,
+                    &system,
                     &api_messages,
                     &self.registry.definitions(),
                     self.text_delta_sink.as_deref(),
@@ -140,10 +190,11 @@ impl QueryEngine {
                 self.usage.add(usage);
             }
             for block in &response.content {
-                if block.get("type").and_then(Value::as_str) == Some("text")
-                    && let Some(text) = block.get("text").and_then(Value::as_str)
-                {
-                    final_text.push_str(text);
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    final_text.push_str(text)
                 }
             }
             self.messages
@@ -226,7 +277,7 @@ impl QueryEngine {
 
     pub fn estimated_tokens(&self) -> usize {
         let messages = estimate_messages(&normalize_for_api(&self.messages));
-        let system = rough_token_count(&self.system, 4);
+        let system = rough_token_count(&self.effective_system_prompt(), 4);
         let tools = self
             .registry
             .definitions()
@@ -251,6 +302,18 @@ impl QueryEngine {
         if self.messages.len() < 2 {
             bail!("消息不足，至少需要一轮对话才能 compact")
         }
+        self.tool_context
+            .hooks()
+            .run(
+                "PreCompact",
+                None,
+                json!({
+                    "message_count": self.messages.len(),
+                    "custom_instructions": custom_instructions,
+                }),
+                &self.tool_context.cwd(),
+            )
+            .await?;
 
         let messages_before = self.messages.len();
         let before_tokens = self.estimated_tokens();
@@ -258,12 +321,13 @@ impl QueryEngine {
         summary_input.push(Message::user_text(compact_prompt(custom_instructions)));
         summary_input = normalize_for_api(&summary_input);
 
+        let system = self.effective_system_prompt();
         let result = self
             .client
             .messages(
                 &self.model,
                 self.max_tokens.min(20_000),
-                &self.system,
+                &system,
                 &summary_input,
                 &[],
                 None,
@@ -285,23 +349,57 @@ impl QueryEngine {
 
         self.messages = vec![Message::user_text(continuation_message(&raw_summary))];
         self.compaction_count += 1;
-        Ok(CompactStats {
+        let stats = CompactStats {
             before_tokens,
             after_tokens: self.estimated_tokens(),
             messages_before,
             messages_after: self.messages.len(),
-        })
+        };
+        let post_hook = self
+            .tool_context
+            .hooks()
+            .run(
+                "PostCompact",
+                None,
+                json!({
+                    "before_tokens": stats.before_tokens,
+                    "after_tokens": stats.after_tokens,
+                    "messages_before": stats.messages_before,
+                    "messages_after": stats.messages_after,
+                }),
+                &self.tool_context.cwd(),
+            )
+            .await;
+        if let (true, Err(error)) = (self.debug, post_hook) {
+            eprintln!("[debug] PostCompact hook failed after compaction: {error:#}");
+        }
+        Ok(stats)
+    }
+
+    fn effective_system_prompt(&self) -> String {
+        let workspace = self.tool_context.workspace_system_context();
+        if workspace.is_empty() {
+            self.system.clone()
+        } else {
+            format!("{}\n\n{}", self.system, workspace)
+        }
     }
 
     pub async fn shutdown(&self) {
         self.tool_context.shutdown_background_tasks().await;
+        if self.tool_context.agent_depth() == 0 {
+            if let Ok(runtime) = self.tool_context.agent_runtime() {
+                runtime.shutdown_all().await;
+            }
+            self.registry.shutdown().await;
+        }
     }
 }
 
 pub fn default_system_prompt() -> String {
     String::from(
         "You are an open, provider-neutral coding agent. Work directly toward the user's goal and use the available tools whenever they help.\n\
-         Relative file paths are resolved from the harness workspace root.\n\
+         Relative file paths are resolved from the current harness working directory and constrained by its workspace boundary.\n\
          Inspect relevant evidence before changing files. Read an existing file completely before Edit or Write. \
          Preserve unrelated work, keep decisions transparent, and verify changes with the project's real build or tests when available. \
          You may propose or implement any technically sound approach within the user's requested scope.",
@@ -316,6 +414,6 @@ mod tests {
     fn default_prompt_does_not_embed_a_local_absolute_path() {
         let prompt = default_system_prompt();
         assert!(!prompt.contains(std::path::MAIN_SEPARATOR));
-        assert!(prompt.contains("workspace root"));
+        assert!(prompt.contains("workspace boundary"));
     }
 }

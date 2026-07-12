@@ -159,8 +159,9 @@ fn discover_from_roots(roots: &[(PathBuf, PathBuf)]) -> Result<SkillCatalog> {
 fn parse_frontmatter(content: &str, fallback: &str) -> Result<(String, String)> {
     let mut name = fallback.to_owned();
     let mut description = format!("Local workflow from {fallback}");
-    if let Some(rest) = content.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---")
+    if let Some((rest, end)) = content
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---").map(|end| (rest, end)))
     {
         for line in rest[..end].lines() {
             let Some((key, value)) = line.split_once(':') else {

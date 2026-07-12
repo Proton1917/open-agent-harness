@@ -1,54 +1,59 @@
-# Harness logic audit
+# Harness migration audit
 
-## Release scope
+## Boundary and method
 
-`v0.1.0` is an original, provider-neutral Rust coding-agent harness. The private comparison snapshot is evidence, not a dependency: it remains read-only under the ignored `reference/` tree, is never compiled or executed, and is absent from Git history and release artifacts.
+The current tree is an original, provider-neutral Rust implementation of general coding-agent harness behavior. The private comparison snapshot is static evidence, never a build input: it stays under the ignored `reference/` tree, is not executed, is absent from Git history, and cannot enter a release artifact.
 
-The release scope is deliberately the harness rather than a branded product shell:
-
-1. unchanged CLI input and output surfaces;
-2. a user-configured messages endpoint with SSE or JSON reconstruction;
-3. the model → tool → result loop, permissions, safe concurrency, and context accounting;
-4. bounded local file, notebook, search, shell, background-task, planning, and workflow tools;
-5. private local sessions, compaction, project instructions, settings, and skills;
-6. deterministic local protocol tests, privacy tests, static auditing, and a warning-free release build.
-
-Account systems, subscriptions, entitlement checks, telemetry, experiments, proprietary UI, closed remote services, voice characters, marketing behavior, and copied prompts or assets are intentionally outside the repository.
+The migration keeps the existing CLI surface and replaces the reusable backend machinery. Account systems, subscriptions, identity, entitlement, telemetry, experiments, proprietary UI, closed remote services, marketing behavior, copied prompts, and copied assets are outside the project.
 
 ## Coverage matrix
 
 | Harness subsystem | Rust implementation | Status | Verification evidence |
 |---|---|---:|---|
-| CLI and output formats | `src/cli.rs`, `src/main.rs` | complete | help/version smoke; text, JSON, and stream JSON paths |
-| Endpoint trust boundary | `src/api.rs`, `src/config.rs` | complete | same-origin URL validation, no redirects, proxy opt-in, bounded bodies |
-| Request privacy contract | `src/api.rs`, `tests/privacy_boundary.rs` | complete | raw request contains only six documented fields and bearer auth |
-| Credential isolation | `src/main.rs`, `src/tools/bash.rs`, `src/tools/grep.rs` | complete | real binary proves endpoint token is absent from tool subprocesses and message bodies |
-| SSE and JSON response reconstruction | `src/api.rs` | complete | block accumulation, partial tool JSON, truncation and malformed-stream failures |
-| Query and tool loop | `src/query.rs` | complete | multi-round tool use/result test; failed model round rolls back in-memory history |
-| Message normalization | `src/messages.rs` | complete | adjacent-role merge, orphan removal, interrupted-pair repair |
-| Context accounting | `src/tokens.rs`, `src/query.rs` | complete | messages, system text, and tool schemas included in estimates |
-| Context compaction | `src/compact.rs`, `src/query.rs` | complete | manual and automatic thresholds, continuation formatting, disabled modes |
-| Strict tool schemas | `src/tools/schema.rs`, `src/tools/mod.rs` | complete | unknown or invalid fields fail before permission checks and side effects |
-| Ordered safe concurrency | `src/tools/mod.rs` | complete | consecutive read-only calls run together; mutations remain barriers |
-| File editing | `read.rs`, `write.rs`, `edit.rs` | complete | full-read guard, exact stale-content rejection, unique replacement, atomic write |
-| Notebook editing | `src/tools/notebook.rs` | complete | replace, insert, delete, cell IDs, output clearing, size boundary |
-| Search | `src/tools/glob.rs`, `src/tools/grep.rs` | complete | native Rust regexes, filters, context, pagination, traversal, time, file, and byte limits |
-| Shell and background processes | `src/tools/bash.rs`, `src/tools/tasks.rs` | complete | private bounded capture, timeout, task output, stop, process-group cleanup |
-| Planning state | `src/tools/work_items.rs` | complete | bounded todo/task persistence, ownership, dependencies, metadata, private files |
-| Permissions and workspace scope | `src/permissions.rs`, `src/tools/mod.rs` | complete | non-interactive denial, deny precedence, outside-path and symlink-escape tests |
-| Settings trust | `src/config.rs` | complete | project files cannot set environment, redirect endpoint, or elevate permission mode |
-| Sessions and resume | `src/session.rs` | complete | private permissions, clear/compact boundaries, bounded JSONL, sanitized tool records |
-| Engineering instructions | `src/context.rs` | complete | broad-to-specific `AGENTS.md`, bare mode, scope-escaping symlink rejection |
-| Local workflows | `src/skills.rs`, `src/tools/skill.rs` | complete | precedence, size/count limits, text-only loading, no automatic script execution |
-| Resource ceilings | `src/api.rs`, `src/main.rs`, `src/session.rs`, `src/tools/` | complete | explicit request, response, prompt, file, output, scan, store, and transcript limits |
-| Warning-free source gate | `.cargo/config.toml`, `.github/workflows/ci.yml` | complete | warnings are errors in test, clippy, and release compilation |
-| Open-source boundary | `.gitignore`, `scripts/audit-harness.sh` | complete | private reference and local instructions untracked; source and binary static scan |
+| CLI and output formats | `src/cli.rs`, `src/main.rs` | complete | unchanged text, JSON, stream-JSON, interactive, and print paths |
+| Model endpoint boundary | `src/api.rs`, `src/config.rs` | complete | same-origin validation, no redirects, proxy opt-in, bounded JSON/SSE |
+| Request privacy contract | `src/api.rs`, `tests/privacy_boundary.rs` | complete | raw requests contain only the documented generic body and bearer authorization |
+| Credential isolation | `src/main.rs`, subprocess modules, `tests/credential_isolation.rs` | complete | model token removed before workers and excluded from child environments |
+| Query loop and rollback | `src/query.rs`, `src/messages.rs` | complete | multi-round tool flow, usage accumulation, normalization, atomic failure rollback |
+| Context accounting and compaction | `src/tokens.rs`, `src/compact.rs`, `src/query.rs` | complete | system, messages, tools, output reserve, automatic/manual compaction |
+| Strict schemas and scheduling | `src/tools/schema.rs`, `src/tools/mod.rs` | complete | validation before permission; ordered bounded concurrency with mutation barriers |
+| File and notebook tools | `src/tools/{read,write,edit,notebook}.rs` | complete | full-read guard, exact freshness, unique replacement, atomic write, cell operations |
+| Native search tools | `src/tools/{glob,grep}.rs` | complete | bounded traversal, regex, filters, context, pagination, file/time/byte ceilings |
+| Shell and background jobs | `src/tools/{bash,tasks}.rs`, `src/process.rs` | complete | private bounded capture, blocking/nonblocking output, stop, Unix groups, Windows trees |
+| Todo and task state | `src/tools/work_items.rs` | complete | bounded private persistence, ownership, dependencies, metadata |
+| Session plan state | `src/plan.rs`, `src/permissions.rs` | complete | dynamic enter/exit; user-locked plan mode cannot be escaped by a tool |
+| Permissions and workspace scope | `src/permissions.rs`, `src/tools/mod.rs` | complete | deny precedence, noninteractive denial, canonical and symlink boundaries |
+| Settings trust | `src/config.rs` | complete | project settings can tighten deny rules only; executable/network settings stay trusted |
+| Sessions and resume | `src/session.rs` | complete | private bounded JSONL, clear/compact boundaries, sanitized tool records |
+| Engineering instructions | `src/context.rs` | complete | broad-to-specific `AGENTS.md`, bare mode, scope-safe symlink handling |
+| Local workflows | `src/skills.rs`, `src/tools/skill.rs` | complete | bounded text loading and precedence; bundled files are never auto-executed |
+| Deferred tool registry | `src/tools/mod.rs` | complete | bounded search/select, exact activation, dynamic refresh, duplicate/size rejection |
+| Local subagents | `src/agents.rs`, `tests/agent_flow.rs` | complete | independent histories, recursion/concurrency/total caps, background/resume/cancel/cleanup |
+| Git worktree isolation | `src/worktree.rs` | complete | create/enter/keep/remove, dirty refusal, context/instruction/skill refresh, real Git tests |
+| LSP client | `src/lsp.rs`, `src/rpc.rs` | complete for declared operations | lazy initialize/sync/query, diagnostics, restart, cancellation, shutdown, real subprocess test |
+| MCP client | `src/mcp.rs`, `src/rpc.rs` | complete for declared capabilities | stdio and Streamable HTTP, sessions, SSE, pagination, tools/resources/templates/prompts, refresh |
+| Explicit web tools | `src/web_tools.rs` | complete for textual fetch/search | DNS pinning, address policy, redirect revalidation, header stripping, body limits |
+| Local command hooks | `src/hooks.rs` | complete for declared events | matcher, sync/async/once, bounded JSON I/O, timeout, rewrite/block/context responses |
+| Resource ceilings and cleanup | `src/api.rs`, `src/rpc.rs`, `src/process.rs`, `src/tools/` | complete | hard request/response/process/file/count/depth/time limits and shutdown services |
+| Warning-free portable gate | `.cargo/config.toml`, `.github/workflows/ci.yml` | complete | warnings are errors; Linux release audit plus macOS and Windows test/clippy jobs |
+| Open-source boundary | `.gitignore`, `scripts/audit-harness.sh` | complete | Rust-only runtime, practical source tooling, ignored references/instructions, binary scan |
 
-The registered model surface contains 15 tools: six file/search tools, three execution tools, five planning tools, and one local workflow loader.
+The always-active base surface remains fifteen local tools. The normal executable also exposes `ToolSearch`, which lazily activates local agents, plan transitions, worktrees, web access, LSP, and configured MCP tools. MCP resource/prompt helpers appear only when a configured server advertises the corresponding capability.
 
-## Claims not made by this release
+## Deliberate exclusions and exact non-claims
 
-This release does not pretend that every feature ever placed around an agent loop belongs in its core. It does not claim a built-in MCP client, LSP client, worktree manager, remote web service, or recursive subagent scheduler. Those can be added later as open, independently testable integrations without changing the CLI or weakening the trust boundary. None is required for a claim made in `README.md`.
+“Harness complete” does not mean copying every ornament that has ever surrounded a message loop. The following boundaries are intentional and are not claimed by the README:
+
+- No account, subscription, billing, identity, entitlement, update, experiment, analytics, or hidden remote-control path.
+- No proprietary terminal UI, interactive question panel, slash-command directory UI, remote-team UI, scheduled notification system, voice character, or marketing surface. The CLI remains unchanged.
+- No image/PDF/browser rendering layer. `Read` and web integrations return bounded textual data; a graphical browser is not implied.
+- MCP advertises no roots, sampling, elicitation, or task client capability. Unsupported server-to-client requests fail closed; `ping` is answered on request-response channels. Tools, resources, templates, prompts, notifications, stdio, and Streamable HTTP are the declared MCP scope.
+- LSP is limited to the operations listed by the `LSP` tool schema. It is not a complete editor client.
+- Hooks are local command hooks from trusted settings. There is no hidden hosted hook service, and arbitrary project settings cannot install one.
+- `WebSearch` is an adapter for a URL the user supplies. The repository ships no search provider, credential, hostname, or fallback service.
+- Subagents are local recursive harness runs. Remote agents, peer messaging, team coordination, and cloud sessions are not represented as local capability.
+
+These exclusions keep the implementation open, testable, provider-neutral, and honest. Adding one later requires an explicit public contract, failure boundary, resource budget, privacy test, and warning-free implementation.
 
 ## Release gate
 
@@ -56,6 +61,7 @@ Every command below must finish successfully and print no compiler warning:
 
 ```bash
 cargo fmt --all -- --check
+cargo +1.85.0 check --locked --all-targets
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
@@ -65,4 +71,4 @@ target/release/open-agent-harness --help
 target/release/open-agent-harness --version
 ```
 
-The static audit must additionally prove that the release binary contains no removed brand identifier, no private reference file is tracked, `AGENTS.md` remains ignored and untracked, no hard-coded public endpoint exists in runtime source, and the release contains no hidden account or telemetry metadata.
+CI repeats tests and clippy on Linux, macOS, and Windows. The static audit additionally proves that the release binary and runtime source contain no removed brand identifier, private reference files are untracked, `AGENTS.md` stays ignored, the runtime contains no hard-coded public endpoint, warning suppressions and placeholders are absent, and no hidden account or telemetry metadata exists.

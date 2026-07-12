@@ -22,6 +22,7 @@ List the files or sections that used AI assistance, what the model produced, and
 ## Verification
 
 - [ ] `cargo fmt --all -- --check`
+- [ ] `cargo +1.85.0 check --locked --all-targets`
 - [ ] `cargo test --locked --all-targets`
 - [ ] `cargo clippy --locked --all-targets -- -D warnings`
 - [ ] `cargo build --locked --release`

@@ -20,15 +20,34 @@ pub struct Settings {
 impl fmt::Debug for Settings {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut redacted = self.raw.clone();
-        if let Some(root) = redacted.as_object_mut()
-            && root.contains_key("env")
-        {
-            root.insert("env".into(), Value::String("<redacted>".into()));
-        }
+        redact_settings_debug(&mut redacted);
         formatter
             .debug_struct("Settings")
             .field("raw", &redacted)
             .finish()
+    }
+}
+
+fn redact_settings_debug(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "env" | "headers" | "token" | "apikey" | "api_key" | "authorization"
+                ) {
+                    *value = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_settings_debug(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_settings_debug(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -112,6 +131,19 @@ impl Settings {
             root.remove("env");
         }
     }
+}
+
+pub(crate) fn project_deny_rules(cwd: &Path, bare: bool) -> Result<Vec<String>> {
+    if bare {
+        return Ok(Vec::new());
+    }
+    let mut project = Value::Object(Map::new());
+    merge_project_file_if_present(&mut project, &cwd.join(".open-agent-harness/settings.json"))?;
+    merge_project_file_if_present(
+        &mut project,
+        &cwd.join(".open-agent-harness/settings.local.json"),
+    )?;
+    Ok(string_array_at(&project, &["permissions", "deny"]))
 }
 
 fn string_array_at(root: &Value, path: &[&str]) -> Vec<String> {
@@ -348,12 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn settings_debug_redacts_environment_values() {
+    fn settings_debug_redacts_nested_secret_containers() {
         let settings = Settings {
-            raw: serde_json::json!({"env":{"HARNESS_API_KEY":"debug-secret"}}),
+            raw: serde_json::json!({
+                "env":{"HARNESS_API_KEY":"debug-secret"},
+                "mcpServers":{"private":{"headers":{"Authorization":"header-secret"}}},
+                "lspServers":{"private":{"env":{"LANGUAGE_TOKEN":"nested-secret"}}}
+            }),
         };
         let rendered = format!("{settings:?}");
         assert!(!rendered.contains("debug-secret"));
+        assert!(!rendered.contains("header-secret"));
+        assert!(!rendered.contains("nested-secret"));
         assert!(rendered.contains("redacted"));
     }
 

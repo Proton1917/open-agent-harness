@@ -26,11 +26,11 @@ pub struct NotebookEditTool;
 
 #[async_trait]
 impl Tool for NotebookEditTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "NotebookEdit"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replaces, inserts, or deletes one Jupyter notebook cell. Read the complete notebook first; cells without IDs can be addressed as cell-<zero-based-index>."
     }
 
@@ -212,7 +212,7 @@ fn find_cell(cells: &[Value], requested: &str) -> Result<usize> {
     if let Some(index) = requested
         .strip_prefix("cell-")
         .and_then(|value| value.parse::<usize>().ok())
-        && index < cells.len()
+        .filter(|index| *index < cells.len())
     {
         return Ok(index);
     }

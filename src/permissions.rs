@@ -1,6 +1,9 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::{Arc, RwLock},
+};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::ValueEnum;
 use globset::Glob;
 
@@ -30,6 +33,8 @@ pub struct PermissionManager {
     pub interactive: bool,
     allow: Vec<String>,
     deny: Vec<String>,
+    session_mode: Arc<RwLock<Option<PermissionMode>>>,
+    workspace_deny: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +55,46 @@ impl PermissionManager {
             interactive,
             allow,
             deny,
+            session_mode: Arc::new(RwLock::new(None)),
+            workspace_deny: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn set_workspace_deny(&self, rules: Vec<String>) {
+        *self
+            .workspace_deny
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rules;
+    }
+
+    pub fn effective_mode(&self) -> PermissionMode {
+        self.session_mode
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(self.mode)
+    }
+
+    pub fn enter_plan_mode(&self) -> bool {
+        let mut mode = self
+            .session_mode
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if mode.unwrap_or(self.mode) == PermissionMode::Plan {
+            return false;
+        }
+        *mode = Some(PermissionMode::Plan);
+        true
+    }
+
+    pub fn exit_plan_mode(&self) -> Result<bool> {
+        if self.mode == PermissionMode::Plan {
+            bail!("用户从命令行或可信设置锁定了 plan 模式，工具不能解除")
+        }
+        let mut mode = self
+            .session_mode
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(mode.take() == Some(PermissionMode::Plan))
     }
 
     pub fn decide(
@@ -62,21 +106,30 @@ impl PermissionManager {
         outside_workspace: bool,
     ) -> Result<PermissionDecision> {
         let target = format!("{tool}({summary})");
-        if matches_any(&self.deny, tool, &target) {
+        let workspace_denied = matches_any(
+            &self
+                .workspace_deny
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            tool,
+            &target,
+        );
+        if matches_any(&self.deny, tool, &target) || workspace_denied {
             return Ok(PermissionDecision::Deny);
+        }
+        if self.effective_mode() == PermissionMode::Plan {
+            return Ok(if read_only && !outside_workspace {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny
+            });
         }
         if matches_any(&self.allow, tool, &target) {
             return Ok(PermissionDecision::Allow);
         }
-        match self.mode {
+        match self.effective_mode() {
             PermissionMode::BypassPermissions => Ok(PermissionDecision::Allow),
-            PermissionMode::Plan => {
-                if read_only && !outside_workspace {
-                    Ok(PermissionDecision::Allow)
-                } else {
-                    Ok(PermissionDecision::Deny)
-                }
-            }
+            PermissionMode::Plan => unreachable!("plan mode returned before allow-rule handling"),
             PermissionMode::AcceptEdits
                 if !outside_workspace && matches!(tool, "Edit" | "NotebookEdit" | "Write") =>
             {
@@ -130,5 +183,29 @@ mod tests {
             p.decide("Bash", "rm x", false, true, false).unwrap(),
             PermissionDecision::Deny
         );
+    }
+
+    #[test]
+    fn session_plan_mode_cannot_override_a_user_lock() {
+        let locked = PermissionManager::new(PermissionMode::Plan, false, vec![], vec![]);
+        assert!(!locked.enter_plan_mode());
+        assert!(locked.exit_plan_mode().is_err());
+        assert_eq!(
+            PermissionManager::new(
+                PermissionMode::Plan,
+                false,
+                vec!["Bash(*)".to_owned()],
+                vec![]
+            )
+            .decide("Bash", "echo unsafe", false, false, false)
+            .unwrap(),
+            PermissionDecision::Deny
+        );
+
+        let dynamic = PermissionManager::new(PermissionMode::Default, false, vec![], vec![]);
+        assert!(dynamic.enter_plan_mode());
+        assert_eq!(dynamic.effective_mode(), PermissionMode::Plan);
+        assert!(dynamic.exit_plan_mode().unwrap());
+        assert_eq!(dynamic.effective_mode(), PermissionMode::Default);
     }
 }

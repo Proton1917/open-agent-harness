@@ -57,11 +57,11 @@ pub struct TodoWriteTool;
 
 #[async_trait]
 impl Tool for TodoWriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TodoWrite"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replaces the current session checklist with pending, in_progress, or completed items."
     }
 
@@ -141,11 +141,11 @@ pub struct TaskCreateTool;
 
 #[async_trait]
 impl Tool for TaskCreateTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TaskCreate"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Creates a persistent task in the current workspace task list."
     }
 
@@ -225,11 +225,11 @@ pub struct TaskGetTool;
 
 #[async_trait]
 impl Tool for TaskGetTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TaskGet"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Gets a persistent task by ID."
     }
 
@@ -271,11 +271,11 @@ pub struct TaskListTool;
 
 #[async_trait]
 impl Tool for TaskListTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TaskList"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Lists persistent tasks for the current workspace."
     }
 
@@ -360,11 +360,11 @@ pub struct TaskUpdateTool;
 
 #[async_trait]
 impl Tool for TaskUpdateTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TaskUpdate"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Updates, links, completes, or deletes a persistent task."
     }
 
@@ -457,9 +457,7 @@ impl Tool for TaskUpdateTool {
                     (!active_form.trim().is_empty()).then(|| active_form.trim().to_owned());
                 updated.push("activeForm");
             }
-            if let Some(status) = input.status
-                && task.status != status
-            {
+            if let Some(status) = input.status.filter(|status| task.status != *status) {
                 task.status = status;
                 updated.push("status");
             }
@@ -580,34 +578,28 @@ fn prefixed_ids(ids: &[String]) -> String {
 }
 
 fn load_store(context: &ToolContext) -> Result<TaskStore> {
-    if !context.task_store_path.exists() {
+    let path = context.task_store_path();
+    if !path.exists() {
         return Ok(TaskStore::default());
     }
-    if std::fs::symlink_metadata(&context.task_store_path)?
-        .file_type()
-        .is_symlink()
-    {
+    if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
         bail!("拒绝读取 symlink task store")
     }
-    let size = std::fs::metadata(&context.task_store_path)?.len();
+    let size = std::fs::metadata(&path)?.len();
     if size > MAX_TASK_STORE_BYTES {
         bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(&context.task_store_path)?
+    std::fs::File::open(&path)?
         .take(MAX_TASK_STORE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_TASK_STORE_BYTES as usize {
         bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
     }
-    let content = String::from_utf8(bytes).with_context(|| {
-        format!(
-            "任务存储不是有效 UTF-8: {}",
-            context.task_store_path.display()
-        )
-    })?;
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("任务存储不是有效 UTF-8: {}", path.display()))?;
     let store: TaskStore = serde_json::from_str(&content)
-        .with_context(|| format!("任务存储 JSON 损坏: {}", context.task_store_path.display()))?;
+        .with_context(|| format!("任务存储 JSON 损坏: {}", path.display()))?;
     if store.tasks.len() > MAX_TASKS {
         bail!("任务存储超过 {MAX_TASKS} 个任务限制")
     }
@@ -619,7 +611,7 @@ fn save_store(context: &ToolContext, store: &TaskStore) -> Result<()> {
     if content.len() > MAX_TASK_STORE_BYTES as usize {
         bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
     }
-    atomic_write_private(&context.task_store_path, &(content + "\n"))
+    atomic_write_private(&context.task_store_path(), &(content + "\n"))
 }
 
 fn validate_metadata(metadata: &Map<String, Value>) -> Result<()> {
