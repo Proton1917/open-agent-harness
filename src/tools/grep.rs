@@ -13,7 +13,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use walkdir::{DirEntry, WalkDir};
 
-use super::{Tool, ToolContext, ToolOutput, object_schema, parse_input};
+use super::{
+    Tool, ToolContext, ToolOutput, normalize_path_for_display, object_schema, parse_input,
+};
 
 const MAX_RESULT_BYTES: usize = 240 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -583,19 +585,20 @@ fn include_entry(entry: &DirEntry) -> bool {
 }
 
 fn display_path(path: &Path, cwd: &Path) -> String {
-    if let Ok(relative) = path.strip_prefix(cwd) {
-        return if relative.as_os_str().is_empty() {
+    let rendered = if let Ok(relative) = path.strip_prefix(cwd) {
+        if relative.as_os_str().is_empty() {
             ".".into()
         } else {
             relative.display().to_string()
-        };
-    }
-    if let Some(relative) =
+        }
+    } else if let Some(relative) =
         dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
     {
-        return format!("~/{}", relative.display());
-    }
-    path.display().to_string()
+        format!("~/{}", relative.display())
+    } else {
+        path.display().to_string()
+    };
+    normalize_path_for_display(rendered)
 }
 
 #[cfg(test)]

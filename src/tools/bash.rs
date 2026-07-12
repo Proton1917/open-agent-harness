@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::Mutex,
+    sync::mpsc,
     task::JoinHandle,
     time::timeout,
 };
@@ -272,47 +272,54 @@ async fn spawn_captured(
     let mut child = command.spawn().context("无法启动 shell 命令")?;
     let stdout = child.stdout.take().context("无法捕获命令 stdout")?;
     let stderr = child.stderr.take().context("无法捕获命令 stderr")?;
-    let file = Arc::new(Mutex::new(tokio::fs::File::from_std(output_file)));
-    let written = Arc::new(AtomicU64::new(0));
     let truncated = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel(32);
     let drains = vec![
-        tokio::spawn(drain_to_file(
-            stdout,
-            Arc::clone(&file),
-            Arc::clone(&written),
+        tokio::spawn(drain_to_channel(stdout, sender.clone())),
+        tokio::spawn(drain_to_channel(stderr, sender)),
+        tokio::spawn(write_capture(
+            tokio::fs::File::from_std(output_file),
+            receiver,
             Arc::clone(&truncated),
         )),
-        tokio::spawn(drain_to_file(stderr, file, written, Arc::clone(&truncated))),
     ];
     Ok((child, drains, truncated))
 }
 
-async fn drain_to_file(
-    mut reader: impl AsyncRead + Unpin,
-    file: Arc<Mutex<tokio::fs::File>>,
-    written: Arc<AtomicU64>,
-    truncated: Arc<AtomicBool>,
-) {
+async fn drain_to_channel(mut reader: impl AsyncRead + Unpin, sender: mpsc::Sender<Vec<u8>>) {
     let mut chunk = [0u8; 8192];
     loop {
         let count = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(count) => count,
         };
-        let start = written.fetch_add(count as u64, Ordering::Relaxed);
-        if start >= MAX_CAPTURE_FILE_BYTES {
-            truncated.store(true, Ordering::Relaxed);
-            continue;
-        }
-        let keep = count.min((MAX_CAPTURE_FILE_BYTES - start) as usize);
-        if keep < count {
-            truncated.store(true, Ordering::Relaxed);
-        }
-        let mut file = file.lock().await;
-        if file.write_all(&chunk[..keep]).await.is_err() {
+        if sender.send(chunk[..count].to_vec()).await.is_err() {
             break;
         }
     }
+}
+
+async fn write_capture(
+    mut file: tokio::fs::File,
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    truncated: Arc<AtomicBool>,
+) {
+    let mut written = 0u64;
+    while let Some(chunk) = receiver.recv().await {
+        if written >= MAX_CAPTURE_FILE_BYTES {
+            truncated.store(true, Ordering::Relaxed);
+            continue;
+        }
+        let keep = chunk.len().min((MAX_CAPTURE_FILE_BYTES - written) as usize);
+        if keep < chunk.len() {
+            truncated.store(true, Ordering::Relaxed);
+        }
+        if file.write_all(&chunk[..keep]).await.is_err() {
+            return;
+        }
+        written = written.saturating_add(keep as u64);
+    }
+    let _ = file.flush().await;
 }
 
 async fn await_foreground_drains(mut drains: Vec<JoinHandle<()>>, process_group_id: Option<u32>) {

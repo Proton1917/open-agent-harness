@@ -401,19 +401,20 @@ impl ToolContext {
     }
 
     pub fn display_path(&self, path: &Path) -> String {
-        if let Ok(relative) = path.strip_prefix(self.cwd()) {
-            return if relative.as_os_str().is_empty() {
+        let rendered = if let Ok(relative) = path.strip_prefix(self.cwd()) {
+            if relative.as_os_str().is_empty() {
                 ".".into()
             } else {
                 relative.display().to_string()
-            };
-        }
-        if let Some(relative) =
+            }
+        } else if let Some(relative) =
             dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
         {
-            return format!("~/{}", relative.display());
-        }
-        path.display().to_string()
+            format!("~/{}", relative.display())
+        } else {
+            path.display().to_string()
+        };
+        normalize_path_for_display(rendered)
     }
 
     pub async fn remember_read(&self, path: PathBuf, content: String, partial: bool) -> Result<()> {
@@ -491,6 +492,17 @@ impl ToolContext {
             bash::terminate_task(task).await;
             let _ = std::fs::remove_file(&task.output_path);
         }
+    }
+}
+
+pub(crate) fn normalize_path_for_display(value: String) -> String {
+    #[cfg(windows)]
+    {
+        value.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        value
     }
 }
 
