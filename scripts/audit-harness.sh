@@ -22,7 +22,6 @@ scan_paths=(
   "$root/tests"
   "$root/scripts"
   "$root/MIGRATION.md"
-  "$root/AGENTS.md"
 )
 
 removed_terms=('cl''aude' 'anth''ropic')
@@ -41,11 +40,18 @@ done
 echo 'brand_free=true'
 echo 'binary_brand_free=true'
 
-if ! rg -q -i "${removed_terms[1]}" "$root/README.md"; then
-  echo 'readme_critique_present=false' >&2
+if [[ -n "$(git -C "$root" ls-files reference)" ]]; then
+  echo 'reference_untracked=false' >&2
   exit 1
 fi
-echo 'readme_critique_present=true'
+echo 'reference_untracked=true'
+
+if [[ -n "$(git -C "$root" ls-files 'AGENTS.md' '**/AGENTS.md')" ]] \
+  || ! git -C "$root" check-ignore --no-index -q AGENTS.md; then
+  echo 'agents_instructions_ignored=false' >&2
+  exit 1
+fi
+echo 'agents_instructions_ignored=true'
 
 reference_git="$(find "$root/reference" -mindepth 2 -maxdepth 2 -type d -name .git -print -quit)"
 if [[ -n "$reference_git" ]]; then

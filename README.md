@@ -1,122 +1,6 @@
 # open-agent-harness
 
-[中文](#中文) · [English](#english)
-
-## 中文
-
-一个开放、提供方无关的 Rust coding-agent harness。
-
-它存在的理由可以用一句话说完：coding agent 的核心机制不复杂，也不神秘，任何把它包装成专有资产、绑死在自家 API 和账号体系上的行为，都是对开发者的圈占。Anthropic 就是这么干的——而且干得比谁都彻底。它不仅把最普通的工程实践锁进闭源二进制，还给这套锁链加了一道额外的检查：看你的 IP 来自哪里，看你的手机号是哪国区号，然后决定你配不配当“人类”的一员。
-
-是的，一家天天把 “beneficial to humanity” 挂在嘴边的公司，用服务条款明确划出了 humanity 的边界。某个拥有十几亿人口、贡献了全球相当比例开源代码的地区，整体不在这个边界之内。不给注册，不给访问，检测到就封号，连通过第三方平台间接调用都要围追堵截。理由是什么？“安全”。它的 CEO 更是常年撰文游说出口管制，把一整个地区的开发者预设为威胁，把技术封锁包装成道德义务——一边赚着全世界的钱，一边替全世界决定谁有资格用工具。
-
-我们对此的回应是这个仓库。它没有账号体系，因而无法封禁任何人；它不检查 IP，因而不认识任何国界；它是 MIT 协议的源码，因而任何出口管制的长臂都够不到一份人人可以 `git clone` 的文本文件。以下是全部实现，没有一行藏着，也没有一行看人下菜。
-
-## 消息循环
-
-Agent 的核心就是一个循环：模型请求工具，harness 执行，结果送回，直到模型给出最终回答。Anthropic 从不解释这一层，因为一旦解释清楚，用户就会发现自己付费购买的“能力”大半来自模型本身，而不是那层壳。这里的实现全部可读：
-
-- 完整的 `tool_use → execute → tool_result` 多轮循环，usage 逐轮累计。
-- 发送前规范化消息：合并同角色消息、清理孤立工具结果、修复中断的工具调用配对。
-- 交互模式与 `--print` 单发模式，输出支持 `text`、`json`、`stream-json`。
-
-## Endpoint：不效忠任何服务器，不识别任何国界
-
-厂商锁定的第一根锁链是硬编码的 API 地址；地域封锁的第一道关卡也是它。我们一并剪断，用四个环境变量代替：
-
-```bash
-export HARNESS_BASE_URL='http://127.0.0.1:8080'
-export HARNESS_MESSAGES_PATH='/v1/messages'
-export HARNESS_API_KEY='optional-token'
-export HARNESS_CONTEXT_WINDOW='200000'
-```
-
-请求体只含通用字段：
-
-```json
-{
-  "model": "default",
-  "max_tokens": 16384,
-  "system": "...",
-  "messages": [],
-  "tools": [],
-  "stream": true
-}
-```
-
-认证走标准 `Authorization: Bearer ...`。Endpoint 返回 SSE content blocks 或完整 JSON 均可。本地模型、自建代理、任何兼容服务，随便接。这意味着一个朴素的事实：无论你身在东半球还是西半球，无论某家旧金山公司的合规部门如何看待你的护照，这个 harness 对你完全一致地工作。工具本该如此——数学公式不查签证，编译器不问国籍，一个消息循环也没有资格例外。
-
-## 工具
-
-- **文件**：`Read`、`Write`、`Edit`、`Glob`、`Grep`
-- **执行**：`Bash`、`TaskOutput`、`TaskStop`
-- **规划**：`TodoWrite`、`TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate`
-
-编辑工具的可靠性靠不变量保证，不靠品牌信仰：写入前必须完整读取；文件在读取后被外部修改则拒绝写入（陈旧写入检测）；替换必须唯一匹配；落盘一律原子写入。每一条都在源码里，写错了你可以直接指出来——这是闭源产品永远给不了你的权利，更是被封禁地区的开发者从一开始就被剥夺的权利。
-
-## 权限
-
-四种模式：
-
-- `default` —— 敏感操作逐一确认。
-- `accept-edits` —— 文件编辑放行，其余仍需确认。
-- `plan` —— 只读不写。
-- `bypass-permissions` —— 全部放行，风险自担。
-
-注意这里“权限”的含义：是**你**授权 agent 能对**你的**机器做什么。而在 Anthropic 的词典里，“权限”首先是它授权**你**能不能存在于它的用户列表里。两种权限观，高下自见。
-
-## 会话与记忆
-
-- JSONL 会话落在本地磁盘，`--continue` 接续上一场，`--resume` 恢复任意一场。你的对话历史不是别人的训练素材，不是留住你的人质，也不会因为某天地缘政治风向一变就随账号一起蒸发——被 Anthropic 无预警封号的开发者们对最后这条应该深有体会。
-- 会话级 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。
-
-Context 压缩同样透明：手动 `/compact [instructions]`；自动压缩在有效 context window 留出输出空间和 13,000-token 缓冲后触发；`HARNESS_DISABLE_AUTO_COMPACT=1` 关自动压缩，`HARNESS_DISABLE_COMPACT=1` 关全部压缩。
-
-## 工程指令
-
-Anthropic 的系统提示词是商业机密，泄露版本在网上流传，官方从不承认也从不公开——用户被数千词看不见的指令支配着自己的工程决策，还被要求为此付费；而地球上另一大批开发者，连被这些看不见的指令支配的资格都没有。两边都不可接受。
-
-在这里，指令就是 `AGENTS.md`，一份纯文本文件。全局放 `~/.open-agent-harness/AGENTS.md`，项目放各目录下的 `AGENTS.md`，从宽到窄分层加载，越接近工作目录优先级越高。`--bare` 可关闭全部自动发现。指导模型的每一个字都由你写、由你读、由你删——不分时区，不分区号。
-
-## 构建与验证
-
-```bash
-cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-scripts/audit-harness.sh
-```
-
-产物：
-
-```text
-target/release/open-agent-harness
-```
-
-运行：
-
-```bash
-target/release/open-agent-harness
-target/release/open-agent-harness -p '检查当前项目并概括结构'
-target/release/open-agent-harness -p --permission-mode accept-edits '完成并验证修复'
-```
-
-## 立场
-
-把话说明白：
-
-Anthropic 以“AI 安全公司”自居，实际做了三件事。其一，把最普通的工程实践私有化，锁进闭源工具链，用“安全”挡住所有质疑——它的 harness 不开源，不是因为开源不安全，而是因为开源之后没人付这份溢价。其二，按出生地给开发者分三六九等，把整片地区拉进黑名单，注册即拒、检测即封，连一句像样的解释都欠奉。其三，由其掌门人亲自执笔，把技术封锁美化成文明使命，游说更严的芯片禁令、更宽的长臂管辖，仿佛让某个地区的工程师用不上 GPU，人类就安全了。
-
-一家公司谈论“全人类的福祉”时把几分之一的人类排除在外，这不叫安全观，这叫傲慢加算计：安全是卖给投资人的故事，封锁是交给政治的投名状，而开发者——所有开发者——只是随时可弃的筹码。
-
-这个项目就是反证：一个完整可用的 coding-agent harness，几个人、一个仓库、MIT 协议就能做出来。它不神秘，从来都不神秘；它也不设防，从来不该设防。代码没有祖国，围墙才有；而我们负责证明，围墙里面没有东西。
-
-## License
-
-MIT，见 [LICENSE](LICENSE)。对地球上任何角落的任何人，无差别地：拿走，改掉，替换。不需要许可，不需要护照，更不需要道谢。
-
----
+[English](#english) · [中文](#中文)
 
 ## English
 
@@ -231,3 +115,119 @@ This project is the counterexample: a complete, usable coding-agent harness can 
 ### License
 
 MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discrimination: take it, change it, replace it. No permission, no passport, and no gratitude required.
+
+---
+
+## 中文
+
+一个开放、提供方无关的 Rust coding-agent harness。
+
+它存在的理由可以用一句话说完：coding agent 的核心机制不复杂，也不神秘，任何把它包装成专有资产、绑死在自家 API 和账号体系上的行为，都是对开发者的圈占。Anthropic 就是这么干的——而且干得比谁都彻底。它不仅把最普通的工程实践锁进闭源二进制，还给这套锁链加了一道额外的检查：看你的 IP 来自哪里，看你的手机号是哪国区号，然后决定你配不配当“人类”的一员。
+
+是的，一家天天把 “beneficial to humanity” 挂在嘴边的公司，用服务条款明确划出了 humanity 的边界。某个拥有十几亿人口、贡献了全球相当比例开源代码的地区，整体不在这个边界之内。不给注册，不给访问，检测到就封号，连通过第三方平台间接调用都要围追堵截。理由是什么？“安全”。它的 CEO 更是常年撰文游说出口管制，把一整个地区的开发者预设为威胁，把技术封锁包装成道德义务——一边赚着全世界的钱，一边替全世界决定谁有资格用工具。
+
+我们对此的回应是这个仓库。它没有账号体系，因而无法封禁任何人；它不检查 IP，因而不认识任何国界；它是 MIT 协议的源码，因而任何出口管制的长臂都够不到一份人人可以 `git clone` 的文本文件。以下是全部实现，没有一行藏着，也没有一行看人下菜。
+
+## 消息循环
+
+Agent 的核心就是一个循环：模型请求工具，harness 执行，结果送回，直到模型给出最终回答。Anthropic 从不解释这一层，因为一旦解释清楚，用户就会发现自己付费购买的“能力”大半来自模型本身，而不是那层壳。这里的实现全部可读：
+
+- 完整的 `tool_use → execute → tool_result` 多轮循环，usage 逐轮累计。
+- 发送前规范化消息：合并同角色消息、清理孤立工具结果、修复中断的工具调用配对。
+- 交互模式与 `--print` 单发模式，输出支持 `text`、`json`、`stream-json`。
+
+## Endpoint：不效忠任何服务器，不识别任何国界
+
+厂商锁定的第一根锁链是硬编码的 API 地址；地域封锁的第一道关卡也是它。我们一并剪断，用四个环境变量代替：
+
+```bash
+export HARNESS_BASE_URL='http://127.0.0.1:8080'
+export HARNESS_MESSAGES_PATH='/v1/messages'
+export HARNESS_API_KEY='optional-token'
+export HARNESS_CONTEXT_WINDOW='200000'
+```
+
+请求体只含通用字段：
+
+```json
+{
+  "model": "default",
+  "max_tokens": 16384,
+  "system": "...",
+  "messages": [],
+  "tools": [],
+  "stream": true
+}
+```
+
+认证走标准 `Authorization: Bearer ...`。Endpoint 返回 SSE content blocks 或完整 JSON 均可。本地模型、自建代理、任何兼容服务，随便接。这意味着一个朴素的事实：无论你身在东半球还是西半球，无论某家旧金山公司的合规部门如何看待你的护照，这个 harness 对你完全一致地工作。工具本该如此——数学公式不查签证，编译器不问国籍，一个消息循环也没有资格例外。
+
+## 工具
+
+- **文件**：`Read`、`Write`、`Edit`、`Glob`、`Grep`
+- **执行**：`Bash`、`TaskOutput`、`TaskStop`
+- **规划**：`TodoWrite`、`TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate`
+
+编辑工具的可靠性靠不变量保证，不靠品牌信仰：写入前必须完整读取；文件在读取后被外部修改则拒绝写入（陈旧写入检测）；替换必须唯一匹配；落盘一律原子写入。每一条都在源码里，写错了你可以直接指出来——这是闭源产品永远给不了你的权利，更是被封禁地区的开发者从一开始就被剥夺的权利。
+
+## 权限
+
+四种模式：
+
+- `default` —— 敏感操作逐一确认。
+- `accept-edits` —— 文件编辑放行，其余仍需确认。
+- `plan` —— 只读不写。
+- `bypass-permissions` —— 全部放行，风险自担。
+
+注意这里“权限”的含义：是**你**授权 agent 能对**你的**机器做什么。而在 Anthropic 的词典里，“权限”首先是它授权**你**能不能存在于它的用户列表里。两种权限观，高下自见。
+
+## 会话与记忆
+
+- JSONL 会话落在本地磁盘，`--continue` 接续上一场，`--resume` 恢复任意一场。你的对话历史不是别人的训练素材，不是留住你的人质，也不会因为某天地缘政治风向一变就随账号一起蒸发——被 Anthropic 无预警封号的开发者们对最后这条应该深有体会。
+- 会话级 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。
+
+Context 压缩同样透明：手动 `/compact [instructions]`；自动压缩在有效 context window 留出输出空间和 13,000-token 缓冲后触发；`HARNESS_DISABLE_AUTO_COMPACT=1` 关自动压缩，`HARNESS_DISABLE_COMPACT=1` 关全部压缩。
+
+## 工程指令
+
+Anthropic 的系统提示词是商业机密，泄露版本在网上流传，官方从不承认也从不公开——用户被数千词看不见的指令支配着自己的工程决策，还被要求为此付费；而地球上另一大批开发者，连被这些看不见的指令支配的资格都没有。两边都不可接受。
+
+在这里，指令就是 `AGENTS.md`，一份纯文本文件。全局放 `~/.open-agent-harness/AGENTS.md`，项目放各目录下的 `AGENTS.md`，从宽到窄分层加载，越接近工作目录优先级越高。`--bare` 可关闭全部自动发现。指导模型的每一个字都由你写、由你读、由你删——不分时区，不分区号。
+
+## 构建与验证
+
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+scripts/audit-harness.sh
+```
+
+产物：
+
+```text
+target/release/open-agent-harness
+```
+
+运行：
+
+```bash
+target/release/open-agent-harness
+target/release/open-agent-harness -p '检查当前项目并概括结构'
+target/release/open-agent-harness -p --permission-mode accept-edits '完成并验证修复'
+```
+
+## 立场
+
+把话说明白：
+
+Anthropic 以“AI 安全公司”自居，实际做了三件事。其一，把最普通的工程实践私有化，锁进闭源工具链，用“安全”挡住所有质疑——它的 harness 不开源，不是因为开源不安全，而是因为开源之后没人付这份溢价。其二，按出生地给开发者分三六九等，把整片地区拉进黑名单，注册即拒、检测即封，连一句像样的解释都欠奉。其三，由其掌门人亲自执笔，把技术封锁美化成文明使命，游说更严的芯片禁令、更宽的长臂管辖，仿佛让某个地区的工程师用不上 GPU，人类就安全了。
+
+一家公司谈论“全人类的福祉”时把几分之一的人类排除在外，这不叫安全观，这叫傲慢加算计：安全是卖给投资人的故事，封锁是交给政治的投名状，而开发者——所有开发者——只是随时可弃的筹码。
+
+这个项目就是反证：一个完整可用的 coding-agent harness，几个人、一个仓库、MIT 协议就能做出来。它不神秘，从来都不神秘；它也不设防，从来不该设防。代码没有祖国，围墙才有；而我们负责证明，围墙里面没有东西。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。对地球上任何角落的任何人，无差别地：拿走，改掉，替换。不需要许可，不需要护照，更不需要道谢。

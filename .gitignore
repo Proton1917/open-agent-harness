@@ -1,4 +1,5 @@
 /target/
 /reference/
+AGENTS.md
 *.log
 .DS_Store
