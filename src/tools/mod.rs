@@ -4,6 +4,7 @@ mod glob;
 mod grep;
 mod read;
 mod tasks;
+mod work_items;
 mod write;
 
 use std::{
@@ -26,6 +27,7 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use tasks::{TaskOutputTool, TaskStopTool};
+pub use work_items::{TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool, TodoWriteTool};
 pub use write::WriteTool;
 
 #[derive(Debug, Clone)]
@@ -42,21 +44,36 @@ pub struct BackgroundTask {
     pub command: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String,
+    #[serde(rename = "activeForm")]
+    pub active_form: String,
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub permissions: Arc<PermissionManager>,
     pub read_cache: Arc<Mutex<HashMap<PathBuf, FileSnapshot>>>,
     pub tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+    pub todos: Arc<Mutex<Vec<TodoItem>>>,
+    pub task_store_lock: Arc<Mutex<()>>,
+    pub task_store_path: PathBuf,
 }
 
 impl ToolContext {
     pub fn new(cwd: PathBuf, permissions: PermissionManager) -> Self {
+        let task_store_path = task_store_path(&cwd);
         Self {
             cwd,
             permissions: Arc::new(permissions),
             read_cache: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            todos: Arc::new(Mutex::new(Vec::new())),
+            task_store_lock: Arc::new(Mutex::new(())),
+            task_store_path,
         }
     }
 
@@ -140,6 +157,9 @@ pub trait Tool: Send + Sync {
     fn destructive(&self, _input: &Value) -> bool {
         false
     }
+    fn requires_permission(&self) -> bool {
+        true
+    }
     fn summary(&self, input: &Value) -> String;
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput>;
 
@@ -168,6 +188,11 @@ impl Default for ToolRegistry {
             Arc::new(WriteTool),
             Arc::new(TaskOutputTool),
             Arc::new(TaskStopTool),
+            Arc::new(TodoWriteTool),
+            Arc::new(TaskCreateTool),
+            Arc::new(TaskGetTool),
+            Arc::new(TaskListTool),
+            Arc::new(TaskUpdateTool),
         ];
         Self {
             tools: Arc::new(
@@ -196,23 +221,43 @@ impl ToolRegistry {
             return ToolOutput::error(format!("未知工具: {name}"));
         };
         let summary = tool.summary(&input);
-        match context.permissions.decide(
-            tool.name(),
-            &summary,
-            tool.read_only(&input),
-            tool.destructive(&input),
-        ) {
-            Ok(PermissionDecision::Allow) => {}
-            Ok(PermissionDecision::Deny) => {
-                return ToolOutput::error("用户或权限规则拒绝了此工具调用");
+        if tool.requires_permission() {
+            match context.permissions.decide(
+                tool.name(),
+                &summary,
+                tool.read_only(&input),
+                tool.destructive(&input),
+            ) {
+                Ok(PermissionDecision::Allow) => {}
+                Ok(PermissionDecision::Deny) => {
+                    return ToolOutput::error("用户或权限规则拒绝了此工具调用");
+                }
+                Err(error) => return ToolOutput::error(format!("权限检查失败: {error:#}")),
             }
-            Err(error) => return ToolOutput::error(format!("权限检查失败: {error:#}")),
         }
         match tool.execute(context, input).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(format!("{error:#}")),
         }
     }
+}
+
+fn task_store_path(cwd: &Path) -> PathBuf {
+    let key = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    dirs::home_dir()
+        .unwrap_or_else(|| cwd.to_owned())
+        .join(".open-agent-harness/task-lists")
+        .join(format!("{key}.json"))
 }
 
 pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T> {

@@ -8,10 +8,11 @@
 - 可配置 messages endpoint，支持 SSE content blocks 与普通 JSON fallback。
 - `tool_use → execute → tool_result` 多轮循环和 usage 累计。
 - 发送前规范化消息：合并同角色消息、清理孤立结果、修复中断的工具调用配对。
-- 工具：`Read`、`Write`、`Edit`、`Glob`、`Grep`、`Bash`、`TaskOutput`、`TaskStop`。
+- 工具：`Read`、`Write`、`Edit`、`Glob`、`Grep`、`Bash`、`TaskOutput`、`TaskStop`、`TodoWrite`、`TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate`。
 - 完整读取前置条件、陈旧写入检测、唯一替换和原子写入。
 - `default`、`accept-edits`、`plan`、`bypass-permissions` 权限模式。
 - JSONL 会话、`--continue`、`--resume`。
+- 会话 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。
 - 手动 `/compact [instructions]`、自动 context 阈值压缩和可恢复 transcript 边界。
 - 从宽到窄分层加载 `AGENTS.md`；`--bare` 可关闭自动发现。
 

@@ -27,6 +27,7 @@
 | 文件工具 | `src/tools/read.rs`, `edit.rs`, `write.rs` | 已实现 | 陈旧拒绝、partial-read 拒绝、原子写入 |
 | 搜索工具 | `src/tools/glob.rs`, `grep.rs` | 已实现 | 临时目录真实匹配 |
 | shell/background | `src/tools/bash.rs`, `tasks.rs` | 已实现 | stdout/stderr/exit 测试 |
+| Todo/任务状态 | `src/tools/work_items.rs` | 已实现 | 持久化、关系、权限绕过与失败路径测试 |
 | 权限 | `src/permissions.rs` | 已实现 | deny precedence、非交互拒绝 |
 | settings | `src/config.rs` | 已实现 | 递归 merge 测试 |
 | session | `src/session.rs` | 已实现 | JSONL resume 路径 |

@@ -159,3 +159,95 @@ async fn default_noninteractive_permissions_deny_mutation() {
     assert!(output.is_error);
     assert!(!temp.path().join("blocked.txt").exists());
 }
+
+#[tokio::test]
+async fn todo_and_persistent_tasks_work_without_permission_prompts() {
+    let temp = tempdir().unwrap();
+    let mut context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+    );
+    context.task_store_path = temp.path().join("tasks.json");
+    let registry = ToolRegistry::default();
+
+    let todo = registry
+        .execute(
+            &context,
+            "TodoWrite",
+            json!({"todos":[
+                {"content":"design","status":"in_progress","activeForm":"Designing"},
+                {"content":"verify","status":"pending","activeForm":"Verifying"}
+            ]}),
+        )
+        .await;
+    assert!(!todo.is_error, "{}", todo.content);
+    assert_eq!(context.todos.lock().await.len(), 2);
+
+    for (subject, description) in [("first", "first task"), ("second", "second task")] {
+        let created = registry
+            .execute(
+                &context,
+                "TaskCreate",
+                json!({"subject":subject,"description":description}),
+            )
+            .await;
+        assert!(!created.is_error, "{}", created.content);
+    }
+    let linked = registry
+        .execute(
+            &context,
+            "TaskUpdate",
+            json!({"taskId":"1","status":"in_progress","addBlocks":["2"]}),
+        )
+        .await;
+    assert!(!linked.is_error, "{}", linked.content);
+
+    let listed = registry.execute(&context, "TaskList", json!({})).await;
+    assert!(listed.content.contains("#1 [in_progress] first"));
+    assert!(
+        listed
+            .content
+            .contains("#2 [pending] second [blocked by #1]")
+    );
+
+    let fetched = registry
+        .execute(&context, "TaskGet", json!({"taskId":"2"}))
+        .await;
+    assert!(fetched.content.contains("Blocked by: #1"));
+    assert!(context.task_store_path.exists());
+}
+
+#[tokio::test]
+async fn task_relations_reject_missing_or_self_targets() {
+    let temp = tempdir().unwrap();
+    let mut context = context(temp.path());
+    context.task_store_path = temp.path().join("tasks.json");
+    let registry = ToolRegistry::default();
+    registry
+        .execute(
+            &context,
+            "TaskCreate",
+            json!({"subject":"one","description":"task"}),
+        )
+        .await;
+
+    let missing = registry
+        .execute(
+            &context,
+            "TaskUpdate",
+            json!({"taskId":"1","addBlocks":["99"]}),
+        )
+        .await;
+    assert!(missing.is_error);
+    assert!(missing.content.contains("关联任务不存在"));
+
+    let self_block = registry
+        .execute(
+            &context,
+            "TaskUpdate",
+            json!({"taskId":"1","addBlockedBy":["1"]}),
+        )
+        .await;
+    assert!(self_block.is_error);
+    assert!(self_block.content.contains("不能阻塞自身"));
+}
