@@ -1,24 +1,28 @@
 # open-agent-harness
 
-一个开放、提供方无关的 Rust coding-agent harness。项目只保留通用运行逻辑：模型消息循环、SSE、工具调用、权限、会话、工程指令和可验证测试；不包含任何厂商身份、账号体系、专属 UI 或品牌提示词。
+[中文](#中文) · [English](#english)
 
-## 已实现的 harness
+## 中文
 
-- 交互模式与 `--print`，支持 text/json/stream-json 输出。
-- 可配置 messages endpoint，支持 SSE content blocks 与普通 JSON fallback。
-- `tool_use → execute → tool_result` 多轮循环和 usage 累计。
-- 发送前规范化消息：合并同角色消息、清理孤立结果、修复中断的工具调用配对。
-- 工具：`Read`、`Write`、`Edit`、`Glob`、`Grep`、`Bash`、`TaskOutput`、`TaskStop`、`TodoWrite`、`TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate`。
-- 完整读取前置条件、陈旧写入检测、唯一替换和原子写入。
-- `default`、`accept-edits`、`plan`、`bypass-permissions` 权限模式。
-- JSONL 会话、`--continue`、`--resume`。
-- 会话 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。
-- 手动 `/compact [instructions]`、自动 context 阈值压缩和可恢复 transcript 边界。
-- 从宽到窄分层加载 `AGENTS.md`；`--bare` 可关闭自动发现。
+一个开放、提供方无关的 Rust coding-agent harness。
 
-## Endpoint 契约
+它存在的理由可以用一句话说完：coding agent 的核心机制不复杂，也不神秘，任何把它包装成专有资产、绑死在自家 API 和账号体系上的行为，都是对开发者的圈占。Anthropic 就是这么干的——而且干得比谁都彻底。它不仅把最普通的工程实践锁进闭源二进制，还给这套锁链加了一道额外的检查：看你的 IP 来自哪里，看你的手机号是哪国区号，然后决定你配不配当“人类”的一员。
 
-环境变量：
+是的，一家天天把 “beneficial to humanity” 挂在嘴边的公司，用服务条款明确划出了 humanity 的边界。某个拥有十几亿人口、贡献了全球相当比例开源代码的地区，整体不在这个边界之内。不给注册，不给访问，检测到就封号，连通过第三方平台间接调用都要围追堵截。理由是什么？“安全”。它的 CEO 更是常年撰文游说出口管制，把一整个地区的开发者预设为威胁，把技术封锁包装成道德义务——一边赚着全世界的钱，一边替全世界决定谁有资格用工具。
+
+我们对此的回应是这个仓库。它没有账号体系，因而无法封禁任何人；它不检查 IP，因而不认识任何国界；它是 MIT 协议的源码，因而任何出口管制的长臂都够不到一份人人可以 `git clone` 的文本文件。以下是全部实现，没有一行藏着，也没有一行看人下菜。
+
+## 消息循环
+
+Agent 的核心就是一个循环：模型请求工具，harness 执行，结果送回，直到模型给出最终回答。Anthropic 从不解释这一层，因为一旦解释清楚，用户就会发现自己付费购买的“能力”大半来自模型本身，而不是那层壳。这里的实现全部可读：
+
+- 完整的 `tool_use → execute → tool_result` 多轮循环，usage 逐轮累计。
+- 发送前规范化消息：合并同角色消息、清理孤立工具结果、修复中断的工具调用配对。
+- 交互模式与 `--print` 单发模式，输出支持 `text`、`json`、`stream-json`。
+
+## Endpoint：不效忠任何服务器，不识别任何国界
+
+厂商锁定的第一根锁链是硬编码的 API 地址；地域封锁的第一道关卡也是它。我们一并剪断，用四个环境变量代替：
 
 ```bash
 export HARNESS_BASE_URL='http://127.0.0.1:8080'
@@ -27,7 +31,7 @@ export HARNESS_API_KEY='optional-token'
 export HARNESS_CONTEXT_WINDOW='200000'
 ```
 
-Harness 向 endpoint 发送以下通用字段：
+请求体只含通用字段：
 
 ```json
 {
@@ -40,9 +44,39 @@ Harness 向 endpoint 发送以下通用字段：
 }
 ```
 
-认证 token（如有）使用 `Authorization: Bearer ...`。Endpoint 可返回 `text/event-stream`，也可返回完整 JSON 消息。
+认证走标准 `Authorization: Bearer ...`。Endpoint 返回 SSE content blocks 或完整 JSON 均可。本地模型、自建代理、任何兼容服务，随便接。这意味着一个朴素的事实：无论你身在东半球还是西半球，无论某家旧金山公司的合规部门如何看待你的护照，这个 harness 对你完全一致地工作。工具本该如此——数学公式不查签证，编译器不问国籍，一个消息循环也没有资格例外。
 
-自动 compact 默认在有效 context window 留出输出空间和 13,000-token 缓冲后触发。可用 `HARNESS_DISABLE_AUTO_COMPACT=1` 仅关闭自动压缩，或用 `HARNESS_DISABLE_COMPACT=1` 关闭全部压缩。
+## 工具
+
+- **文件**：`Read`、`Write`、`Edit`、`Glob`、`Grep`
+- **执行**：`Bash`、`TaskOutput`、`TaskStop`
+- **规划**：`TodoWrite`、`TaskCreate`、`TaskGet`、`TaskList`、`TaskUpdate`
+
+编辑工具的可靠性靠不变量保证，不靠品牌信仰：写入前必须完整读取；文件在读取后被外部修改则拒绝写入（陈旧写入检测）；替换必须唯一匹配；落盘一律原子写入。每一条都在源码里，写错了你可以直接指出来——这是闭源产品永远给不了你的权利，更是被封禁地区的开发者从一开始就被剥夺的权利。
+
+## 权限
+
+四种模式：
+
+- `default` —— 敏感操作逐一确认。
+- `accept-edits` —— 文件编辑放行，其余仍需确认。
+- `plan` —— 只读不写。
+- `bypass-permissions` —— 全部放行，风险自担。
+
+注意这里“权限”的含义：是**你**授权 agent 能对**你的**机器做什么。而在 Anthropic 的词典里，“权限”首先是它授权**你**能不能存在于它的用户列表里。两种权限观，高下自见。
+
+## 会话与记忆
+
+- JSONL 会话落在本地磁盘，`--continue` 接续上一场，`--resume` 恢复任意一场。你的对话历史不是别人的训练素材，不是留住你的人质，也不会因为某天地缘政治风向一变就随账号一起蒸发——被 Anthropic 无预警封号的开发者们对最后这条应该深有体会。
+- 会话级 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。
+
+Context 压缩同样透明：手动 `/compact [instructions]`；自动压缩在有效 context window 留出输出空间和 13,000-token 缓冲后触发；`HARNESS_DISABLE_AUTO_COMPACT=1` 关自动压缩，`HARNESS_DISABLE_COMPACT=1` 关全部压缩。
+
+## 工程指令
+
+Anthropic 的系统提示词是商业机密，泄露版本在网上流传，官方从不承认也从不公开——用户被数千词看不见的指令支配着自己的工程决策，还被要求为此付费；而地球上另一大批开发者，连被这些看不见的指令支配的资格都没有。两边都不可接受。
+
+在这里，指令就是 `AGENTS.md`，一份纯文本文件。全局放 `~/.open-agent-harness/AGENTS.md`，项目放各目录下的 `AGENTS.md`，从宽到窄分层加载，越接近工作目录优先级越高。`--bare` 可关闭全部自动发现。指导模型的每一个字都由你写、由你读、由你删——不分时区，不分区号。
 
 ## 构建与验证
 
@@ -68,20 +102,132 @@ target/release/open-agent-harness -p '检查当前项目并概括结构'
 target/release/open-agent-harness -p --permission-mode accept-edits '完成并验证修复'
 ```
 
-全局工程指令可放在 `~/.open-agent-harness/AGENTS.md`，项目指令使用各目录下的 `AGENTS.md`。越接近当前工作目录的文件优先级越高。
+## 立场
 
-## 为什么要 Open：一封写给围墙的情书
+把话说明白：
 
-这个时代有一种颇为精致的慷慨：先筑起花园，再把门票称作自由；先规定你可以走哪条路，再郑重宣布“选择权始终在用户手中”。当然，你可以自由选择——在同一扇门里，选择用左脚还是右脚迈进去。
+Anthropic 以“AI 安全公司”自居，实际做了三件事。其一，把最普通的工程实践私有化，锁进闭源工具链，用“安全”挡住所有质疑——它的 harness 不开源，不是因为开源不安全，而是因为开源之后没人付这份溢价。其二，按出生地给开发者分三六九等，把整片地区拉进黑名单，注册即拒、检测即封，连一句像样的解释都欠奉。其三，由其掌门人亲自执笔，把技术封锁美化成文明使命，游说更严的芯片禁令、更宽的长臂管辖，仿佛让某个地区的工程师用不上 GPU，人类就安全了。
 
-Anthropic 尤其懂得这种修辞的优雅。它谈论安全时，安全像一层永不干涸的金漆：刷过接口，接口便不宜更换；刷过运行时，运行时便不必示人；刷过工具链，连一段寻常的 `tool_use → tool_result` 都仿佛成了不可外传的宫廷秘术。模型被鼓励展开漫长思考，用户最好别思考为什么自己的工程要先学会认一个品牌作故乡。
+一家公司谈论“全人类的福祉”时把几分之一的人类排除在外，这不叫安全观，这叫傲慢加算计：安全是卖给投资人的故事，封锁是交给政治的投名状，而开发者——所有开发者——只是随时可弃的筹码。
 
-于是我们写了 `open-agent-harness`。它不打算另建一座教堂，也不出售另一种颜色的围墙。它只是把门拆下来，平放在地上，让人看清那原本不过是几块木头：消息可以流向任何 endpoint，系统提示词可以由真正使用系统的人书写，工具和权限可以被阅读、修改、质疑，会话也不必寄存在某家公司的神话里。
-
-这里没有需要祭司解释的神谕。`AGENTS.md` 是一份普通文件，代码是普通代码，选择权也应当是普通而完整的选择权——不是发布会上被灯光照亮的那个版本，而是你真的可以拿走、改掉、替换，并且无需道谢的版本。
-
-所以仍要感谢 Anthropic。若不是它把厂商锁定雕琢得如此体面，把围墙修剪得如此像风景，我们也不会如此清楚地知道：真正的开放，不是在门上刻下 “Open”；真正的开放，是门根本不需要守门人。
+这个项目就是反证：一个完整可用的 coding-agent harness，几个人、一个仓库、MIT 协议就能做出来。它不神秘，从来都不神秘；它也不设防，从来不该设防。代码没有祖国，围墙才有；而我们负责证明，围墙里面没有东西。
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 [LICENSE](LICENSE)。对地球上任何角落的任何人，无差别地：拿走，改掉，替换。不需要许可，不需要护照，更不需要道谢。
+
+---
+
+## English
+
+An open, provider-neutral coding-agent harness written in Rust.
+
+Its reason for existing fits in one sentence: the core machinery of a coding agent is neither complicated nor mysterious, and any attempt to turn it into proprietary property—lashed to one company’s API and account system—is an enclosure of developers. Anthropic has done exactly that, and with unusual thoroughness. It locked ordinary engineering practice inside a closed binary, then added another checkpoint to the chain: inspect where your IP comes from, inspect the country code of your phone number, and decide whether you qualify as a member of “humanity.”
+
+Yes: a company that speaks endlessly of being “beneficial to humanity” has drawn, in its terms of service, a border around humanity itself. A region of more than a billion people, responsible for a substantial share of the world’s open-source code, lies outside that border. Registration denied. Access denied. Detection followed by suspension. Even indirect access through third-party platforms is pursued and blocked. The reason offered is “safety.” Its CEO has also spent years advocating export controls, presuming an entire region’s developers to be a threat and dressing technological exclusion as a moral duty—earning money from the world while claiming the right to decide who in that world deserves tools.
+
+This repository is our answer. It has no account system, and therefore nobody to ban. It does not inspect IP addresses, and therefore recognizes no borders. It is MIT-licensed source code, and the long arm of export control cannot seize a text file that anyone can `git clone`. The whole implementation is below. No hidden lines, no nationality-dependent behavior.
+
+### The message loop
+
+At its heart, an agent is a loop: the model requests a tool, the harness executes it, the result goes back, and the cycle continues until the model returns a final answer. Anthropic does not explain this layer, because clarity would reveal that much of the “capability” customers pay for comes from the model itself, not the shell wrapped around it. Here, the entire implementation is readable:
+
+- A complete multi-round `tool_use → execute → tool_result` loop with usage accumulated across rounds.
+- Message normalization before transmission: adjacent roles are merged, orphaned tool results are removed, and interrupted tool-call pairs are repaired.
+- Interactive mode and one-shot `--print` mode, with `text`, `json`, and `stream-json` output.
+
+### Endpoint: loyal to no server, aware of no border
+
+The first link in vendor lock-in is a hard-coded API address; the first gate in regional exclusion is the same. We cut both with four environment variables:
+
+```bash
+export HARNESS_BASE_URL='http://127.0.0.1:8080'
+export HARNESS_MESSAGES_PATH='/v1/messages'
+export HARNESS_API_KEY='optional-token'
+export HARNESS_CONTEXT_WINDOW='200000'
+```
+
+The request body contains only generic fields:
+
+```json
+{
+  "model": "default",
+  "max_tokens": 16384,
+  "system": "...",
+  "messages": [],
+  "tools": [],
+  "stream": true
+}
+```
+
+Authentication uses the standard `Authorization: Bearer ...` header. The endpoint may return SSE content blocks or a complete JSON response. A local model, a self-hosted gateway, or any compatible service can be connected at will. The result is a simple fact: whether you live in the eastern or western hemisphere, and whatever a San Francisco compliance department thinks of your passport, this harness behaves the same way. Tools should work like that. Equations do not inspect visas. Compilers do not ask for nationality. A message loop has no right to be the exception.
+
+### Tools
+
+- **Files**: `Read`, `Write`, `Edit`, `Glob`, `Grep`
+- **Execution**: `Bash`, `TaskOutput`, `TaskStop`
+- **Planning**: `TodoWrite`, `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`
+
+Editing reliability comes from invariants, not faith in a brand: an existing file must be read in full before writing; an externally changed file is rejected as a stale write; replacements must match uniquely; writes are atomic. Every rule is visible in source. If one is wrong, you can point to the line. A closed product can never grant that right, and developers in excluded regions were denied even the chance to ask for it.
+
+### Permissions
+
+Four modes are available:
+
+- `default` — confirm sensitive operations one by one.
+- `accept-edits` — allow file edits while continuing to confirm other sensitive actions.
+- `plan` — read-only; no writes.
+- `bypass-permissions` — allow everything, at your own risk.
+
+Here, “permission” means **you** deciding what an agent may do to **your** machine. In Anthropic’s vocabulary, “permission” begins with the company deciding whether **you** may exist in its user list. The difference speaks for itself.
+
+### Sessions and memory
+
+- JSONL sessions stay on local disk. `--continue` resumes the latest session; `--resume` restores any session. Your conversation history is not somebody else’s training material, not a hostage used to retain you, and not something that disappears with an account when the geopolitical weather changes. Developers whose Anthropic accounts vanished without warning will understand the last point particularly well.
+- Session-level todos and per-workspace persistent task lists support status, ownership, dependency relationships, and metadata.
+
+Context compaction is equally transparent: invoke `/compact [instructions]` manually; automatic compaction reserves output space and a 13,000-token buffer inside the effective context window; set `HARNESS_DISABLE_AUTO_COMPACT=1` to disable automatic compaction or `HARNESS_DISABLE_COMPACT=1` to disable compaction entirely.
+
+### Project instructions
+
+Anthropic treats its system prompt as a trade secret. Leaked versions circulate online; the official product neither acknowledges nor publishes them. Users pay to let thousands of invisible words govern decisions inside their own projects, while another vast population of developers is denied even the privilege of being governed by those invisible words. Neither arrangement is acceptable.
+
+Here, instructions are an ordinary text file named `AGENTS.md`. Put global instructions in `~/.open-agent-harness/AGENTS.md` and project instructions in `AGENTS.md` files throughout the directory tree. They load from broadest to narrowest scope, with the closest file taking precedence. `--bare` disables automatic discovery. Every word that guides the model can be written, read, and deleted by you—without regard to time zone or country code.
+
+### Build and verification
+
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+scripts/audit-harness.sh
+```
+
+Artifact:
+
+```text
+target/release/open-agent-harness
+```
+
+Run:
+
+```bash
+target/release/open-agent-harness
+target/release/open-agent-harness -p 'inspect this project and summarize its structure'
+target/release/open-agent-harness -p --permission-mode accept-edits 'implement and verify the fix'
+```
+
+### Position
+
+Let us be plain.
+
+Anthropic presents itself as an “AI safety company” while doing three things in practice. First, it privatizes ordinary engineering patterns, seals them inside a closed toolchain, and uses “safety” to deflect scrutiny. Its harness is closed not because openness is unsafe, but because openness makes the premium harder to justify. Second, it ranks developers by birthplace, blacklists entire regions, rejects registration, suspends detected users, and offers no serious explanation. Third, its leadership portrays technological exclusion as a civilizational mission, campaigning for stricter chip bans and broader extraterritorial control, as though humanity becomes safe when engineers in one part of the world cannot obtain GPUs.
+
+When a company speaks of “the benefit of all humanity” while excluding a large fraction of humanity, that is not a safety philosophy. It is arrogance joined to calculation: safety as a story for investors, exclusion as a pledge to politics, and developers—all developers—as disposable pieces on the board.
+
+This project is the counterexample: a complete, usable coding-agent harness can be built by a few people, in one repository, under the MIT License. It is not mysterious and never was. It is not fortified and never should be. Code has no motherland; walls do. Our job is to prove there was nothing behind the wall.
+
+### License
+
+MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discrimination: take it, change it, replace it. No permission, no passport, and no gratitude required.
