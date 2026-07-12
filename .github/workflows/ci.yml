@@ -1,0 +1,38 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust source and release audit
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run all tests without warnings
+        run: cargo test --locked --all-targets
+
+      - name: Run clippy without warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release without warnings
+        run: cargo build --locked --release
+
+      - name: Audit tracked source and release artifact
+        run: scripts/audit-harness.sh

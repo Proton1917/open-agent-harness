@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 if [[ "$(basename "$root")" != "open-agent-harness" ]]; then
   echo 'project_directory_name_valid=false' >&2
@@ -21,17 +21,46 @@ scan_paths=(
   "$root/src"
   "$root/tests"
   "$root/scripts"
+  "$root/.cargo"
+  "$root/.github"
+  "$root/CHANGELOG.md"
   "$root/MIGRATION.md"
 )
 
+non_rust_runtime="$(find "$root/src" -type f ! -name '*.rs' -print -quit)"
+if [[ -n "$non_rust_runtime" ]]; then
+  printf 'non_rust_runtime_file=%s\n' "$non_rust_runtime" >&2
+  exit 1
+fi
+echo 'runtime_is_rust=true'
+
+if ! rg -q 'rustflags = \["-D", "warnings"\]' "$root/.cargo/config.toml" \
+  || ! rg -q 'RUSTFLAGS: -D warnings' "$root/.github/workflows/ci.yml"; then
+  echo 'warnings_are_errors=false' >&2
+  exit 1
+fi
+echo 'warnings_are_errors=true'
+
 removed_terms=('cl''aude' 'anth''ropic')
+release_binary="$root/target/release/open-agent-harness"
+if [[ ! -x "$release_binary" ]]; then
+  echo 'release_binary_present=false' >&2
+  exit 1
+fi
+if find "$root/Cargo.toml" "$root/Cargo.lock" "$root/src" -newer "$release_binary" -print -quit \
+  | rg -q .; then
+  echo 'release_binary_current=false' >&2
+  exit 1
+fi
+echo 'release_binary_present=true'
+echo 'release_binary_current=true'
+
 for term in "${removed_terms[@]}"; do
   if rg -n -i "$term" "${scan_paths[@]}"; then
     echo 'brand_free=false' >&2
     exit 1
   fi
-  if [[ -x "$root/target/release/open-agent-harness" ]] \
-    && strings "$root/target/release/open-agent-harness" | rg -q -i "$term"; then
+  if strings "$release_binary" | rg -q -i "$term"; then
     echo 'binary_brand_free=false' >&2
     exit 1
   fi
@@ -53,7 +82,10 @@ if [[ -n "$(git -C "$root" ls-files 'AGENTS.md' '**/AGENTS.md')" ]] \
 fi
 echo 'agents_instructions_ignored=true'
 
-reference_git="$(find "$root/reference" -mindepth 2 -maxdepth 2 -type d -name .git -print -quit)"
+reference_git=""
+if [[ -d "$root/reference" ]]; then
+  reference_git="$(find "$root/reference" -mindepth 2 -maxdepth 2 -type d -name .git -print -quit)"
+fi
 if [[ -n "$reference_git" ]]; then
   reference_root="$(dirname "$reference_git")"
   if [[ -n "$(git -C "$reference_root" status --short)" ]]; then
@@ -62,3 +94,38 @@ if [[ -n "$reference_git" ]]; then
   fi
 fi
 echo 'reference_clean=true'
+
+if rg -n 'https?://' "$root/src" \
+  | rg -v -e 'http://127\.0\.0\.1:8080' -e 'https?://[^[:space:]\"]*\.invalid'; then
+  echo 'hardcoded_remote_endpoint_free=false' >&2
+  exit 1
+fi
+echo 'hardcoded_remote_endpoint_free=true'
+
+sensitive_runtime_terms=(
+  'event_logging'
+  'growthbook'
+  'datadog'
+  'telemetry'
+  'device_id'
+  'machine_id'
+  'account_uuid'
+  'organization_uuid'
+)
+for term in "${sensitive_runtime_terms[@]}"; do
+  if rg -n -i "$term" "$root/src"; then
+    echo 'hidden_metadata_free=false' >&2
+    exit 1
+  fi
+done
+echo 'hidden_metadata_free=true'
+
+while IFS= read -r tracked; do
+  [[ -f "$root/$tracked" ]] || continue
+  size="$(wc -c < "$root/$tracked" | tr -d ' ')"
+  if (( size > 1048576 )); then
+    printf 'tracked_file_too_large=%s:%s\n' "$tracked" "$size" >&2
+    exit 1
+  fi
+done < <(git -C "$root" ls-files)
+echo 'tracked_files_open_source_sized=true'

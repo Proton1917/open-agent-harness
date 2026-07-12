@@ -47,6 +47,7 @@ async fn query_engine_round_trips_tool_use_and_result() {
         token: Some("test-key".into()),
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
     })
     .unwrap();
     let context = ToolContext::new(
@@ -93,6 +94,165 @@ async fn query_engine_round_trips_tool_use_and_result() {
     assert!(second.contains("rust migration evidence"));
 }
 
+#[tokio::test]
+async fn failed_model_round_rolls_back_unpersisted_messages() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut stream);
+        let body = b"not-json";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    assert!(engine.run_turn("must rollback".into()).await.is_err());
+    server.join().unwrap();
+    assert!(engine.messages.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_followup_stops_background_tasks_started_by_the_turn() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut first);
+        let stream = background_tool_stream();
+        write!(
+            first,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            stream.len(),
+            stream
+        )
+        .unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut second);
+        let body = b"not-json";
+        write!(
+            second,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        second.write_all(body).unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let observed = context.clone();
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    assert!(
+        engine
+            .run_turn("start a background task".into())
+            .await
+            .is_err()
+    );
+    server.join().unwrap();
+    assert!(observed.tasks.lock().await.is_empty());
+    assert!(engine.messages.is_empty());
+}
+
+#[test]
+fn context_estimate_includes_system_prompt_and_tool_schemas() {
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: "http://127.0.0.1:9".into(),
+        messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test".into(),
+            max_tokens: 16,
+            system: "s".repeat(4_000),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    assert!(engine.estimated_tokens() > 1_000);
+}
+
 fn tool_use_stream() -> String {
     [
         serde_json::json!({"type":"message_start","message":{"id":"msg_tool","usage":{"input_tokens":10,"output_tokens":0}}}),
@@ -116,6 +276,20 @@ fn text_stream() -> String {
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"链路完成"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
         serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(sse_event)
+    .collect()
+}
+
+fn background_tool_stream() -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{"id":"msg_background","usage":{}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_background","name":"Bash","input":{}}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"sleep 30\",\"run_in_background\":true}"}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()

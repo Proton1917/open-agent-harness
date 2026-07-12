@@ -41,6 +41,7 @@ async fn compact_replaces_history_with_formatted_continuation() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
     })
     .unwrap();
     let context = ToolContext::new(
@@ -109,6 +110,7 @@ async fn query_auto_compacts_before_normal_model_round() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        allow_env_proxy: false,
     })
     .unwrap();
     let context = ToolContext::new(

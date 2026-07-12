@@ -9,6 +9,9 @@ use walkdir::{DirEntry, WalkDir};
 
 use super::{Tool, ToolContext, ToolOutput, object_schema, parse_input};
 
+const MAX_VISITED_ENTRIES: usize = 200_000;
+const MAX_SEARCH_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Deserialize)]
 struct Input {
     pattern: String,
@@ -28,14 +31,17 @@ impl Tool for GlobTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "pattern": {"type": "string"},
-                "path": {"type": "string", "description": "Search root; defaults to cwd"}
+                "pattern": {"type": "string", "maxLength": 4096},
+                "path": {"type": "string", "maxLength": 4096, "description": "Search root; defaults to cwd"}
             }),
             &["pattern"],
         )
     }
     fn read_only(&self, _: &Value) -> bool {
         true
+    }
+    fn path_fields(&self) -> &'static [&'static str] {
+        &["path"]
     }
     fn summary(&self, input: &Value) -> String {
         input
@@ -59,11 +65,17 @@ impl Tool for GlobTool {
         let started = Instant::now();
         let mut files = Vec::new();
         let mut truncated = false;
+        let mut visited = 0usize;
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
             .filter_entry(include_entry)
         {
+            visited += 1;
+            if visited > MAX_VISITED_ENTRIES || started.elapsed() > MAX_SEARCH_TIME {
+                truncated = true;
+                break;
+            }
             let entry = entry.with_context(|| format!("遍历 {} 失败", root.display()))?;
             if !entry.file_type().is_file() {
                 continue;
@@ -79,7 +91,11 @@ impl Tool for GlobTool {
         }
         files.sort();
         if files.is_empty() {
-            return Ok(ToolOutput::success("No files found"));
+            return Ok(ToolOutput::success(if truncated {
+                "No files found before the traversal limit was reached"
+            } else {
+                "No files found"
+            }));
         }
         let mut output = files.join("\n");
         if truncated {

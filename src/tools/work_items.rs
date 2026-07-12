@@ -1,13 +1,23 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io::Read,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::{TodoItem, Tool, ToolContext, ToolOutput, atomic_write, object_schema, parse_input};
+use super::{
+    TodoItem, Tool, ToolContext, ToolOutput, atomic_write_private, object_schema, parse_input,
+};
 
 const STATUSES: &[&str] = &["pending", "in_progress", "completed"];
+const MAX_TODOS: usize = 100;
+const MAX_TASKS: usize = 1000;
+const MAX_TASK_STORE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 64 * 1024;
+const MAX_METADATA_KEYS: usize = 128;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TaskStore {
@@ -60,12 +70,13 @@ impl Tool for TodoWriteTool {
             json!({
                 "todos": {
                     "type": "array",
+                    "maxItems": MAX_TODOS,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": {"type": "string"},
+                            "content": {"type": "string", "maxLength": 4096},
                             "status": {"type": "string", "enum": STATUSES},
-                            "activeForm": {"type": "string"}
+                            "activeForm": {"type": "string", "maxLength": 4096}
                         },
                         "required": ["content", "status", "activeForm"],
                         "additionalProperties": false
@@ -141,9 +152,9 @@ impl Tool for TaskCreateTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "subject": {"type": "string"},
-                "description": {"type": "string"},
-                "activeForm": {"type": "string"},
+                "subject": {"type": "string", "maxLength": 512},
+                "description": {"type": "string", "maxLength": 16384},
+                "activeForm": {"type": "string", "maxLength": 512},
                 "metadata": {"type": "object"}
             }),
             &["subject", "description"],
@@ -173,8 +184,18 @@ impl Tool for TaskCreateTool {
         }
         let _guard = context.task_store_lock.lock().await;
         let mut store = load_store(context)?;
+        if store.tasks.len() >= MAX_TASKS {
+            bail!("任务数量达到 {MAX_TASKS} 个限制")
+        }
+        if let Some(metadata) = &input.metadata {
+            validate_metadata(metadata)?;
+        }
         let id = store.next_id.max(1).to_string();
-        store.next_id = store.next_id.max(1) + 1;
+        store.next_id = store
+            .next_id
+            .max(1)
+            .checked_add(1)
+            .context("任务 ID 已耗尽")?;
         store.tasks.push(TaskItem {
             id: id.clone(),
             subject: input.subject.trim().to_owned(),
@@ -213,7 +234,10 @@ impl Tool for TaskGetTool {
     }
 
     fn input_schema(&self) -> Value {
-        object_schema(json!({"taskId": {"type": "string"}}), &["taskId"])
+        object_schema(
+            json!({"taskId": {"type": "string", "maxLength": 64}}),
+            &["taskId"],
+        )
     }
 
     fn read_only(&self, _: &Value) -> bool {
@@ -347,14 +371,14 @@ impl Tool for TaskUpdateTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "taskId": {"type": "string"},
-                "subject": {"type": "string"},
-                "description": {"type": "string"},
-                "activeForm": {"type": "string"},
+                "taskId": {"type": "string", "maxLength": 64},
+                "subject": {"type": "string", "maxLength": 512},
+                "description": {"type": "string", "maxLength": 16384},
+                "activeForm": {"type": "string", "maxLength": 512},
                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]},
-                "owner": {"type": "string"},
-                "addBlocks": {"type": "array", "items": {"type": "string"}},
-                "addBlockedBy": {"type": "array", "items": {"type": "string"}},
+                "owner": {"type": "string", "maxLength": 512},
+                "addBlocks": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 64}},
+                "addBlockedBy": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 64}},
                 "metadata": {"type": "object"}
             }),
             &["taskId"],
@@ -379,6 +403,9 @@ impl Tool for TaskUpdateTool {
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: UpdateInput = parse_input(input)?;
+        if let Some(metadata) = &input.metadata {
+            validate_metadata(metadata)?;
+        }
         let _guard = context.task_store_lock.lock().await;
         let mut store = load_store(context)?;
         let Some(position) = store.tasks.iter().position(|task| task.id == input.task_id) else {
@@ -556,13 +583,51 @@ fn load_store(context: &ToolContext) -> Result<TaskStore> {
     if !context.task_store_path.exists() {
         return Ok(TaskStore::default());
     }
-    let content = std::fs::read_to_string(&context.task_store_path)
-        .with_context(|| format!("无法读取任务存储 {}", context.task_store_path.display()))?;
-    serde_json::from_str(&content)
-        .with_context(|| format!("任务存储 JSON 损坏: {}", context.task_store_path.display()))
+    if std::fs::symlink_metadata(&context.task_store_path)?
+        .file_type()
+        .is_symlink()
+    {
+        bail!("拒绝读取 symlink task store")
+    }
+    let size = std::fs::metadata(&context.task_store_path)?.len();
+    if size > MAX_TASK_STORE_BYTES {
+        bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&context.task_store_path)?
+        .take(MAX_TASK_STORE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_TASK_STORE_BYTES as usize {
+        bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
+    }
+    let content = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "任务存储不是有效 UTF-8: {}",
+            context.task_store_path.display()
+        )
+    })?;
+    let store: TaskStore = serde_json::from_str(&content)
+        .with_context(|| format!("任务存储 JSON 损坏: {}", context.task_store_path.display()))?;
+    if store.tasks.len() > MAX_TASKS {
+        bail!("任务存储超过 {MAX_TASKS} 个任务限制")
+    }
+    Ok(store)
 }
 
 fn save_store(context: &ToolContext, store: &TaskStore) -> Result<()> {
     let content = serde_json::to_string_pretty(store)?;
-    atomic_write(&context.task_store_path, &(content + "\n"))
+    if content.len() > MAX_TASK_STORE_BYTES as usize {
+        bail!("任务存储超过 {MAX_TASK_STORE_BYTES} 字节限制")
+    }
+    atomic_write_private(&context.task_store_path, &(content + "\n"))
+}
+
+fn validate_metadata(metadata: &Map<String, Value>) -> Result<()> {
+    if metadata.len() > MAX_METADATA_KEYS {
+        bail!("metadata 超过 {MAX_METADATA_KEYS} 个键限制")
+    }
+    if serde_json::to_vec(metadata)?.len() > MAX_METADATA_BYTES {
+        bail!("metadata 超过 {MAX_METADATA_BYTES} 字节限制")
+    }
+    Ok(())
 }

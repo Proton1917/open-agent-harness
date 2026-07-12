@@ -3,7 +3,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolContext, ToolOutput, atomic_write, object_schema, parse_input};
+use super::{
+    MAX_EDITABLE_FILE_BYTES, Tool, ToolContext, ToolOutput, atomic_write, object_schema,
+    parse_input, read_text_bounded, reject_direct_symlink_write,
+};
 
 #[derive(Deserialize)]
 struct Input {
@@ -24,8 +27,8 @@ impl Tool for WriteTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "file_path": {"type": "string"},
-                "content": {"type": "string"}
+                "file_path": {"type": "string", "maxLength": 4096},
+                "content": {"type": "string", "maxLength": MAX_EDITABLE_FILE_BYTES}
             }),
             &["file_path", "content"],
         )
@@ -35,6 +38,9 @@ impl Tool for WriteTool {
     }
     fn destructive(&self, _: &Value) -> bool {
         true
+    }
+    fn path_fields(&self) -> &'static [&'static str] {
+        &["file_path"]
     }
     fn summary(&self, input: &Value) -> String {
         input
@@ -49,8 +55,10 @@ impl Tool for WriteTool {
         if path.extension().and_then(|s| s.to_str()) == Some("ipynb") {
             bail!("Jupyter Notebook 不能通过 Write 修改")
         }
+        reject_direct_symlink_write(&path)?;
         if path.exists() {
-            let current = std::fs::read_to_string(&path)
+            context.require_full_read(&path).await?;
+            let current = read_text_bounded(&path)
                 .with_context(|| format!("无法读取现有文件 {}", path.display()))?;
             context.verify_fresh_full_read(&path, &current).await?;
         }
@@ -58,6 +66,9 @@ impl Tool for WriteTool {
         context
             .remember_read(path.clone(), input.content, false)
             .await?;
-        Ok(ToolOutput::success(format!("Wrote {}", path.display())))
+        Ok(ToolOutput::success(format!(
+            "Wrote {}",
+            context.display_path(&path)
+        )))
     }
 }

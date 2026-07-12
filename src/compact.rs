@@ -61,8 +61,7 @@ pub fn compact_prompt(custom_instructions: Option<&str>) -> String {
     let mut prompt = String::from(
         r#"Summarize the conversation so another coding agent can continue the work without access to earlier messages.
 
-Respond with exactly two XML sections:
-<analysis>A brief private inventory of the conversation.</analysis>
+Respond with exactly one XML section:
 <summary>
 1. Primary Request and Intent
 2. Key Technical Concepts
@@ -76,7 +75,7 @@ Respond with exactly two XML sections:
 10. Context for Continuing Work
 </summary>
 
-Preserve exact file paths, commands, error messages, identifiers, decisions, incomplete work, and verification results. Do not call tools. Return plain text only."#,
+Preserve the paths, commands, error messages, identifiers, decisions, incomplete work, and verification results already present in the conversation. Do not invent or request secrets, account data, device data, or hidden local metadata. Do not call tools. Return plain text only."#,
     );
     if let Some(instructions) = custom_instructions.filter(|value| !value.trim().is_empty()) {
         prompt.push_str("\n\nAdditional instructions:\n");

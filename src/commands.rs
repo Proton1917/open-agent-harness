@@ -2,6 +2,7 @@ use crate::{permissions::PermissionMode, query::QueryEngine};
 
 pub enum CommandOutcome {
     Handled,
+    Cleared,
     Exit,
     NotCommand,
 }
@@ -16,7 +17,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine, mode: PermissionMode) -> Co
         "/clear" => {
             engine.clear();
             println!("Conversation cleared.");
-            CommandOutcome::Handled
+            CommandOutcome::Cleared
         }
         "/model" if argument.trim().is_empty() => {
             println!("{}", engine.model);

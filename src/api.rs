@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
@@ -18,7 +18,14 @@ use crate::{
 pub struct ModelClient {
     http: Client,
     endpoint: EndpointConfig,
+    messages_url: reqwest::Url,
 }
+
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct MessageResult {
     pub response: ModelResponse,
@@ -27,12 +34,20 @@ pub struct MessageResult {
 
 impl ModelClient {
     pub fn new(endpoint: EndpointConfig) -> Result<Self> {
-        let http = Client::builder()
+        let messages_url = build_messages_url(&endpoint)?;
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(600))
-            .build()
-            .context("无法创建 HTTP client")?;
-        Ok(Self { http, endpoint })
+            .redirect(reqwest::redirect::Policy::none());
+        if !endpoint.allow_env_proxy {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().context("无法创建 HTTP client")?;
+        Ok(Self {
+            http,
+            endpoint,
+            messages_url,
+        })
     }
 
     pub async fn messages(
@@ -52,19 +67,17 @@ impl ModelClient {
             "tools": tools,
             "stream": true,
         });
-        let path = if self.endpoint.messages_path.starts_with('/') {
-            self.endpoint.messages_path.clone()
-        } else {
-            format!("/{}", self.endpoint.messages_path)
-        };
-        let url = format!("{}{path}", self.endpoint.base_url);
+        let encoded_body = serde_json::to_vec(&body).context("无法编码 model request")?;
+        if encoded_body.len() > MAX_REQUEST_BYTES {
+            bail!("model request 超过 {MAX_REQUEST_BYTES} 字节限制")
+        }
         let mut last_error = None;
         for attempt in 0..4u32 {
             let mut request = self
                 .http
-                .post(&url)
+                .post(self.messages_url.clone())
                 .header("content-type", "application/json")
-                .json(&body);
+                .body(encoded_body.clone());
             if let Some(token) = &self.endpoint.token {
                 request = request.bearer_auth(token);
             }
@@ -88,22 +101,40 @@ impl ModelClient {
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.contains("text/event-stream"));
                 if is_sse {
-                    return parse_sse(response, on_text_delta).await;
+                    return parse_sse(response, on_text_delta, self.endpoint.token.as_deref())
+                        .await;
                 }
-                let text = response.text().await.context("读取 API 响应失败")?;
-                let response = serde_json::from_str(&text).with_context(|| {
-                    format!("API 返回了无法解析的消息响应: {}", truncate(&text, 1000))
-                })?;
+                let bytes = read_body_limited(response, MAX_RESPONSE_BYTES, "API 响应").await?;
+                let mut response: ModelResponse =
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!(
+                            "API 返回了无法解析的消息响应: {}",
+                            truncate(
+                                &redact_text(
+                                    &String::from_utf8_lossy(&bytes),
+                                    self.endpoint.token.as_deref()
+                                ),
+                                1000
+                            )
+                        )
+                    })?;
+                redact_response(&mut response, self.endpoint.token.as_deref());
                 return Ok(MessageResult {
                     response,
                     streamed_text: false,
                 });
             }
-            let text = response.text().await.context("读取 API 错误响应失败")?;
-            let error = api_error(status, &text);
+            let bytes = read_body_limited(response, MAX_ERROR_BYTES, "API 错误响应").await?;
+            let text = String::from_utf8_lossy(&bytes);
+            let error = api_error(status, &text, self.endpoint.token.as_deref());
             if retryable(status) && attempt < 3 {
                 last_error = Some(error);
-                sleep(retry_after.unwrap_or_else(|| Duration::from_secs(1 << attempt))).await;
+                sleep(
+                    retry_after
+                        .unwrap_or_else(|| Duration::from_secs(1 << attempt))
+                        .min(MAX_RETRY_DELAY),
+                )
+                .await;
                 continue;
             }
             return Err(error);
@@ -115,14 +146,32 @@ impl ModelClient {
 async fn parse_sse(
     response: reqwest::Response,
     on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
+    secret: Option<&str>,
 ) -> Result<MessageResult> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        bail!("SSE 响应超过 {MAX_RESPONSE_BYTES} 字节限制")
+    }
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    let mut received = 0usize;
     let mut accumulator = StreamAccumulator::default();
     let mut streamed_text = false;
     while let Some(chunk) = stream.next().await {
-        buffer.extend_from_slice(&chunk.context("读取 SSE chunk 失败")?);
+        let chunk = chunk.context("读取 SSE chunk 失败")?;
+        received = received
+            .checked_add(chunk.len())
+            .context("SSE 响应大小溢出")?;
+        if received > MAX_RESPONSE_BYTES {
+            bail!("SSE 响应超过 {MAX_RESPONSE_BYTES} 字节限制")
+        }
+        buffer.extend_from_slice(&chunk);
         while let Some((frame_end, separator_len)) = find_frame_end(&buffer) {
+            if frame_end > MAX_SSE_FRAME_BYTES {
+                bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
+            }
             let frame = buffer.drain(..frame_end).collect::<Vec<_>>();
             buffer.drain(..separator_len);
             if let Some(data) = frame_data(&frame)? {
@@ -131,18 +180,24 @@ async fn parse_sse(
                 }
                 let event: Value = serde_json::from_str(&data)
                     .with_context(|| format!("无法解析 SSE data: {}", truncate(&data, 1000)))?;
-                streamed_text |= accumulator.apply(event, on_text_delta)?;
+                streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
             }
+        }
+        if buffer.len() > MAX_SSE_FRAME_BYTES {
+            bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
         }
     }
     if !buffer.iter().all(u8::is_ascii_whitespace)
         && let Some(data) = frame_data(&buffer)?
+        && data != "[DONE]"
     {
         let event: Value = serde_json::from_str(&data)?;
-        streamed_text |= accumulator.apply(event, on_text_delta)?;
+        streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
     }
+    let mut response = accumulator.finish()?;
+    redact_response(&mut response, secret);
     Ok(MessageResult {
-        response: accumulator.finish()?,
+        response,
         streamed_text,
     })
 }
@@ -180,6 +235,7 @@ impl StreamAccumulator {
         &mut self,
         event: Value,
         on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
+        secret: Option<&str>,
     ) -> Result<bool> {
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
         match event_type {
@@ -197,11 +253,26 @@ impl StreamAccumulator {
             }
             "content_block_start" => {
                 let index = event_index(&event)?;
-                let block = event
+                let mut block = event
                     .get("content_block")
                     .cloned()
                     .context("content_block_start 缺少 content_block")?;
+                let initial_text = (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str).unwrap_or(""))
+                    .map(|text| redact_text(text, secret))
+                    .unwrap_or_default();
+                if let Some(object) = block.as_object_mut()
+                    && !initial_text.is_empty()
+                {
+                    object.insert("text".into(), Value::String(initial_text.clone()));
+                }
                 self.blocks.insert(index, block);
+                if !initial_text.is_empty() {
+                    if let Some(callback) = on_text_delta {
+                        callback(&initial_text);
+                    }
+                    return Ok(true);
+                }
             }
             "content_block_delta" => {
                 let index = event_index(&event)?;
@@ -210,10 +281,13 @@ impl StreamAccumulator {
                     .context("content_block_delta 缺少 delta")?;
                 match delta.get("type").and_then(Value::as_str).unwrap_or("") {
                     "text_delta" => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                        append_string(self.blocks.get_mut(&index), "text", text)?;
+                        let text = redact_text(
+                            delta.get("text").and_then(Value::as_str).unwrap_or(""),
+                            secret,
+                        );
+                        append_string(self.blocks.get_mut(&index), "text", &text)?;
                         if let Some(callback) = on_text_delta {
-                            callback(text);
+                            callback(&text);
                         }
                         return Ok(!text.is_empty());
                     }
@@ -265,10 +339,13 @@ impl StreamAccumulator {
                 }
             }
             "error" => {
-                let message = event
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知 SSE error");
+                let message = redact_text(
+                    event
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("未知 SSE error"),
+                    secret,
+                );
                 anyhow::bail!("Model stream error: {message}")
             }
             "ping" | "message_stop" => {}
@@ -278,6 +355,9 @@ impl StreamAccumulator {
     }
 
     fn finish(self) -> Result<ModelResponse> {
+        if !self.partial_json.is_empty() {
+            bail!("SSE 在工具输入 JSON 完成前中断")
+        }
         Ok(ModelResponse {
             id: self.id.context("SSE 流缺少 message_start.id")?,
             content: self.blocks.into_values().collect(),
@@ -335,7 +415,69 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
+fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
+    let base = reqwest::Url::parse(&endpoint.base_url)
+        .with_context(|| format!("HARNESS_BASE_URL 无效: {}", endpoint.base_url))?;
+    if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+        bail!("HARNESS_BASE_URL 只支持带 host 的 http/https URL")
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        bail!("HARNESS_BASE_URL 不得内嵌用户名或密码")
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        bail!("HARNESS_BASE_URL 不得包含 query 或 fragment")
+    }
+    if endpoint.messages_path.contains('#') {
+        bail!("HARNESS_MESSAGES_PATH 不得包含 fragment")
+    }
+    let separator = if endpoint.messages_path.starts_with('/') {
+        ""
+    } else {
+        "/"
+    };
+    let candidate = format!(
+        "{}{}{}",
+        endpoint.base_url.trim_end_matches('/'),
+        separator,
+        endpoint.messages_path
+    );
+    let url = reqwest::Url::parse(&candidate)
+        .with_context(|| format!("messages endpoint 无效: {candidate}"))?;
+    let same_origin = url.scheme() == base.scheme()
+        && url.host_str() == base.host_str()
+        && url.port_or_known_default() == base.port_or_known_default()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if !same_origin {
+        bail!("HARNESS_MESSAGES_PATH 不得改变 endpoint origin")
+    }
+    Ok(url)
+}
+
+async fn read_body_limited(
+    response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("{label}超过 {limit} 字节限制")
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("读取{label}失败"))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("{label}超过 {limit} 字节限制")
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn api_error(status: StatusCode, body: &str, secret: Option<&str>) -> anyhow::Error {
     let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
@@ -345,7 +487,54 @@ fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| truncate(body, 2000));
+    let message = redact_text(&message, secret);
     anyhow::anyhow!("Model endpoint {}: {}", status.as_u16(), message)
+}
+
+fn redact_response(response: &mut ModelResponse, secret: Option<&str>) {
+    response.id = redact_text(&response.id, secret);
+    if let Some(reason) = &mut response.stop_reason {
+        *reason = redact_text(reason, secret);
+    }
+    for block in &mut response.content {
+        redact_value(block, secret);
+    }
+}
+
+fn redact_value(value: &mut Value, secret: Option<&str>) {
+    match value {
+        Value::String(text) => *text = redact_text(text, secret),
+        Value::Array(values) => {
+            for value in values {
+                redact_value(value, secret);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_value(value, secret);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn redact_text(value: &str, secret: Option<&str>) -> String {
+    match secret.filter(|secret| !secret.is_empty()) {
+        Some(secret) => {
+            let redacted = value.replace(secret, "<redacted-endpoint-token>");
+            let encoded = serde_json::to_string(secret).unwrap_or_default();
+            let escaped = encoded
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or("");
+            if escaped.is_empty() || escaped == secret {
+                redacted
+            } else {
+                redacted.replace(escaped, "<redacted-endpoint-token>")
+            }
+        }
+        None => value.to_owned(),
+    }
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -353,4 +542,78 @@ fn truncate(value: &str, max: usize) -> String {
         return value.to_owned();
     }
     value.chars().take(max).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(base_url: &str, messages_path: &str) -> EndpointConfig {
+        EndpointConfig {
+            token: None,
+            base_url: base_url.into(),
+            messages_path: messages_path.into(),
+            allow_env_proxy: false,
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_preserves_prefix_and_rejects_credentials() {
+        let url =
+            build_messages_url(&endpoint("https://example.invalid/root", "/messages")).unwrap();
+        assert_eq!(url.as_str(), "https://example.invalid/root/messages");
+        assert!(build_messages_url(&endpoint("file:///tmp/socket", "/messages")).is_err());
+        assert!(
+            build_messages_url(&endpoint(
+                "https://user:secret@example.invalid",
+                "/messages"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn endpoint_token_is_redacted_from_responses_and_errors() {
+        let secret = "token-\"private\"";
+        let mut response = ModelResponse {
+            id: secret.into(),
+            content: vec![json!({"type":"text","text":format!("echo {secret}")})],
+            stop_reason: Some(secret.into()),
+            usage: None,
+        };
+        redact_response(&mut response, Some(secret));
+        assert!(!serde_json::to_string(&response).unwrap().contains(secret));
+
+        let body = json!({"error":{"message":format!("reflected {secret}")}}).to_string();
+        let error = api_error(StatusCode::BAD_REQUEST, &body, Some(secret));
+        assert!(!error.to_string().contains(secret));
+        assert!(error.to_string().contains("redacted-endpoint-token"));
+    }
+
+    #[test]
+    fn initial_sse_text_is_streamed_before_later_deltas() {
+        let captured = std::sync::Mutex::new(String::new());
+        let callback = |text: &str| captured.lock().unwrap().push_str(text);
+        let mut accumulator = StreamAccumulator::default();
+        assert!(
+            accumulator
+                .apply(
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hello"}}),
+                    Some(&callback),
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            accumulator
+                .apply(
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}),
+                    Some(&callback),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(*captured.lock().unwrap(), "hello world");
+        assert_eq!(accumulator.blocks[&0]["text"], "hello world");
+    }
 }

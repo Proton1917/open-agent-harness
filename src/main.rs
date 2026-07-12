@@ -1,38 +1,60 @@
 use std::{
-    io::{self, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
+    path::PathBuf,
     sync::Arc,
 };
+
+const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_SYSTEM_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SYSTEM_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::json;
+use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 
 use open_agent_harness::{
     api::ModelClient,
     cli::{Cli, OutputFormat},
     commands::{self, CommandOutcome},
-    config::{DEFAULT_MODEL, Settings, endpoint_config},
+    config::{DEFAULT_MODEL, EndpointConfig, Settings, endpoint_config},
     context::{discover_agent_instructions, render_agent_instructions},
     permissions::{PermissionManager, PermissionMode},
     query::{QueryEngine, QueryOptions, TextDeltaSink, default_system_prompt},
     session::SessionStore,
+    skills::{discover_skills, render_skill_index},
     tools::{ToolContext, ToolRegistry},
 };
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = bootstrap() {
         eprintln!("Error: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
+fn bootstrap() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("无法确定当前目录")?;
-    let settings = Settings::load(&cwd, cli.settings.as_deref(), cli.bare)?;
-    settings.apply_environment();
+    let mut settings = Settings::load(&cwd, cli.settings.as_deref(), cli.bare)?;
+    // SAFETY: bootstrap is still single-threaded; the async runtime is created below.
+    unsafe { settings.apply_environment() };
+    let endpoint = endpoint_config();
+    // SAFETY: bootstrap is still single-threaded. Keep endpoint credentials only in memory so
+    // subprocess tools cannot inherit them after the runtime starts.
+    unsafe {
+        std::env::remove_var("HARNESS_API_KEY");
+        std::env::remove_var("HARNESS_AUTH_TOKEN");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("无法创建 async runtime")?;
+    runtime.block_on(run(cli, cwd, settings, endpoint))
+}
+
+async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfig) -> Result<()> {
     let model = cli
         .model
         .clone()
@@ -51,11 +73,13 @@ async fn run() -> Result<()> {
         settings.allow_rules(),
         settings.deny_rules(),
     );
-    let tool_context = ToolContext::new(cwd.clone(), permissions);
-    let system = build_system_prompt(&cli, &cwd).await?;
+    let skills = discover_skills(&cwd, cli.bare)?;
+    let mut tool_context = ToolContext::new(cwd.clone(), permissions);
+    tool_context.skills = Arc::new(skills.clone());
+    let system = build_system_prompt(&cli, &cwd, &skills).await?;
     let (store, history) = open_session(&cli, &cwd)?;
     let text_delta_sink = output_sink(&cli, store.id);
-    let client = ModelClient::new(endpoint_config())?;
+    let client = ModelClient::new(endpoint)?;
     let mut engine = QueryEngine::new(
         client,
         ToolRegistry::default(),
@@ -76,6 +100,7 @@ async fn run() -> Result<()> {
         let result = engine.run_turn(prompt).await?;
         persist_turn(&store, &engine, &result)?;
         print_result(&cli, &engine, &store, &result.text, result.streamed_text)?;
+        engine.shutdown().await;
         return Ok(());
     }
 
@@ -89,6 +114,9 @@ async fn run() -> Result<()> {
             Some(prompt) => prompt,
             None => read_prompt()?,
         };
+        if input.len() > MAX_USER_INPUT_BYTES {
+            bail!("prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
+        }
         if input.trim().is_empty() {
             continue;
         }
@@ -110,6 +138,10 @@ async fn run() -> Result<()> {
         }
         match commands::handle(input.trim(), &mut engine, mode) {
             CommandOutcome::Exit => break,
+            CommandOutcome::Cleared => {
+                store.clear_history()?;
+                continue;
+            }
             CommandOutcome::Handled => continue,
             CommandOutcome::NotCommand => {}
         }
@@ -125,6 +157,7 @@ async fn run() -> Result<()> {
             Err(error) => eprintln!("Error: {error:#}"),
         }
     }
+    engine.shutdown().await;
     Ok(())
 }
 
@@ -171,24 +204,22 @@ fn open_session(
     Ok((SessionStore::create(cwd, enabled)?, Vec::new()))
 }
 
-async fn build_system_prompt(cli: &Cli, cwd: &std::path::Path) -> Result<String> {
+async fn build_system_prompt(
+    cli: &Cli,
+    cwd: &std::path::Path,
+    skills: &open_agent_harness::skills::SkillCatalog,
+) -> Result<String> {
     let mut system = if let Some(prompt) = &cli.system_prompt {
         prompt.clone()
     } else if let Some(path) = &cli.system_prompt_file {
-        tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("无法读取 {}", path.display()))?
+        read_system_file(path).await?
     } else {
-        default_system_prompt(cwd)
+        default_system_prompt()
     };
     let append = if let Some(prompt) = &cli.append_system_prompt {
         Some(prompt.clone())
     } else if let Some(path) = &cli.append_system_prompt_file {
-        Some(
-            tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("无法读取 {}", path.display()))?,
-        )
+        Some(read_system_file(path).await?)
     } else {
         None
     };
@@ -202,15 +233,52 @@ async fn build_system_prompt(cli: &Cli, cwd: &std::path::Path) -> Result<String>
         system.push_str("\n\n");
         system.push_str(&rendered);
     }
+    let skill_index = render_skill_index(skills);
+    if !skill_index.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&skill_index);
+    }
+    if system.len() > MAX_SYSTEM_CONTEXT_BYTES {
+        bail!("system context 超过 {MAX_SYSTEM_CONTEXT_BYTES} 字节限制")
+    }
     Ok(system)
+}
+
+async fn read_system_file(path: &std::path::Path) -> Result<String> {
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("无法检查 {}", path.display()))?
+        .len();
+    if size > MAX_SYSTEM_FILE_BYTES {
+        bail!("system prompt 文件超过 {MAX_SYSTEM_FILE_BYTES} 字节限制")
+    }
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("无法打开 {}", path.display()))?
+        .take(MAX_SYSTEM_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_SYSTEM_FILE_BYTES as usize {
+        bail!("system prompt 文件超过 {MAX_SYSTEM_FILE_BYTES} 字节限制")
+    }
+    String::from_utf8(bytes).with_context(|| format!("{} 不是有效 UTF-8", path.display()))
 }
 
 fn print_prompt(cli: &Cli) -> Result<String> {
     if let Some(prompt) = &cli.prompt {
+        if prompt.len() > MAX_USER_INPUT_BYTES {
+            bail!("prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
+        }
         return Ok(prompt.clone());
     }
     let mut prompt = String::new();
-    io::stdin().read_to_string(&mut prompt)?;
+    io::stdin()
+        .take((MAX_USER_INPUT_BYTES + 1) as u64)
+        .read_to_string(&mut prompt)?;
+    if prompt.len() > MAX_USER_INPUT_BYTES {
+        bail!("stdin prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
+    }
     if prompt.trim().is_empty() {
         bail!("print 模式需要 positional prompt 或 stdin")
     }
@@ -221,8 +289,13 @@ fn read_prompt() -> Result<String> {
     print!("> ");
     io::stdout().flush()?;
     let mut input = String::new();
-    if io::stdin().read_line(&mut input)? == 0 {
+    let stdin = io::stdin();
+    let mut limited = stdin.lock().take((MAX_USER_INPUT_BYTES + 1) as u64);
+    if limited.read_line(&mut input)? == 0 {
         return Ok("/exit".into());
+    }
+    if input.len() > MAX_USER_INPUT_BYTES {
+        bail!("interactive prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
     }
     Ok(input.trim_end().to_owned())
 }

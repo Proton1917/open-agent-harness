@@ -7,12 +7,14 @@ use crate::{
     api::ModelClient,
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     messages::normalize_for_api,
-    tokens::estimate_messages,
+    tokens::{estimate_messages, rough_token_count},
     tools::{ToolContext, ToolRegistry},
     types::{Message, SessionUsage},
 };
 
 const MAX_TOOL_ROUNDS: usize = 64;
+const MAX_TOOL_CALLS_PER_ROUND: usize = 32;
+const MAX_TOOL_CALLS_PER_TURN: usize = 128;
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct QueryEngine {
@@ -74,14 +76,36 @@ impl QueryEngine {
     }
 
     pub async fn run_turn(&mut self, prompt: String) -> Result<TurnResult> {
+        let message_checkpoint = self.messages.clone();
+        let compaction_checkpoint = self.compaction_count;
+        let task_checkpoint = self.tool_context.background_task_ids().await;
+        match self.run_turn_inner(prompt).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.messages = message_checkpoint;
+                self.compaction_count = compaction_checkpoint;
+                self.tool_context
+                    .rollback_background_tasks(&task_checkpoint)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_turn_inner(&mut self, prompt: String) -> Result<TurnResult> {
         let start = self.messages.len();
         self.messages.push(Message::user_text(prompt));
         let mut final_text = String::new();
         let mut streamed_text = false;
         let mut compacted = false;
+        let mut tool_call_count = 0usize;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            if !compacted && self.compact_config.should_auto_compact(&self.messages) {
+            if !compacted
+                && self.compact_config.auto_enabled
+                && self.messages.len() >= 2
+                && self.estimated_tokens() >= self.compact_config.auto_threshold()
+            {
                 let stats = self.compact(None).await?;
                 compacted = true;
                 if self.debug {
@@ -142,21 +166,42 @@ impl QueryEngine {
                     compacted,
                 });
             }
-            let mut tool_results = Vec::with_capacity(tool_uses.len());
+            if tool_uses.len() > MAX_TOOL_CALLS_PER_ROUND
+                || tool_call_count.saturating_add(tool_uses.len()) > MAX_TOOL_CALLS_PER_TURN
+            {
+                bail!(
+                    "工具调用超过每轮 {MAX_TOOL_CALLS_PER_ROUND} 个或每 turn {MAX_TOOL_CALLS_PER_TURN} 个的限制"
+                )
+            }
+            tool_call_count += tool_uses.len();
+            let mut calls = Vec::with_capacity(tool_uses.len());
             for use_block in tool_uses {
                 let id = use_block
                     .get("id")
                     .and_then(Value::as_str)
-                    .context("tool_use 缺少 id")?;
+                    .context("tool_use 缺少 id")?
+                    .to_owned();
                 let name = use_block
                     .get("name")
                     .and_then(Value::as_str)
-                    .context("tool_use 缺少 name")?;
+                    .context("tool_use 缺少 name")?
+                    .to_owned();
                 let input = use_block.get("input").cloned().unwrap_or_else(|| json!({}));
                 if self.debug {
                     eprintln!("[debug] tool {name}({input})");
                 }
-                let output = self.registry.execute(&self.tool_context, name, input).await;
+                calls.push((id, name, input));
+            }
+            let execution_inputs = calls
+                .iter()
+                .map(|(_, name, input)| (name.clone(), input.clone()))
+                .collect::<Vec<_>>();
+            let outputs = self
+                .registry
+                .execute_batch(&self.tool_context, &execution_inputs)
+                .await;
+            let mut tool_results = Vec::with_capacity(calls.len());
+            for ((id, _, _), output) in calls.into_iter().zip(outputs) {
                 tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": id,
@@ -180,7 +225,15 @@ impl QueryEngine {
     }
 
     pub fn estimated_tokens(&self) -> usize {
-        estimate_messages(&normalize_for_api(&self.messages))
+        let messages = estimate_messages(&normalize_for_api(&self.messages));
+        let system = rough_token_count(&self.system, 4);
+        let tools = self
+            .registry
+            .definitions()
+            .iter()
+            .map(|tool| rough_token_count(&tool.to_string(), 2))
+            .sum::<usize>();
+        messages.saturating_add(system).saturating_add(tools)
     }
 
     pub fn context_status(&self) -> (usize, usize, usize) {
@@ -239,15 +292,30 @@ impl QueryEngine {
             messages_after: self.messages.len(),
         })
     }
+
+    pub async fn shutdown(&self) {
+        self.tool_context.shutdown_background_tasks().await;
+    }
 }
 
-pub fn default_system_prompt(cwd: &std::path::Path) -> String {
-    format!(
+pub fn default_system_prompt() -> String {
+    String::from(
         "You are an open, provider-neutral coding agent. Work directly toward the user's goal and use the available tools whenever they help.\n\
-         Current working directory: {}\n\
+         Relative file paths are resolved from the harness workspace root.\n\
          Inspect relevant evidence before changing files. Read an existing file completely before Edit or Write. \
          Preserve unrelated work, keep decisions transparent, and verify changes with the project's real build or tests when available. \
          You may propose or implement any technically sound approach within the user's requested scope.",
-        cwd.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prompt_does_not_embed_a_local_absolute_path() {
+        let prompt = default_system_prompt();
+        assert!(!prompt.contains(std::path::MAIN_SEPARATOR));
+        assert!(prompt.contains("workspace root"));
+    }
 }

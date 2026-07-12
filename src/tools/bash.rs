@@ -1,17 +1,40 @@
-use std::{process::Stdio, time::Duration};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{fs::OpenOptions, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    sync::Mutex,
+    task::JoinHandle,
+    time::timeout,
+};
 use uuid::Uuid;
 
-use super::{BackgroundTask, Tool, ToolContext, ToolOutput, object_schema, parse_input};
+use super::{
+    BackgroundTask, Tool, ToolContext, ToolOutput, ensure_private_directory, object_schema,
+    parse_input,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
-const MAX_OUTPUT_CHARS: usize = 30_000;
+pub(super) const MAX_OUTPUT_BYTES: usize = 30_000;
+const MAX_CAPTURE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CAPTURE_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CAPTURE_FILES: usize = 1024;
+const MAX_BACKGROUND_TASKS: usize = 32;
 
 #[derive(Deserialize)]
 struct Input {
@@ -29,23 +52,27 @@ impl Tool for BashTool {
     fn name(&self) -> &'static str {
         "Bash"
     }
+
     fn description(&self) -> &'static str {
         "Executes a shell command in the working directory with timeout support. Long commands may run in the background."
     }
+
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "command": {"type": "string"},
+                "command": {"type": "string", "maxLength": 65536},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_MS},
                 "run_in_background": {"type": "boolean"},
-                "description": {"type": "string"}
+                "description": {"type": "string", "maxLength": 2048}
             }),
             &["command"],
         )
     }
+
     fn read_only(&self, _: &Value) -> bool {
         false
     }
+
     fn destructive(&self, input: &Value) -> bool {
         let command = input.get("command").and_then(Value::as_str).unwrap_or("");
         [
@@ -60,6 +87,7 @@ impl Tool for BashTool {
         .iter()
         .any(|needle| command.contains(needle))
     }
+
     fn summary(&self, input: &Value) -> String {
         input
             .get("command")
@@ -67,6 +95,7 @@ impl Tool for BashTool {
             .unwrap_or("<missing>")
             .to_owned()
     }
+
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: Input = parse_input(input)?;
         if input.command.trim().is_empty() {
@@ -77,42 +106,72 @@ impl Tool for BashTool {
         if input.run_in_background {
             return spawn_background(context, &shell, input.command).await;
         }
+
         let timeout_ms = input
             .timeout
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
-        let mut command = Command::new(shell);
-        command
-            .arg("-lc")
-            .arg(&input.command)
-            .current_dir(&context.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let output = timeout(Duration::from_millis(timeout_ms), command.output())
-            .await
-            .map_err(|_| anyhow::anyhow!("命令在 {timeout_ms}ms 后超时并已终止"))?
-            .context("无法启动 shell 命令")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-            (false, false) => format!("{}\n{}", stdout.trim_end(), stderr.trim_end()),
-            (false, true) => stdout.trim_end().to_owned(),
-            (true, false) => stderr.trim_end().to_owned(),
-            (true, true) => String::new(),
-        };
-        combined = truncate_middle(&combined, MAX_OUTPUT_CHARS);
-        if !output.status.success() {
-            if !combined.is_empty() {
-                combined.push('\n');
+        let (output_path, output_file) = create_private_output("foreground")?;
+        let mut command = shell_command(&shell, &input.command, &context.cwd);
+        let (mut child, drains, capture_truncated) =
+            match spawn_captured(&mut command, output_file).await {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&output_path);
+                    return Err(error);
+                }
+            };
+        let process_group_id = child.id();
+        let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+            Ok(status) => Some(status.context("等待 shell 命令失败")?),
+            Err(_) => {
+                terminate_child(&mut child, process_group_id).await;
+                None
             }
-            combined.push_str(&format!("Exit code {}", output.status.code().unwrap_or(-1)));
-            return Ok(ToolOutput::error(combined));
+        };
+        await_foreground_drains(drains, process_group_id).await;
+        let capture_was_truncated = capture_truncated.load(Ordering::Relaxed);
+        let (mut preview, preview_truncated, size) =
+            read_output_preview(&output_path, MAX_OUTPUT_BYTES)?;
+        let keep_output = preview_truncated || capture_was_truncated;
+        if keep_output {
+            if !preview.is_empty() {
+                preview.push('\n');
+            }
+            preview.push_str(&format!(
+                "[Full captured output: {} ({} bytes{})]",
+                context.display_path(&output_path),
+                size,
+                if capture_was_truncated {
+                    "; additional output discarded at the 8 MiB limit"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            let _ = std::fs::remove_file(&output_path);
         }
-        if combined.is_empty() {
-            combined = "Command completed successfully with no output".into();
+
+        let Some(status) = status else {
+            if !preview.is_empty() {
+                preview.push('\n');
+            }
+            preview.push_str(&format!(
+                "Command timed out after {timeout_ms}ms and was terminated"
+            ));
+            return Ok(ToolOutput::error(preview));
+        };
+        if !status.success() {
+            if !preview.is_empty() {
+                preview.push('\n');
+            }
+            preview.push_str(&format!("Exit code {}", status.code().unwrap_or(-1)));
+            return Ok(ToolOutput::error(preview));
         }
-        Ok(ToolOutput::success(combined))
+        if preview.is_empty() {
+            preview = "Command completed successfully with no output".into();
+        }
+        Ok(ToolOutput::success(preview))
     }
 }
 
@@ -121,55 +180,217 @@ async fn spawn_background(
     shell: &str,
     command_text: String,
 ) -> Result<ToolOutput> {
+    if context.tasks.lock().await.len() >= MAX_BACKGROUND_TASKS {
+        bail!("后台任务达到 {MAX_BACKGROUND_TASKS} 个限制；请先读取或停止已有任务")
+    }
     let id = Uuid::new_v4().to_string();
-    let base = dirs::home_dir()
-        .context("无法确定主目录")?
-        .join(".open-agent-harness/tasks");
-    tokio::fs::create_dir_all(&base).await?;
-    let output_path = base.join(format!("{id}.output"));
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&output_path)
-        .await?
-        .into_std()
-        .await;
-    let stderr = stdout.try_clone()?;
-    let child = Command::new(shell)
-        .arg("-lc")
-        .arg(&command_text)
-        .current_dir(&context.cwd)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("无法启动后台命令")?;
-    context.tasks.lock().await.insert(
-        id.clone(),
-        BackgroundTask {
-            child,
-            output_path: output_path.clone(),
-            command: command_text,
-        },
-    );
+    let (output_path, output_file) = create_private_output(&id)?;
+    let mut command = shell_command(shell, &command_text, &context.cwd);
+    let (child, drains, output_truncated) = match spawn_captured(&mut command, output_file).await {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err(error);
+        }
+    };
+    let process_group_id = child.id();
+    let mut task = BackgroundTask {
+        child,
+        output_path: output_path.clone(),
+        command: command_text,
+        process_group_id,
+        drains,
+        output_truncated,
+    };
+    let mut tasks = context.tasks.lock().await;
+    if tasks.len() >= MAX_BACKGROUND_TASKS {
+        terminate_task(&mut task).await;
+        let _ = std::fs::remove_file(&output_path);
+        bail!("后台任务达到 {MAX_BACKGROUND_TASKS} 个限制；请先读取或停止已有任务")
+    }
+    tasks.insert(id.clone(), task);
     Ok(ToolOutput::success(format!(
         "Command running in background with ID: {id}\nOutput: {}",
-        output_path.display()
+        context.display_path(&output_path)
     )))
 }
 
-fn truncate_middle(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_owned();
+fn shell_command(shell: &str, command_text: &str, cwd: &Path) -> Command {
+    let mut command = Command::new(shell);
+    command
+        .arg("-lc")
+        .arg(command_text)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN");
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+}
+
+async fn spawn_captured(
+    command: &mut Command,
+    output_file: File,
+) -> Result<(Child, Vec<JoinHandle<()>>, Arc<AtomicBool>)> {
+    let mut child = command.spawn().context("无法启动 shell 命令")?;
+    let stdout = child.stdout.take().context("无法捕获命令 stdout")?;
+    let stderr = child.stderr.take().context("无法捕获命令 stderr")?;
+    let file = Arc::new(Mutex::new(tokio::fs::File::from_std(output_file)));
+    let written = Arc::new(AtomicU64::new(0));
+    let truncated = Arc::new(AtomicBool::new(false));
+    let drains = vec![
+        tokio::spawn(drain_to_file(
+            stdout,
+            Arc::clone(&file),
+            Arc::clone(&written),
+            Arc::clone(&truncated),
+        )),
+        tokio::spawn(drain_to_file(stderr, file, written, Arc::clone(&truncated))),
+    ];
+    Ok((child, drains, truncated))
+}
+
+async fn drain_to_file(
+    mut reader: impl AsyncRead + Unpin,
+    file: Arc<Mutex<tokio::fs::File>>,
+    written: Arc<AtomicU64>,
+    truncated: Arc<AtomicBool>,
+) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let start = written.fetch_add(count as u64, Ordering::Relaxed);
+        if start >= MAX_CAPTURE_FILE_BYTES {
+            truncated.store(true, Ordering::Relaxed);
+            continue;
+        }
+        let keep = count.min((MAX_CAPTURE_FILE_BYTES - start) as usize);
+        if keep < count {
+            truncated.store(true, Ordering::Relaxed);
+        }
+        let mut file = file.lock().await;
+        if file.write_all(&chunk[..keep]).await.is_err() {
+            break;
+        }
     }
-    let half = max / 2;
-    let head = value.chars().take(half).collect::<String>();
-    let tail = value
-        .chars()
-        .rev()
-        .take(half)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{head}\n... [output truncated] ...\n{tail}")
+}
+
+async fn await_foreground_drains(mut drains: Vec<JoinHandle<()>>, process_group_id: Option<u32>) {
+    for index in 0..drains.len() {
+        if timeout(Duration::from_secs(1), &mut drains[index])
+            .await
+            .is_err()
+        {
+            kill_process_group(process_group_id);
+            for drain in drains.iter_mut().skip(index) {
+                let _ = timeout(Duration::from_secs(1), &mut *drain).await;
+                drain.abort();
+            }
+            return;
+        }
+    }
+}
+
+pub(super) async fn terminate_task(task: &mut BackgroundTask) {
+    let child_running = task.child.try_wait().ok().flatten().is_none();
+    let drains_running = task.drains.iter().any(|drain| !drain.is_finished());
+    if child_running || drains_running {
+        kill_process_group(task.process_group_id);
+        let _ = task.child.start_kill();
+        let _ = task.child.wait().await;
+    }
+    let drains = std::mem::take(&mut task.drains);
+    for mut drain in drains {
+        let _ = timeout(Duration::from_secs(1), &mut drain).await;
+        drain.abort();
+    }
+}
+
+async fn terminate_child(child: &mut Child, process_group_id: Option<u32>) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    kill_process_group(process_group_id);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn kill_process_group(process_group_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(group) = process_group_id {
+        // SAFETY: commands are placed in a dedicated process group at spawn time.
+        unsafe {
+            libc::kill(-(group as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = process_group_id;
+}
+
+fn create_private_output(prefix: &str) -> Result<(PathBuf, File)> {
+    let base = dirs::home_dir()
+        .context("无法确定主目录")?
+        .join(".open-agent-harness/tasks");
+    ensure_private_directory(&base)?;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(&base)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("output") {
+            continue;
+        }
+        files += 1;
+        bytes = bytes.saturating_add(entry.metadata()?.len());
+        if files >= MAX_CAPTURE_FILES || bytes >= MAX_CAPTURE_DIRECTORY_BYTES {
+            bail!(
+                "任务输出目录达到资源上限（{files} files, {bytes} bytes）；请清理 ~/.open-agent-harness/tasks"
+            )
+        }
+    }
+    let output_path = base.join(format!("{prefix}-{}.output", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&output_path)
+        .with_context(|| format!("无法创建输出文件 {}", output_path.display()))?;
+    Ok((output_path, file))
+}
+
+pub(super) fn read_output_preview(path: &Path, max_bytes: usize) -> Result<(String, bool, u64)> {
+    let mut file =
+        File::open(path).with_context(|| format!("无法读取任务输出 {}", path.display()))?;
+    let size = file.metadata()?.len();
+    if size <= max_bytes as u64 {
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut bytes)?;
+        return Ok((
+            String::from_utf8_lossy(&bytes).trim_end().to_owned(),
+            false,
+            size,
+        ));
+    }
+
+    let half = max_bytes / 2;
+    let mut head = vec![0u8; half];
+    file.read_exact(&mut head)?;
+    file.seek(SeekFrom::End(-(half as i64)))?;
+    let mut tail = vec![0u8; half];
+    file.read_exact(&mut tail)?;
+    let preview = format!(
+        "{}\n... [output truncated; full capture retained] ...\n{}",
+        String::from_utf8_lossy(&head).trim_end(),
+        String::from_utf8_lossy(&tail).trim_start()
+    );
+    Ok((preview, true, size))
 }

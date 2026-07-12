@@ -59,6 +59,7 @@ impl PermissionManager {
         summary: &str,
         read_only: bool,
         destructive: bool,
+        outside_workspace: bool,
     ) -> Result<PermissionDecision> {
         let target = format!("{tool}({summary})");
         if matches_any(&self.deny, tool, &target) {
@@ -70,16 +71,18 @@ impl PermissionManager {
         match self.mode {
             PermissionMode::BypassPermissions => Ok(PermissionDecision::Allow),
             PermissionMode::Plan => {
-                if read_only {
+                if read_only && !outside_workspace {
                     Ok(PermissionDecision::Allow)
                 } else {
                     Ok(PermissionDecision::Deny)
                 }
             }
-            PermissionMode::AcceptEdits if matches!(tool, "Edit" | "Write") => {
+            PermissionMode::AcceptEdits
+                if !outside_workspace && matches!(tool, "Edit" | "NotebookEdit" | "Write") =>
+            {
                 Ok(PermissionDecision::Allow)
             }
-            _ if read_only && !destructive => Ok(PermissionDecision::Allow),
+            _ if read_only && !destructive && !outside_workspace => Ok(PermissionDecision::Allow),
             _ if !self.interactive => Ok(PermissionDecision::Deny),
             _ => prompt(tool, summary),
         }
@@ -124,7 +127,7 @@ mod tests {
             vec!["Bash(rm *)".into()],
         );
         assert_eq!(
-            p.decide("Bash", "rm x", false, true).unwrap(),
+            p.decide("Bash", "rm x", false, true, false).unwrap(),
             PermissionDecision::Deny
         );
     }

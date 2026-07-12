@@ -1,0 +1,181 @@
+# Contributing to open-agent-harness
+
+Thank you for helping build a coding-agent harness that belongs to its users. Contributions are welcome from anyone, anywhere, provided they preserve the project’s technical independence and open-source boundary.
+
+## Non-negotiable requirements
+
+### 1. Core product logic must be Rust
+
+All shipped harness behavior and runtime logic must be implemented in Rust.
+
+- Do not add JavaScript, TypeScript, Python, Go, Java, C, C++, Swift, native add-ons, opaque binaries, or another language runtime to implement a harness feature.
+- Do not hide a non-Rust implementation behind code generation, a bundled interpreter, FFI, a downloaded executable, or a shell wrapper.
+- Markdown, TOML, lockfiles, license files, CI/workflow configuration, and small transparent shell scripts for auditing, building, packaging, and repository maintenance are allowed. Those scripts must not implement runtime behavior, conceal another product implementation, or become a required language runtime for the harness.
+- Prefer the Rust standard library and existing dependencies. A new crate must be open source, have a declared SPDX-compatible license, and be justified in the pull request.
+
+### 2. AI assistance does not lower the bar
+
+AI-assisted contributions are allowed. The submitter nevertheless owns every line and must be able to review, explain, test, and maintain it.
+
+- Do not submit bulk-generated code that you have not read or cannot explain.
+- Do not leave placeholders, dead branches, speculative abstractions, fabricated compatibility claims, or warning suppressions that merely hide a defect.
+- Every behavioral claim needs a test, reproducible evidence, or a precise source-code argument.
+- Keep patches coherent and reviewable. Generated volume is never a substitute for correctness.
+- Maintainers may reject technically compiling code when its invariants, failure behavior, privacy boundary, or ownership cannot be audited.
+
+### 3. Obtain comparison material yourself
+
+Every code contributor must independently obtain their own lawful, authorized local copy of the relevant Claude Code release or related research material before making or reviewing behavioral-parity claims. This repository does not publish or redistribute those materials.
+
+- Follow the license, terms, and laws that apply to you.
+- Do not commit or upload vendor binaries, extracted bundles, bytecode, native modules, decompiled source, proprietary system prompts, credentials, account data, telemetry captures containing personal data, or copyrighted documentation.
+- Do not attach such material to issues, pull requests, CI artifacts, releases, gists, or external mirrors operated for this project.
+- Keep personal comparison material outside Git, under the ignored `reference/` directory or another private location.
+- Evidence in a pull request should describe observable behavior, inputs, outputs, invariants, and test cases. It must not reproduce proprietary implementation text.
+
+The implementation submitted here must be an original Rust reimplementation of general harness behavior. Copying minified/decompiled functions, identifiers, prompts, comments, assets, or native code is not acceptable.
+
+## Project boundary
+
+In scope:
+
+- provider-neutral model I/O;
+- message normalization, streaming, retries, and context accounting;
+- local tools, permissions, workspace boundaries, sessions, compaction, tasks, and agent orchestration;
+- open protocols and user-configured integrations;
+- privacy, resource limits, deterministic tests, and security hardening.
+
+Out of scope:
+
+- vendor accounts, subscriptions, billing, identity, entitlement, or region checks;
+- telemetry, experimentation platforms, marketing features, or hidden remote services;
+- proprietary UI cloning, brand prompts, copyrighted assets, or compatibility code that sends data to a hard-coded vendor endpoint;
+- any feature that requires closed infrastructure to function.
+
+## Development workflow
+
+1. Read the local, ignored `AGENTS.md` if one is present.
+2. Start from a clean `main` branch and keep unrelated changes out of the patch.
+3. Add success, failure, boundary, and privacy tests with the implementation.
+4. Use local mock servers for protocol tests. Tests must not contact public services.
+5. Never place real credentials, emails, device identifiers, account identifiers, or private repository data in fixtures or logs.
+6. Update `README.md` and `MIGRATION.md` when public behavior changes.
+7. Run the complete verification gate:
+
+The repository-level `.cargo/config.toml` promotes every compiler warning to an error. A pull request with even one warning is not mergeable, and the release build log must contain no warnings.
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+scripts/audit-harness.sh
+```
+
+## Pull-request checklist
+
+- [ ] All shipped harness behavior and runtime logic is Rust.
+- [ ] The change is provider-neutral and has no hard-coded vendor endpoint.
+- [ ] No proprietary comparison material is included or quoted.
+- [ ] Tool inputs are schema-validated before permission or execution.
+- [ ] Filesystem and network boundaries fail closed.
+- [ ] Outputs, subprocesses, and responses have explicit resource limits.
+- [ ] New persistence uses private permissions and does not store secrets unnecessarily.
+- [ ] Tests cover success and failure paths without external network access.
+- [ ] Formatting, tests, clippy, release build, and repository audit pass.
+- [ ] The complete test and release compilation logs contain zero warnings.
+- [ ] Documentation accurately describes what the code actually guarantees.
+
+By submitting a contribution, you agree that your original contribution is licensed under this repository’s MIT License.
+
+---
+
+# 为 open-agent-harness 贡献代码
+
+感谢你帮助建设一个真正属于使用者的 coding-agent harness。项目欢迎来自任何地区、任何人的贡献，前提是贡献必须守住技术独立与开源边界。
+
+## 不可妥协的要求
+
+### 1. 核心产品逻辑必须使用 Rust
+
+所有随项目发布的 harness 行为与运行时逻辑必须用 Rust 实现。
+
+- 不得用 JavaScript、TypeScript、Python、Go、Java、C、C++、Swift、原生插件、黑盒二进制或其他语言运行时实现 harness 功能。
+- 不得通过代码生成、捆绑解释器、FFI、运行时下载程序或 shell 包装器藏入非 Rust 实现。
+- Markdown、TOML、锁文件、许可证、CI/workflow 配置，以及用于审计、构建、打包和仓库维护的短小透明 shell 脚本均可保留。这些脚本不得实现运行时行为、藏入另一套产品实现，也不得让 harness 依赖额外的语言运行时。
+- 优先使用 Rust 标准库和现有依赖。新增 crate 必须开源、声明兼容的 SPDX 许可证，并在 PR 中说明必要性。
+
+### 2. 使用 AI 不会降低贡献门槛
+
+允许使用 AI 辅助贡献，但提交者仍然必须对每一行代码负责，并能够审阅、解释、测试和维护它。
+
+- 不得提交自己没有读过、无法解释的大批量生成代码。
+- 不得留下占位实现、死分支、臆想抽象、伪造的兼容性声明，或仅用于掩盖缺陷的 warning 抑制。
+- 每项行为声明都必须有测试、可复现证据或严密的源码论证。
+- 补丁必须连贯、可审计；生成代码的数量永远不能替代正确性。
+- 即使代码能够编译，只要其不变量、失败行为、隐私边界或来源责任无法审计，维护者仍可拒绝合并。
+
+### 3. 比对材料必须自行取得
+
+每一位代码贡献者在提出或审阅行为一致性声明前，都必须自行、合法、经授权取得需要比对的 Claude Code 版本或相关研究材料。本仓库不发布、也不转发这些材料。
+
+- 遵守适用于你的许可证、服务条款与法律。
+- 不得提交或上传厂商二进制、拆包产物、bytecode、原生模块、反编译源码、专有系统提示词、凭据、账户数据、含个人信息的遥测记录或受版权保护的文档。
+- 不得把这些材料附在 issue、PR、CI artifact、release、gist，或本项目运营的任何外部镜像中。
+- 个人比对材料应放在 Git 之外，例如被忽略的 `reference/` 目录或其他私有位置。
+- PR 中的证据应描述可观察行为、输入、输出、不变量和测试用例，不得复现专有实现文本。
+
+提交到本仓库的实现必须是对通用 harness 行为的原创 Rust 重写。不得复制压缩或反编译函数、标识符、提示词、注释、资产或原生代码。
+
+## 项目边界
+
+范围内：
+
+- 提供方无关的模型 I/O；
+- 消息规范化、流式响应、重试和上下文计量；
+- 本地工具、权限、工作区边界、会话、压缩、任务和 agent 编排；
+- 开放协议与用户自行配置的集成；
+- 隐私、资源上限、确定性测试与安全加固。
+
+范围外：
+
+- 厂商账号、订阅、计费、身份、权益或地域检查；
+- 遥测、实验平台、营销功能或隐藏远程服务；
+- 专有 UI 复刻、品牌提示词、受版权保护资产，或会向硬编码厂商 endpoint 发送信息的兼容代码；
+- 必须依赖闭源基础设施才能工作的功能。
+
+## 开发流程
+
+1. 如果本地存在被忽略的 `AGENTS.md`，先完整阅读。
+2. 从干净的 `main` 开始，不要把无关改动混进补丁。
+3. 实现必须同时提供成功、失败、边界和隐私测试。
+4. 协议测试使用本地 mock server，测试不得访问公网服务。
+5. fixture 和日志中绝不能出现真实凭据、邮箱、设备标识、账户标识或私有仓库数据。
+6. 公开行为变化时同步更新 `README.md` 与 `MIGRATION.md`。
+7. 执行完整验证门槛：
+
+仓库级 `.cargo/config.toml` 会把所有编译器 warning 提升为 error。出现任何 warning 的 PR 均不得合并，release build 日志也必须保持零 warning。
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+scripts/audit-harness.sh
+```
+
+## Pull Request 检查表
+
+- [ ] 所有随项目发布的 harness 行为与运行时逻辑均为 Rust。
+- [ ] 改动提供方无关，不含硬编码厂商 endpoint。
+- [ ] 未包含或引用任何专有比对材料。
+- [ ] 工具输入在权限判断和执行前完成 schema 校验。
+- [ ] 文件系统与网络边界默认关闭、失败即拒绝。
+- [ ] 输出、子进程和响应均有明确资源上限。
+- [ ] 新增持久化使用私有权限，且不无谓保存秘密。
+- [ ] 测试覆盖成功与失败路径，且不访问外部网络。
+- [ ] 格式化、测试、clippy、release build 与仓库审计全部通过。
+- [ ] 完整测试与 release 编译日志为零 warning。
+- [ ] 文档只声明代码真正能够保证的行为。
+
+提交贡献即表示你同意将自己的原创贡献按本仓库 MIT License 授权。

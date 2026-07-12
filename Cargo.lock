@@ -683,6 +683,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "globset",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

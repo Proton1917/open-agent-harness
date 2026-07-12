@@ -8,6 +8,7 @@ pub mod messages;
 pub mod permissions;
 pub mod query;
 pub mod session;
+pub mod skills;
 pub mod tokens;
 pub mod tools;
 pub mod types;
