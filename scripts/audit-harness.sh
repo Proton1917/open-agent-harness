@@ -116,6 +116,15 @@ for term in "${removed_terms[@]}"; do
     echo 'brand_free=false' >&2
     exit 1
   fi
+  tracked_brand_hits="$(
+    git -C "$root" grep -n -i "$term" -- . \
+      ':(exclude)README.md' \
+      ':(exclude)CONTRIBUTING.md' || true
+  )"
+  if [[ -n "$tracked_brand_hits" ]]; then
+    printf 'brand_text_outside_documented_exceptions=%s\n' "$tracked_brand_hits" >&2
+    exit 1
+  fi
   if strings "$release_binary" | rg -q -i "$term"; then
     echo 'binary_brand_free=false' >&2
     exit 1
@@ -123,6 +132,7 @@ for term in "${removed_terms[@]}"; do
 done
 
 echo 'brand_free=true'
+echo 'brand_exceptions_limited_to_readme_and_contributing=true'
 echo 'binary_brand_free=true'
 
 if [[ -n "$(git -C "$root" ls-files reference)" ]]; then

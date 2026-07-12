@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, bail};
 use clap::ValueEnum;
@@ -41,6 +38,7 @@ pub struct PermissionManager {
 pub enum PermissionDecision {
     Allow,
     Deny,
+    Interrupt,
 }
 
 impl PermissionManager {
@@ -72,6 +70,22 @@ impl PermissionManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .unwrap_or(self.mode)
+    }
+
+    pub fn set_session_mode(&self, next: PermissionMode) -> Result<bool> {
+        if self.mode == PermissionMode::Plan && next != PermissionMode::Plan {
+            bail!("用户从命令行或可信设置锁定了 plan 模式，交互快捷键不能解除")
+        }
+        let mut mode = self
+            .session_mode
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = mode.unwrap_or(self.mode);
+        if current == next {
+            return Ok(false);
+        }
+        *mode = Some(next);
+        Ok(true)
     }
 
     pub fn enter_plan_mode(&self) -> bool {
@@ -154,17 +168,11 @@ fn matches_any(rules: &[String], tool: &str, target: &str) -> bool {
 }
 
 fn prompt(tool: &str, summary: &str) -> Result<PermissionDecision> {
-    eprint!("允许 {tool} 执行 `{summary}`？[y/N] ");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(
-        if matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Deny
-        },
-    )
+    match crate::terminal::request_permission(tool, summary)? {
+        crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
+        crate::terminal::PermissionChoice::Deny => Ok(PermissionDecision::Deny),
+        crate::terminal::PermissionChoice::Interrupt => Ok(PermissionDecision::Interrupt),
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +215,22 @@ mod tests {
         assert_eq!(dynamic.effective_mode(), PermissionMode::Plan);
         assert!(dynamic.exit_plan_mode().unwrap());
         assert_eq!(dynamic.effective_mode(), PermissionMode::Default);
+    }
+
+    #[test]
+    fn interactive_mode_changes_are_shared_across_clones() {
+        let manager = PermissionManager::new(PermissionMode::Default, true, vec![], vec![]);
+        let observer = manager.clone();
+        assert!(
+            manager
+                .set_session_mode(PermissionMode::AcceptEdits)
+                .unwrap()
+        );
+        assert_eq!(observer.effective_mode(), PermissionMode::AcceptEdits);
+        assert!(
+            !manager
+                .set_session_mode(PermissionMode::AcceptEdits)
+                .unwrap()
+        );
     }
 }

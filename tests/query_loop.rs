@@ -9,7 +9,7 @@ use open_agent_harness::{
     api::ModelClient,
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
-    query::{QueryEngine, QueryOptions},
+    query::{QueryEngine, QueryEvent, QueryOptions},
     tools::{ToolContext, ToolRegistry},
 };
 use serde_json::Value;
@@ -83,6 +83,11 @@ async fn query_engine_round_trips_tool_use_and_result() {
             compact_config: None,
         },
     );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+    engine.set_event_sink(Some(Arc::new(move |event| {
+        captured_events.lock().unwrap().push(event.clone());
+    })));
 
     let result = engine.run_turn("read the fixture".into()).await.unwrap();
     server.join().unwrap();
@@ -91,6 +96,19 @@ async fn query_engine_round_trips_tool_use_and_result() {
     assert_eq!(&*deltas.lock().unwrap(), "迁移链路完成");
     assert_eq!(engine.usage.input_tokens, 25);
     assert_eq!(engine.usage.output_tokens, 10);
+    let events = events.lock().unwrap();
+    assert!(matches!(events.first(), Some(QueryEvent::TurnStarted)));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        QueryEvent::ToolStarted { name, summary, .. }
+            if name == "Read" && summary.contains("fixture.txt")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        QueryEvent::ToolFinished { name, is_error: false, .. } if name == "Read"
+    )));
+    assert!(matches!(events.last(), Some(QueryEvent::TurnFinished)));
+    drop(events);
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -100,6 +118,12 @@ async fn query_engine_round_trips_tool_use_and_result() {
             .as_str()
             .unwrap()
             .contains("workspace-system-context-marker")
+    );
+    assert!(
+        requests[0]["system"]
+            .as_str()
+            .unwrap()
+            .contains("# Current permission mode")
     );
     let second = serde_json::to_string(&requests[1]).unwrap();
     assert!(second.contains("tool_result"));

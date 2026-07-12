@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -123,8 +123,8 @@ pub(crate) struct AgentRuntime {
 }
 
 struct BackgroundAgent {
-    owner: Uuid,
     description: String,
+    launch_token: Uuid,
     handle: JoinHandle<Result<AgentRun>>,
 }
 
@@ -288,8 +288,8 @@ impl AgentRuntime {
             jobs.insert(
                 id,
                 BackgroundAgent {
-                    owner: parent.agent_scope(),
                     description: description.clone(),
+                    launch_token: Uuid::new_v4(),
                     handle,
                 },
             );
@@ -558,21 +558,22 @@ impl AgentRuntime {
         self.stop(parse_agent_id(agent_id)?).await
     }
 
-    pub(crate) async fn background_ids(&self, owner: Uuid) -> HashSet<Uuid> {
+    pub(crate) async fn background_checkpoint(&self) -> HashMap<Uuid, Uuid> {
         self.jobs
             .lock()
             .await
             .iter()
-            .filter_map(|(id, job)| (job.owner == owner).then_some(*id))
+            .map(|(id, job)| (*id, job.launch_token))
             .collect()
     }
 
-    pub(crate) async fn rollback_background(&self, owner: Uuid, keep: &HashSet<Uuid>) {
+    pub(crate) async fn rollback_new_background(&self, keep: &HashMap<Uuid, Uuid>) {
         let jobs = {
             let mut jobs = self.jobs.lock().await;
             let ids = jobs
                 .iter()
-                .filter_map(|(id, job)| (job.owner == owner && !keep.contains(id)).then_some(*id))
+                .filter(|(id, job)| keep.get(id) != Some(&job.launch_token))
+                .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
             ids.into_iter()
                 .filter_map(|id| jobs.remove(&id).map(|job| job.handle))
@@ -800,7 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_turn_cleanup_is_scoped_to_its_agent_owner() {
+    async fn transaction_cleanup_removes_new_descendant_jobs_only() {
         let client = ModelClient::new(EndpointConfig {
             token: None,
             base_url: "http://127.0.0.1:9".to_owned(),
@@ -817,35 +818,77 @@ mod tests {
             false,
             AgentLimits::default(),
         );
-        let first_owner = Uuid::new_v4();
-        let second_owner = Uuid::new_v4();
-        let first_job = Uuid::new_v4();
-        let second_job = Uuid::new_v4();
+        let existing = Uuid::new_v4();
+        let descendant = Uuid::new_v4();
         let pending = || tokio::spawn(async { std::future::pending::<Result<AgentRun>>().await });
         runtime.jobs.lock().await.insert(
-            first_job,
+            existing,
             BackgroundAgent {
-                owner: first_owner,
-                description: "first".to_owned(),
+                description: "existing".to_owned(),
+                launch_token: Uuid::new_v4(),
                 handle: pending(),
             },
         );
+        let checkpoint = runtime.background_checkpoint().await;
         runtime.jobs.lock().await.insert(
-            second_job,
+            descendant,
             BackgroundAgent {
-                owner: second_owner,
-                description: "second".to_owned(),
+                description: "descendant".to_owned(),
+                launch_token: Uuid::new_v4(),
                 handle: pending(),
             },
         );
 
-        runtime
-            .rollback_background(first_owner, &HashSet::new())
-            .await;
+        runtime.rollback_new_background(&checkpoint).await;
         let jobs = runtime.jobs.lock().await;
-        assert!(!jobs.contains_key(&first_job));
-        assert!(jobs.contains_key(&second_job));
+        assert!(jobs.contains_key(&existing));
+        assert!(!jobs.contains_key(&descendant));
         drop(jobs);
         runtime.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn transaction_cleanup_removes_relaunched_job_with_reused_agent_id() {
+        let client = ModelClient::new(EndpointConfig {
+            token: None,
+            base_url: "http://127.0.0.1:9".to_owned(),
+            messages_path: "/v1/messages".to_owned(),
+            allow_env_proxy: false,
+        })
+        .unwrap();
+        let runtime = AgentRuntime::new(
+            client,
+            ToolRegistry::default(),
+            "test".to_owned(),
+            128,
+            "test".to_owned(),
+            false,
+            AgentLimits::default(),
+        );
+        let reused_id = Uuid::new_v4();
+        let pending = || tokio::spawn(async { std::future::pending::<Result<AgentRun>>().await });
+        runtime.jobs.lock().await.insert(
+            reused_id,
+            BackgroundAgent {
+                description: "before checkpoint".to_owned(),
+                launch_token: Uuid::new_v4(),
+                handle: pending(),
+            },
+        );
+        let checkpoint = runtime.background_checkpoint().await;
+        let old = runtime.jobs.lock().await.remove(&reused_id).unwrap();
+        old.handle.abort();
+        let _ = old.handle.await;
+        runtime.jobs.lock().await.insert(
+            reused_id,
+            BackgroundAgent {
+                description: "relaunched during turn".to_owned(),
+                launch_token: Uuid::new_v4(),
+                handle: pending(),
+            },
+        );
+
+        runtime.rollback_new_background(&checkpoint).await;
+        assert!(!runtime.jobs.lock().await.contains_key(&reused_id));
     }
 }

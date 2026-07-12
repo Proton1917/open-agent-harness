@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 — 2026-07-12
+
+- Rebuilt the interactive conversational-terminal structure in Rust: startup card, bordered Unicode composer, bounded paste, history, multiline input, safe permission-mode cycling, live request state, streamed response rendering, and tool-call/result rows.
+- Added transactional active-turn interruption. `Ctrl-C` cancels model or tool work, rolls back uncommitted messages and turn-owned background jobs, and returns to the composer; double `Ctrl-C` exits only from idle input.
+- Replaced the minimal generic prompt with an open layered prompt assembler covering the harness contract, task execution, action boundaries, live tools and permission state, project instructions, context continuity, compaction, and delegation without automatically transmitting absolute cwd or device metadata.
+- Added a provider-neutral `/init` prompt that analyzes a repository and creates or coherently improves `AGENTS.md`.
+- Preserved the non-TTY fallback and exact `--print` text, JSON, and stream-JSON contracts.
+
 ## v0.2.0 — 2026-07-12
 
 The first release covering the complete open backend migration boundary while preserving the existing CLI.

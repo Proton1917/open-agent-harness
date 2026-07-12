@@ -1,9 +1,11 @@
+use crate::prompt::init_prompt;
 use crate::query::QueryEngine;
 
 pub enum CommandOutcome {
     Handled,
     Cleared,
     Exit,
+    Submit(String),
     NotCommand,
 }
 
@@ -50,9 +52,10 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             );
             CommandOutcome::Handled
         }
+        "/init" => CommandOutcome::Submit(init_prompt().to_owned()),
         "/help" => {
             println!(
-                "/help  /model [name]  /cost  /context  /compact [instructions]  /permissions  /clear  /exit"
+                "/help  /init  /model [name]  /cost  /context  /compact [instructions]  /permissions  /clear  /exit"
             );
             CommandOutcome::Handled
         }

@@ -25,8 +25,10 @@ use open_agent_harness::{
     mcp::connect_mcp,
     permissions::{PermissionManager, PermissionMode},
     plan::plan_tools,
-    query::{QueryEngine, QueryOptions, TextDeltaSink, default_system_prompt},
+    prompt::default_system_prompt,
+    query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
     session::SessionStore,
+    terminal::{ConversationUi, InputEditor},
     tools::{ToolContext, ToolRegistry},
     web_tools::configure_web,
     worktree::configure_worktree,
@@ -137,7 +139,9 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
     }
     tool_context.set_workspace_context_budget(MAX_SYSTEM_CONTEXT_BYTES - system.len());
     tool_context.reload_workspace_context().await?;
-    let text_delta_sink = output_sink(&cli, store.id);
+    let ui = ConversationUi::detect();
+    let enhanced_terminal = !cli.print && ui.interactive();
+    let text_delta_sink = output_sink(&cli, store.id, enhanced_terminal.then(|| ui.clone()));
     let client = ModelClient::new(endpoint)?;
     let mut engine = QueryEngine::new(
         client,
@@ -153,6 +157,11 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
             compact_config: None,
         },
     );
+    if enhanced_terminal {
+        let event_ui = ui.clone();
+        let event_sink: QueryEventSink = Arc::new(move |event| event_ui.event(event));
+        engine.set_event_sink(Some(event_sink));
+    }
 
     if cli.print {
         let prompt = print_prompt(&cli)?;
@@ -164,14 +173,30 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
         return Ok(());
     }
 
-    println!(
-        "open-agent-harness · {} · session {}",
-        engine.model, store.id
-    );
+    if enhanced_terminal {
+        ui.banner(&engine.model, &cwd, store.id, engine.permission_mode())?;
+    } else {
+        println!(
+            "open-agent-harness · {} · session {}",
+            engine.model, store.id
+        );
+    }
     let mut initial = cli.prompt.clone();
+    let mut editor = InputEditor::default();
     loop {
         let input = match initial.take() {
             Some(prompt) => prompt,
+            None if enhanced_terminal => {
+                let Some(read) =
+                    editor.read(engine.permission_mode(), engine.permission_mode_locked())?
+                else {
+                    break;
+                };
+                if let Err(error) = engine.set_permission_mode(read.permission_mode) {
+                    eprintln!("Mode unchanged: {error:#}");
+                }
+                read.text
+            }
             None => read_prompt()?,
         };
         if input.len() > MAX_USER_INPUT_BYTES {
@@ -184,37 +209,54 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
             match engine.compact(instructions).await {
                 Ok(stats) => {
                     store.replace_history(&engine.messages)?;
-                    println!(
-                        "Compacted {} messages to {} (estimated tokens: {} → {}).",
-                        stats.messages_before,
-                        stats.messages_after,
-                        stats.before_tokens,
-                        stats.after_tokens
-                    );
+                    if !enhanced_terminal {
+                        println!(
+                            "Compacted {} messages to {} (estimated tokens: {} → {}).",
+                            stats.messages_before,
+                            stats.messages_after,
+                            stats.before_tokens,
+                            stats.after_tokens
+                        );
+                    }
                 }
+                Err(error) if enhanced_terminal => ui.event(&QueryEvent::TurnFailed {
+                    message: format!("Compact failed: {error:#}"),
+                }),
                 Err(error) => eprintln!("Compact failed: {error:#}"),
             }
             continue;
         }
-        match commands::handle(input.trim(), &mut engine) {
+        let input = match commands::handle(input.trim(), &mut engine) {
             CommandOutcome::Exit => break,
             CommandOutcome::Cleared => {
                 store.clear_history()?;
                 continue;
             }
             CommandOutcome::Handled => continue,
-            CommandOutcome::NotCommand => {}
-        }
-        match engine.run_turn(input).await {
-            Ok(result) => {
+            CommandOutcome::Submit(prompt) => prompt,
+            CommandOutcome::NotCommand => input,
+        };
+        let turn = if enhanced_terminal {
+            engine.run_turn_interruptible(input).await
+        } else {
+            engine.run_turn(input).await.map(Some)
+        };
+        match turn {
+            Ok(Some(result)) => {
                 persist_turn(&store, &engine, &result)?;
-                if result.streamed_text {
+                if enhanced_terminal {
+                    if !result.streamed_text {
+                        ui.response(&result.text)?;
+                    }
+                } else if result.streamed_text {
                     println!("\n");
                 } else {
                     println!("\n{}\n", result.text);
                 }
             }
-            Err(error) => eprintln!("Error: {error:#}"),
+            Ok(None) => continue,
+            Err(error) if !enhanced_terminal => eprintln!("Error: {error:#}"),
+            Err(_) => {}
         }
     }
     run_session_end_hook(&hooks, store.id, &cwd, "interactive_exit", cli.debug).await;
@@ -366,7 +408,11 @@ fn read_prompt() -> Result<String> {
     Ok(input.trim_end().to_owned())
 }
 
-fn output_sink(cli: &Cli, session_id: Uuid) -> Option<TextDeltaSink> {
+fn output_sink(
+    cli: &Cli,
+    session_id: Uuid,
+    interactive_ui: Option<ConversationUi>,
+) -> Option<TextDeltaSink> {
     match (cli.print, cli.output_format) {
         (true, OutputFormat::Json) => None,
         (true, OutputFormat::StreamJson) => Some(Arc::new(move |delta| {
@@ -380,6 +426,10 @@ fn output_sink(cli: &Cli, session_id: Uuid) -> Option<TextDeltaSink> {
                 .expect("serializing a text delta cannot fail")
             );
         })),
+        _ if interactive_ui.is_some() => {
+            let ui = interactive_ui.expect("interactive UI was checked above");
+            Some(Arc::new(move |delta| ui.text_delta(delta)))
+        }
         _ => Some(Arc::new(|delta| {
             print!("{delta}");
             let _ = io::stdout().flush();

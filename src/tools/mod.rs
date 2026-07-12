@@ -18,6 +18,7 @@ use std::{
         Arc, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -115,7 +116,6 @@ pub struct ToolContext {
     task_store_path: Arc<RwLock<PathBuf>>,
     agent_runtime: Arc<OnceLock<Arc<AgentRuntime>>>,
     agent_depth: usize,
-    agent_scope: uuid::Uuid,
     agent_limits: AgentLimits,
     hooks: Arc<HookRunner>,
     bare: bool,
@@ -149,7 +149,6 @@ impl ToolContext {
             task_store_path: Arc::new(RwLock::new(task_store_path)),
             agent_runtime: Arc::new(OnceLock::new()),
             agent_depth: 0,
-            agent_scope: uuid::Uuid::new_v4(),
             agent_limits: AgentLimits::default(),
             hooks: Arc::new(HookRunner::default()),
             bare: false,
@@ -287,10 +286,6 @@ impl ToolContext {
         self.agent_depth
     }
 
-    pub(crate) fn agent_scope(&self) -> uuid::Uuid {
-        self.agent_scope
-    }
-
     pub(crate) fn install_agent_runtime(&self, runtime: Arc<AgentRuntime>) -> Result<()> {
         self.agent_runtime
             .set(runtime)
@@ -326,7 +321,6 @@ impl ToolContext {
             task_store_path: Arc::new(RwLock::new(self.task_store_path())),
             agent_runtime: Arc::clone(&self.agent_runtime),
             agent_depth: self.agent_depth.saturating_add(1),
-            agent_scope: uuid::Uuid::new_v4(),
             agent_limits: self.agent_limits,
             hooks: Arc::clone(&self.hooks),
             bare: self.bare,
@@ -506,10 +500,21 @@ pub(crate) fn normalize_path_for_display(value: String) -> String {
     }
 }
 
+fn compact_value(value: &Value) -> String {
+    const MAX_CHARS: usize = 160;
+    let rendered = value.to_string();
+    let mut compact = rendered.chars().take(MAX_CHARS).collect::<String>();
+    if rendered.chars().count() > MAX_CHARS {
+        compact.push('…');
+    }
+    compact
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    pub interrupted: bool,
 }
 
 impl ToolOutput {
@@ -517,6 +522,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            interrupted: false,
         }
     }
 
@@ -524,6 +530,15 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            interrupted: false,
+        }
+    }
+
+    pub fn interrupted() -> Self {
+        Self {
+            content: "用户中断了权限确认".to_owned(),
+            is_error: true,
+            interrupted: true,
         }
     }
 
@@ -539,6 +554,31 @@ impl ToolOutput {
         self.content.truncate(end);
         self.content.push_str(MARKER);
         self
+    }
+}
+
+pub type ToolStartedObserver = Arc<dyn Fn(usize) + Send + Sync>;
+pub type ToolFinishedObserver = Arc<dyn Fn(usize, &ToolOutput, Duration) + Send + Sync>;
+
+pub struct ToolExecutionObserver {
+    on_started: ToolStartedObserver,
+    on_finished: ToolFinishedObserver,
+}
+
+impl ToolExecutionObserver {
+    pub fn new(on_started: ToolStartedObserver, on_finished: ToolFinishedObserver) -> Self {
+        Self {
+            on_started,
+            on_finished,
+        }
+    }
+
+    fn started(&self, index: usize) {
+        (self.on_started)(index);
+    }
+
+    fn finished(&self, index: usize, output: &ToolOutput, elapsed: Duration) {
+        (self.on_finished)(index, output, elapsed);
     }
 }
 
@@ -696,6 +736,13 @@ impl ToolRegistry {
         tools
     }
 
+    pub fn summary(&self, name: &str, input: &Value) -> String {
+        read_registry(&self.state)
+            .active
+            .get(name)
+            .map_or_else(|| compact_value(input), |tool| tool.summary(input))
+    }
+
     pub async fn execute(&self, context: &ToolContext, name: &str, input: Value) -> ToolOutput {
         let tool = read_registry(&self.state).active.get(name).cloned();
         let Some(tool) = tool else {
@@ -737,6 +784,7 @@ impl ToolRegistry {
                 Ok(PermissionDecision::Deny) => {
                     return ToolOutput::error("用户或权限规则拒绝了此工具调用");
                 }
+                Ok(PermissionDecision::Interrupt) => return ToolOutput::interrupted(),
                 Err(error) => return ToolOutput::error(format!("权限检查失败: {error:#}")),
             }
         }
@@ -759,14 +807,35 @@ impl ToolRegistry {
         context: &ToolContext,
         calls: &[(String, Value)],
     ) -> Vec<ToolOutput> {
+        self.execute_batch_observed(context, calls, None).await
+    }
+
+    pub async fn execute_batch_observed(
+        &self,
+        context: &ToolContext,
+        calls: &[(String, Value)],
+        observer: Option<&ToolExecutionObserver>,
+    ) -> Vec<ToolOutput> {
         let mut outputs = Vec::with_capacity(calls.len());
         let mut index = 0;
         while index < calls.len() {
             let (name, input) = &calls[index];
             let concurrency_safe = self.concurrency_safe(name, input);
             if !concurrency_safe {
-                outputs.push(self.execute(context, name, input.clone()).await);
+                if let Some(observer) = observer {
+                    observer.started(index);
+                }
+                let started = Instant::now();
+                let output = self.execute(context, name, input.clone()).await;
+                if let Some(observer) = observer {
+                    observer.finished(index, &output, started.elapsed());
+                }
+                let interrupted = output.interrupted;
+                outputs.push(output);
                 index += 1;
+                if interrupted {
+                    break;
+                }
                 continue;
             }
 
@@ -777,10 +846,43 @@ impl ToolRegistry {
                 })
                 .map_or(calls.len(), |offset| index + offset);
             for chunk in calls[index..end].chunks(MAX_CONCURRENT_READ_TOOLS) {
-                let concurrent = chunk.iter().map(|(candidate_name, candidate_input)| {
-                    self.execute(context, candidate_name, candidate_input.clone())
-                });
+                let chunk_start = index;
+                let interrupted = Arc::new(AtomicBool::new(false));
+                let concurrent =
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, (candidate_name, candidate_input))| {
+                            let interrupted = Arc::clone(&interrupted);
+                            async move {
+                                let call_index = chunk_start + offset;
+                                if interrupted.load(Ordering::Acquire) {
+                                    return ToolOutput::interrupted();
+                                }
+                                if let Some(observer) = observer {
+                                    observer.started(call_index);
+                                }
+                                let started = Instant::now();
+                                let output = self
+                                    .execute(context, candidate_name, candidate_input.clone())
+                                    .await;
+                                if let Some(observer) = observer {
+                                    observer.finished(call_index, &output, started.elapsed());
+                                }
+                                if output.interrupted {
+                                    interrupted.store(true, Ordering::Release);
+                                }
+                                output
+                            }
+                        });
                 outputs.extend(futures_util::future::join_all(concurrent).await);
+                index += chunk.len();
+                if outputs.iter().any(|output| output.interrupted) {
+                    return outputs;
+                }
+                if index >= end {
+                    break;
+                }
             }
             index = end;
         }
@@ -1315,14 +1417,31 @@ mod tests {
             ("BarrierRead".into(), json!({})),
             ("BarrierRead".into(), json!({})),
         ];
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started_events = Arc::clone(&events);
+        let finished_events = Arc::clone(&events);
+        let observer = ToolExecutionObserver::new(
+            Arc::new(move |index| {
+                started_events.lock().unwrap().push(("start", index));
+            }),
+            Arc::new(move |index, _, _| {
+                finished_events.lock().unwrap().push(("finish", index));
+            }),
+        );
         let outputs = timeout(
             Duration::from_secs(1),
-            registry.execute_batch(&context, &calls),
+            registry.execute_batch_observed(&context, &calls, Some(&observer)),
         )
         .await
         .expect("calls should reach the barrier together");
         assert_eq!(outputs.len(), 2);
         assert!(outputs.iter().all(|output| output.content == "done"));
+        let events = events.lock().unwrap();
+        assert_eq!(&events[..2], &[("start", 0), ("start", 1)]);
+        assert_eq!(
+            events.iter().filter(|(kind, _)| *kind == "finish").count(),
+            2
+        );
     }
 
     #[test]

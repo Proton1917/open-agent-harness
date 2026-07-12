@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -9,8 +9,9 @@ use crate::{
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     messages::normalize_for_api,
     permissions::PermissionMode,
+    prompt::{permission_mode_section, registered_tools_section},
     tokens::{estimate_messages, rough_token_count},
-    tools::{ToolContext, ToolRegistry},
+    tools::{ToolContext, ToolExecutionObserver, ToolRegistry},
     types::{Message, SessionUsage},
 };
 
@@ -18,6 +19,41 @@ const MAX_TOOL_ROUNDS: usize = 64;
 const MAX_TOOL_CALLS_PER_ROUND: usize = 32;
 const MAX_TOOL_CALLS_PER_TURN: usize = 128;
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
+pub type QueryEventSink = Arc<dyn Fn(&QueryEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryEvent {
+    TurnStarted,
+    RequestStarted {
+        round: usize,
+    },
+    ToolStarted {
+        id: String,
+        name: String,
+        summary: String,
+    },
+    ToolFinished {
+        id: String,
+        name: String,
+        preview: String,
+        is_error: bool,
+        elapsed_ms: u128,
+    },
+    CompactStarted,
+    CompactFinished {
+        before_tokens: usize,
+        after_tokens: usize,
+    },
+    TurnFinished,
+    TurnInterrupted,
+    TurnFailed {
+        message: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("turn interrupted by user")]
+struct TurnInterrupted;
 
 pub struct QueryEngine {
     client: ModelClient,
@@ -30,6 +66,7 @@ pub struct QueryEngine {
     pub usage: SessionUsage,
     debug: bool,
     text_delta_sink: Option<TextDeltaSink>,
+    event_sink: Option<QueryEventSink>,
     compact_config: CompactConfig,
     pub compaction_count: usize,
 }
@@ -84,6 +121,7 @@ impl QueryEngine {
             usage: SessionUsage::default(),
             debug: options.debug,
             text_delta_sink: options.text_delta_sink,
+            event_sink: None,
             compact_config: options
                 .compact_config
                 .unwrap_or_else(|| CompactConfig::from_env(options.max_tokens)),
@@ -92,35 +130,95 @@ impl QueryEngine {
     }
 
     pub async fn run_turn(&mut self, prompt: String) -> Result<TurnResult> {
+        self.run_turn_with_cancel(prompt, std::future::pending())
+            .await?
+            .context("non-interruptible turn ended without a result")
+    }
+
+    pub async fn run_turn_interruptible(&mut self, prompt: String) -> Result<Option<TurnResult>> {
+        self.run_turn_with_cancel(prompt, async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        })
+        .await
+    }
+
+    async fn run_turn_with_cancel<F>(
+        &mut self,
+        prompt: String,
+        cancel: F,
+    ) -> Result<Option<TurnResult>>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        self.emit(QueryEvent::TurnStarted);
         let message_checkpoint = self.messages.clone();
         let compaction_checkpoint = self.compaction_count;
         let task_checkpoint = self.tool_context.background_task_ids().await;
         let agent_runtime = self.tool_context.agent_runtime().ok();
-        let agent_scope = self.tool_context.agent_scope();
         let agent_checkpoint = match &agent_runtime {
-            Some(runtime) => runtime.background_ids(agent_scope).await,
+            Some(runtime) => runtime.background_checkpoint().await,
             None => Default::default(),
         };
-        match self.run_turn_inner(prompt).await {
-            Ok(result) => Ok(result),
-            Err(error) => {
+        tokio::pin!(cancel);
+        let result = tokio::select! {
+            result = self.run_turn_inner(prompt) => Some(result),
+            () = &mut cancel => None,
+        };
+        match result {
+            None => {
                 self.messages = message_checkpoint;
                 self.compaction_count = compaction_checkpoint;
                 self.tool_context
                     .rollback_background_tasks(&task_checkpoint)
                     .await;
                 if let Some(runtime) = agent_runtime {
-                    runtime
-                        .rollback_background(agent_scope, &agent_checkpoint)
-                        .await;
+                    runtime.rollback_new_background(&agent_checkpoint).await;
                 }
-                Err(error)
+                self.emit(QueryEvent::TurnInterrupted);
+                Ok(None)
+            }
+            Some(Ok(result)) => {
+                self.emit(QueryEvent::TurnFinished);
+                Ok(Some(result))
+            }
+            Some(Err(error)) => {
+                self.messages = message_checkpoint;
+                self.compaction_count = compaction_checkpoint;
+                self.tool_context
+                    .rollback_background_tasks(&task_checkpoint)
+                    .await;
+                if let Some(runtime) = agent_runtime {
+                    runtime.rollback_new_background(&agent_checkpoint).await;
+                }
+                if error.downcast_ref::<TurnInterrupted>().is_some() {
+                    self.emit(QueryEvent::TurnInterrupted);
+                    Ok(None)
+                } else {
+                    self.emit(QueryEvent::TurnFailed {
+                        message: format!("{error:#}"),
+                    });
+                    Err(error)
+                }
             }
         }
     }
 
+    pub fn set_event_sink(&mut self, event_sink: Option<QueryEventSink>) {
+        self.event_sink = event_sink;
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         self.tool_context.permissions.effective_mode()
+    }
+
+    pub fn set_permission_mode(&self, mode: PermissionMode) -> Result<bool> {
+        self.tool_context.permissions.set_session_mode(mode)
+    }
+
+    pub fn permission_mode_locked(&self) -> bool {
+        self.tool_context.permissions.mode == PermissionMode::Plan
     }
 
     async fn run_turn_inner(&mut self, prompt: String) -> Result<TurnResult> {
@@ -171,6 +269,7 @@ impl QueryEngine {
                     self.messages.len()
                 );
             }
+            self.emit(QueryEvent::RequestStarted { round: round + 1 });
             let api_messages = normalize_for_api(&self.messages);
             let system = self.effective_system_prompt();
             let message_result = self
@@ -247,10 +346,49 @@ impl QueryEngine {
                 .iter()
                 .map(|(_, name, input)| (name.clone(), input.clone()))
                 .collect::<Vec<_>>();
+            let call_events = Arc::new(
+                calls
+                    .iter()
+                    .map(|(id, name, input)| {
+                        (id.clone(), name.clone(), self.registry.summary(name, input))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let observer = self.event_sink.as_ref().map(|event_sink| {
+                let started_sink = Arc::clone(event_sink);
+                let started_calls = Arc::clone(&call_events);
+                let finished_sink = Arc::clone(event_sink);
+                let finished_calls = Arc::clone(&call_events);
+                ToolExecutionObserver::new(
+                    Arc::new(move |index| {
+                        if let Some((id, name, summary)) = started_calls.get(index) {
+                            started_sink(&QueryEvent::ToolStarted {
+                                id: id.clone(),
+                                name: name.clone(),
+                                summary: summary.clone(),
+                            });
+                        }
+                    }),
+                    Arc::new(move |index, output, elapsed| {
+                        if let Some((id, name, _)) = finished_calls.get(index) {
+                            finished_sink(&QueryEvent::ToolFinished {
+                                id: id.clone(),
+                                name: name.clone(),
+                                preview: output_preview(&output.content),
+                                is_error: output.is_error,
+                                elapsed_ms: elapsed.as_millis(),
+                            });
+                        }
+                    }),
+                )
+            });
             let outputs = self
                 .registry
-                .execute_batch(&self.tool_context, &execution_inputs)
+                .execute_batch_observed(&self.tool_context, &execution_inputs, observer.as_ref())
                 .await;
+            if outputs.iter().any(|output| output.interrupted) {
+                return Err(TurnInterrupted.into());
+            }
             let mut tool_results = Vec::with_capacity(calls.len());
             for ((id, _, _), output) in calls.into_iter().zip(outputs) {
                 tool_results.push(json!({
@@ -302,6 +440,7 @@ impl QueryEngine {
         if self.messages.len() < 2 {
             bail!("消息不足，至少需要一轮对话才能 compact")
         }
+        self.emit(QueryEvent::CompactStarted);
         self.tool_context
             .hooks()
             .run(
@@ -373,15 +512,35 @@ impl QueryEngine {
         if let (true, Err(error)) = (self.debug, post_hook) {
             eprintln!("[debug] PostCompact hook failed after compaction: {error:#}");
         }
+        self.emit(QueryEvent::CompactFinished {
+            before_tokens: stats.before_tokens,
+            after_tokens: stats.after_tokens,
+        });
         Ok(stats)
+    }
+
+    fn emit(&self, event: QueryEvent) {
+        if let Some(sink) = &self.event_sink {
+            sink(&event);
+        }
     }
 
     fn effective_system_prompt(&self) -> String {
         let workspace = self.tool_context.workspace_system_context();
-        if workspace.is_empty() {
-            self.system.clone()
-        } else {
-            format!("{}\n\n{}", self.system, workspace)
+        let permission = permission_mode_section(self.permission_mode());
+        let tool_names = self
+            .registry
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        let tools = registered_tools_section(&tool_names);
+        match workspace.is_empty() {
+            true => format!("{}\n\n{}\n\n{}", self.system, tools, permission),
+            false => format!(
+                "{}\n\n{}\n\n{}\n\n{}",
+                self.system, tools, permission, workspace
+            ),
         }
     }
 
@@ -396,24 +555,16 @@ impl QueryEngine {
     }
 }
 
-pub fn default_system_prompt() -> String {
-    String::from(
-        "You are an open, provider-neutral coding agent. Work directly toward the user's goal and use the available tools whenever they help.\n\
-         Relative file paths are resolved from the current harness working directory and constrained by its workspace boundary.\n\
-         Inspect relevant evidence before changing files. Read an existing file completely before Edit or Write. \
-         Preserve unrelated work, keep decisions transparent, and verify changes with the project's real build or tests when available. \
-         You may propose or implement any technically sound approach within the user's requested scope.",
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_prompt_does_not_embed_a_local_absolute_path() {
-        let prompt = default_system_prompt();
-        assert!(!prompt.contains(std::path::MAIN_SEPARATOR));
-        assert!(prompt.contains("workspace boundary"));
+fn output_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let line = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut preview = line.chars().take(MAX_CHARS).collect::<String>();
+    if line.chars().count() > MAX_CHARS {
+        preview.push('…');
     }
+    preview
 }

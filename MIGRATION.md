@@ -4,13 +4,14 @@
 
 The current tree is an original, provider-neutral Rust implementation of general coding-agent harness behavior. The private comparison snapshot is static evidence, never a build input: it stays under the ignored `reference/` tree, is not executed, is absent from Git history, and cannot enter a release artifact.
 
-The migration keeps the existing CLI surface and replaces the reusable backend machinery. Account systems, subscriptions, identity, entitlement, telemetry, experiments, proprietary UI, closed remote services, marketing behavior, copied prompts, and copied assets are outside the project.
+The migration preserves the machine-facing CLI contract and rebuilds both the reusable backend machinery and the observable conversational-terminal structure in Rust. Account systems, subscriptions, identity, entitlement, telemetry, experiments, closed remote services, marketing behavior, copied prompts, copied implementation, and copied assets are outside the project.
 
 ## Coverage matrix
 
 | Harness subsystem | Rust implementation | Status | Verification evidence |
 |---|---|---:|---|
-| CLI and output formats | `src/cli.rs`, `src/main.rs` | complete | unchanged text, JSON, stream-JSON, interactive, and print paths |
+| CLI and output formats | `src/cli.rs`, `src/main.rs`, `src/terminal.rs` | complete for declared surface | stable text/JSON/stream-JSON print paths; Rust composer, history, multiline input, mode cycling, event rows, transactional interrupt |
+| Prompt assembly and init | `src/{prompt,query,commands,compact,agents}.rs` | complete for declared layers | open stable contract, live tools/mode, workspace context, compaction/delegation prompts, `/init` for `AGENTS.md`; no automatic absolute cwd or device metadata |
 | Model endpoint boundary | `src/api.rs`, `src/config.rs` | complete | same-origin validation, no redirects, proxy opt-in, bounded JSON/SSE |
 | Request privacy contract | `src/api.rs`, `tests/privacy_boundary.rs` | complete | raw requests contain only the documented generic body and bearer authorization |
 | Credential isolation | `src/main.rs`, subprocess modules, `tests/credential_isolation.rs` | complete | model token removed before workers and excluded from child environments |
@@ -45,7 +46,7 @@ The always-active base surface remains fifteen local tools. The normal executabl
 “Harness complete” does not mean copying every ornament that has ever surrounded a message loop. The following boundaries are intentional and are not claimed by the README:
 
 - No account, subscription, billing, identity, entitlement, update, experiment, analytics, or hidden remote-control path.
-- No proprietary terminal UI, interactive question panel, slash-command directory UI, remote-team UI, scheduled notification system, voice character, or marketing surface. The CLI remains unchanged.
+- No copied terminal implementation, text, branding, or assets. The repository does include an original Rust conversational composer and observable state machine; rich interactive question panels, command-directory browsers, remote-team UI, scheduled notifications, voice characters, and marketing surfaces are not claimed.
 - No image/PDF/browser rendering layer. `Read` and web integrations return bounded textual data; a graphical browser is not implied.
 - MCP advertises no roots, sampling, elicitation, or task client capability. Unsupported server-to-client requests fail closed; `ping` is answered on request-response channels. Tools, resources, templates, prompts, notifications, stdio, and Streamable HTTP are the declared MCP scope.
 - LSP is limited to the operations listed by the `LSP` tool schema. It is not a complete editor client.
