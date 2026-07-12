@@ -20,6 +20,38 @@ fn context(root: &std::path::Path) -> ToolContext {
     )
 }
 
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes whether the process exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next());
+        if matches!(state, Some('Z' | 'X')) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(pid: i32) -> bool {
+    for _ in 0..100 {
+        if !process_is_running(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
 #[tokio::test]
 async fn read_then_edit_preserves_reference_guard() {
     let temp = tempdir().unwrap();
@@ -118,6 +150,48 @@ async fn glob_and_grep_return_real_matches() {
         .await;
     assert!(!grep.is_error, "{}", grep.content);
     assert!(grep.content.contains("migrated_marker"));
+}
+
+#[tokio::test]
+async fn rust_grep_supports_filters_context_counts_and_multiline() {
+    let temp = tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "before\nNeedle\nafter\n").unwrap();
+    std::fs::write(temp.path().join("notes.txt"), "needle\nsecond line\n").unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+
+    let content = registry
+        .execute(
+            &context,
+            "Grep",
+            json!({"pattern":"needle","output_mode":"content","type":"rust","-i":true,"-C":1}),
+        )
+        .await;
+    assert!(!content.is_error, "{}", content.content);
+    assert!(content.content.contains("code.rs:2:Needle"));
+    assert!(content.content.contains("code.rs-1-before"));
+    assert!(!content.content.contains("notes.txt"));
+
+    let count = registry
+        .execute(
+            &context,
+            "Grep",
+            json!({"pattern":"needle","output_mode":"count","-i":true}),
+        )
+        .await;
+    assert!(!count.is_error, "{}", count.content);
+    assert!(count.content.contains("code.rs:1"));
+    assert!(count.content.contains("notes.txt:1"));
+
+    let multiline = registry
+        .execute(
+            &context,
+            "Grep",
+            json!({"pattern":"needle\\nsecond","glob":"*.txt","output_mode":"files_with_matches","multiline":true}),
+        )
+        .await;
+    assert!(!multiline.is_error, "{}", multiline.content);
+    assert_eq!(multiline.content, "notes.txt");
 }
 
 #[tokio::test]
@@ -519,9 +593,10 @@ async fn bash_timeout_terminates_descendant_processes() {
         .trim()
         .to_owned();
     let pid = pid.parse::<i32>().unwrap();
-    // SAFETY: signal 0 only probes whether the recorded child process still exists.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    assert!(!alive, "descendant process {pid} survived timeout");
+    assert!(
+        wait_for_process_exit(pid).await,
+        "descendant process {pid} survived timeout"
+    );
 }
 
 #[cfg(unix)]
@@ -564,8 +639,10 @@ async fn task_stop_terminates_background_process_group() {
         .execute(&context, "TaskStop", json!({"task_id":task_id}))
         .await;
     assert!(!stopped.is_error, "{}", stopped.content);
-    // SAFETY: signal 0 only probes whether the recorded descendant still exists.
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    assert!(
+        wait_for_process_exit(pid).await,
+        "background descendant process {pid} survived TaskStop"
+    );
 }
 
 #[tokio::test]

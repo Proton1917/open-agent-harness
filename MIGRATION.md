@@ -32,7 +32,7 @@ Account systems, subscriptions, entitlement checks, telemetry, experiments, prop
 | Ordered safe concurrency | `src/tools/mod.rs` | complete | consecutive read-only calls run together; mutations remain barriers |
 | File editing | `read.rs`, `write.rs`, `edit.rs` | complete | full-read guard, exact stale-content rejection, unique replacement, atomic write |
 | Notebook editing | `src/tools/notebook.rs` | complete | replace, insert, delete, cell IDs, output clearing, size boundary |
-| Search | `src/tools/glob.rs`, `src/tools/grep.rs` | complete | real matches, pagination, traversal, time, byte, and process limits |
+| Search | `src/tools/glob.rs`, `src/tools/grep.rs` | complete | native Rust regexes, filters, context, pagination, traversal, time, file, and byte limits |
 | Shell and background processes | `src/tools/bash.rs`, `src/tools/tasks.rs` | complete | private bounded capture, timeout, task output, stop, process-group cleanup |
 | Planning state | `src/tools/work_items.rs` | complete | bounded todo/task persistence, ownership, dependencies, metadata, private files |
 | Permissions and workspace scope | `src/permissions.rs`, `src/tools/mod.rs` | complete | non-interactive denial, deny precedence, outside-path and symlink-escape tests |

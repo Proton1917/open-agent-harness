@@ -1,19 +1,26 @@
 use std::{
-    process::Stdio,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use globset::{Glob, GlobMatcher};
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{
-    io::AsyncReadExt,
-    process::{Child, Command},
-    time::timeout,
-};
+use walkdir::{DirEntry, WalkDir};
 
 use super::{Tool, ToolContext, ToolOutput, object_schema, parse_input};
+
+const MAX_RESULT_BYTES: usize = 240 * 1024;
+const MAX_RECORD_BYTES: usize = 64 * 1024;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_TOTAL_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_FILES: usize = 100_000;
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -45,7 +52,7 @@ fn default_line_numbers() -> bool {
     true
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OutputMode {
     Content,
@@ -56,39 +63,46 @@ enum OutputMode {
 
 pub struct GrepTool;
 
-const MAX_STDOUT_BYTES: usize = 512 * 1024;
-const MAX_STDERR_BYTES: usize = 64 * 1024;
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
-
 #[async_trait]
 impl Tool for GrepTool {
     fn name(&self) -> &'static str {
         "Grep"
     }
+
     fn description(&self) -> &'static str {
-        "Searches file contents with ripgrep. Supports content, files_with_matches, and count modes plus pagination."
+        "Searches text file contents with Rust regexes. Supports content, files_with_matches, and count modes plus pagination."
     }
+
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "pattern": {"type": "string", "maxLength": 65536}, "path": {"type": "string", "maxLength": 4096},
+                "pattern": {"type": "string", "maxLength": 65536},
+                "path": {"type": "string", "maxLength": 4096},
                 "glob": {"type": "string", "maxLength": 4096},
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"]},
-                "-B": {"type": "integer", "minimum": 0}, "-A": {"type": "integer", "minimum": 0},
-                "-C": {"type": "integer", "minimum": 0}, "context": {"type": "integer", "minimum": 0},
-                "-n": {"type": "boolean"}, "-i": {"type": "boolean"}, "type": {"type": "string", "maxLength": 128},
-                "head_limit": {"type": "integer", "minimum": 0, "maximum": 100000}, "offset": {"type": "integer", "minimum": 0, "maximum": 10000000},
+                "-B": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "-A": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "-C": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "context": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "-n": {"type": "boolean"},
+                "-i": {"type": "boolean"},
+                "type": {"type": "string", "maxLength": 128},
+                "head_limit": {"type": "integer", "minimum": 0, "maximum": 100000},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 10000000},
                 "multiline": {"type": "boolean"}
             }),
             &["pattern"],
         )
     }
+
     fn read_only(&self, _: &Value) -> bool {
         true
     }
+
     fn path_fields(&self) -> &'static [&'static str] {
         &["path"]
     }
+
     fn summary(&self, input: &Value) -> String {
         input
             .get("pattern")
@@ -96,201 +110,513 @@ impl Tool for GrepTool {
             .unwrap_or("<missing>")
             .to_owned()
     }
+
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: Input = parse_input(input)?;
-        let path = match &input.path {
+        let root = match &input.path {
             Some(path) => context.resolve_path(path)?,
             None => context.cwd.clone(),
         };
-        if !path.exists() {
-            bail!("搜索路径不存在: {}", path.display())
+        if !root.exists() {
+            bail!("搜索路径不存在: {}", context.display_path(&root))
         }
-        let mut command = Command::new("rg");
-        command.arg("--color=never").arg("--no-heading");
-        for dir in [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"] {
-            command.arg("--glob").arg(format!("!{dir}/**"));
+        if !root.is_file() && !root.is_dir() {
+            bail!(
+                "搜索路径不是普通文件或目录: {}",
+                context.display_path(&root)
+            )
         }
-        match input.output_mode {
-            OutputMode::Content => {
-                if input.line_numbers {
-                    command.arg("--line-number");
-                }
-                if let Some(value) = input.before {
-                    command.arg("-B").arg(value.to_string());
-                }
-                if let Some(value) = input.after {
-                    command.arg("-A").arg(value.to_string());
-                }
-                if let Some(value) = input.context.or(input.context_short) {
-                    command.arg("-C").arg(value.to_string());
-                }
-            }
-            OutputMode::FilesWithMatches => {
-                command.arg("--files-with-matches");
-            }
-            OutputMode::Count => {
-                command.arg("--count");
-            }
-        }
-        if input.case_insensitive {
-            command.arg("--ignore-case");
-        }
-        if input.multiline {
-            command.arg("--multiline").arg("--multiline-dotall");
-        }
-        if let Some(glob) = &input.glob {
-            command.arg("--glob").arg(glob);
-        }
-        if let Some(kind) = &input.r#type {
-            command.arg("--type").arg(kind);
-        }
-        let search_path = path
-            .strip_prefix(&context.cwd)
-            .ok()
-            .filter(|relative| !relative.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let search_path = if path.starts_with(&context.cwd) {
-            search_path
-        } else {
-            &path
-        };
-        command
-            .arg("--")
-            .arg(&input.pattern)
-            .arg(search_path)
-            .current_dir(&context.cwd);
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env_remove("HARNESS_API_KEY")
-            .env_remove("HARNESS_AUTH_TOKEN");
-        #[cfg(unix)]
-        command.process_group(0);
-        let started = Instant::now();
-        let mut child = command
-            .spawn()
-            .context("无法启动 rg；请确认 ripgrep 已安装")?;
-        let process_group_id = child.id();
-        let stdout = child.stdout.take().context("无法捕获 rg stdout")?;
-        let stderr = child.stderr.take().context("无法捕获 rg stderr")?;
-        let mut stdout_task = tokio::spawn(read_up_to(stdout, MAX_STDOUT_BYTES));
-        let mut stderr_task = tokio::spawn(drain_capped(stderr, MAX_STDERR_BYTES));
-        let (stdout, byte_truncated) = match timeout(remaining(started), &mut stdout_task).await {
-            Ok(result) => result.context("rg stdout reader 失败")??,
-            Err(_) => {
-                terminate_search(&mut child, process_group_id).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                bail!("rg 搜索超过 {} 秒限制", SEARCH_TIMEOUT.as_secs())
-            }
-        };
-        let status = if byte_truncated {
-            terminate_search(&mut child, process_group_id).await;
-            None
-        } else {
-            match timeout(remaining(started), child.wait()).await {
-                Ok(status) => Some(status.context("等待 rg 结束失败")?),
-                Err(_) => {
-                    terminate_search(&mut child, process_group_id).await;
-                    stderr_task.abort();
-                    bail!("rg 搜索超过 {} 秒限制", SEARCH_TIMEOUT.as_secs())
-                }
-            }
-        };
-        let stderr = match timeout(remaining(started), &mut stderr_task).await {
-            Ok(result) => result.context("rg stderr reader 失败")??,
-            Err(_) => {
-                terminate_search(&mut child, process_group_id).await;
-                stderr_task.abort();
-                bail!("rg 搜索超过 {} 秒限制", SEARCH_TIMEOUT.as_secs())
-            }
-        };
-        if let Some(status) = status
-            && !status.success()
-            && status.code() != Some(1)
-        {
-            bail!("rg 失败: {}", String::from_utf8_lossy(&stderr).trim())
-        }
-        let raw = String::from_utf8_lossy(&stdout);
-        let lines: Vec<&str> = raw.lines().collect();
-        let limit = match input.head_limit {
-            Some(0) => usize::MAX,
-            Some(n) => n,
-            None => 250,
-        };
-        let selected = lines
-            .iter()
-            .skip(input.offset)
-            .take(limit)
-            .copied()
-            .collect::<Vec<_>>();
-        if selected.is_empty() {
-            if byte_truncated {
-                return Ok(ToolOutput::success(format!(
-                    "No results were captured at offset {}; rg output exceeded the {} byte limit",
-                    input.offset, MAX_STDOUT_BYTES
-                )));
-            }
-            return Ok(ToolOutput::success("No matches found"));
-        }
-        let truncated = byte_truncated || lines.len().saturating_sub(input.offset) > selected.len();
-        let mut result = selected.join("\n");
-        if truncated {
-            result.push_str(&format!(
-                "\n\n[Showing results with pagination = limit: {}, offset: {}]",
-                limit, input.offset
-            ));
-        }
+        let cwd = context.cwd.clone();
+        let result = tokio::task::spawn_blocking(move || search(root, cwd, input))
+            .await
+            .context("Rust Grep worker 失败")??;
         Ok(ToolOutput::success(result))
     }
 }
 
-fn remaining(started: Instant) -> Duration {
-    SEARCH_TIMEOUT.saturating_sub(started.elapsed())
-}
+fn search(root: PathBuf, cwd: PathBuf, input: Input) -> Result<String> {
+    let regex = RegexBuilder::new(&input.pattern)
+        .case_insensitive(input.case_insensitive)
+        .multi_line(input.multiline)
+        .dot_matches_new_line(input.multiline)
+        .size_limit(16 * 1024 * 1024)
+        .dfa_size_limit(16 * 1024 * 1024)
+        .build()
+        .context("无效 regex pattern")?;
+    let glob = input
+        .glob
+        .as_deref()
+        .map(Glob::new)
+        .transpose()
+        .context("无效 glob filter")?
+        .map(|glob| glob.compile_matcher());
+    let symmetric = input.context.or(input.context_short).unwrap_or(0) as usize;
+    let options = SearchOptions {
+        regex,
+        glob,
+        kind: input.r#type.map(|kind| kind.to_ascii_lowercase()),
+        output_mode: input.output_mode,
+        line_numbers: input.line_numbers,
+        before: input.before.map_or(symmetric, |value| value as usize),
+        after: input.after.map_or(symmetric, |value| value as usize),
+        multiline: input.multiline,
+    };
+    let limit = match input.head_limit {
+        Some(0) => usize::MAX,
+        Some(limit) => limit,
+        None => 250,
+    };
+    let mut collector = Collector::new(input.offset, limit);
+    let mut budget = SearchBudget::new();
 
-async fn terminate_search(child: &mut Child, process_group_id: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(group) = process_group_id {
-        // SAFETY: rg is placed in a dedicated process group at spawn time.
-        unsafe {
-            libc::kill(-(group as i32), libc::SIGKILL);
+    if root.is_file() {
+        scan_candidate(&root, &root, &cwd, &options, &mut collector, &mut budget)?;
+    } else {
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(include_entry)
+        {
+            budget.check_time()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    budget.limited = true;
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if budget.files >= MAX_FILES {
+                budget.limited = true;
+                break;
+            }
+            budget.files += 1;
+            if !scan_candidate(
+                entry.path(),
+                &root,
+                &cwd,
+                &options,
+                &mut collector,
+                &mut budget,
+            )? {
+                break;
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = process_group_id;
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    collector.finish(input.offset, limit, budget.limited)
 }
 
-async fn read_up_to(
-    reader: impl tokio::io::AsyncRead + Unpin,
-    limit: usize,
-) -> Result<(Vec<u8>, bool)> {
+struct SearchOptions {
+    regex: Regex,
+    glob: Option<GlobMatcher>,
+    kind: Option<String>,
+    output_mode: OutputMode,
+    line_numbers: bool,
+    before: usize,
+    after: usize,
+    multiline: bool,
+}
+
+struct SearchBudget {
+    started: Instant,
+    files: usize,
+    scanned_bytes: u64,
+    limited: bool,
+}
+
+impl SearchBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            files: 0,
+            scanned_bytes: 0,
+            limited: false,
+        }
+    }
+
+    fn check_time(&self) -> Result<()> {
+        if self.started.elapsed() > SEARCH_TIMEOUT {
+            bail!("Grep 搜索超过 {} 秒限制", SEARCH_TIMEOUT.as_secs())
+        }
+        Ok(())
+    }
+}
+
+fn scan_candidate(
+    path: &Path,
+    root: &Path,
+    cwd: &Path,
+    options: &SearchOptions,
+    collector: &mut Collector,
+    budget: &mut SearchBudget,
+) -> Result<bool> {
+    budget.check_time()?;
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if !matches_filters(path, relative, options) {
+        return Ok(true);
+    }
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("无法检查搜索文件 {}", display_path(path, cwd)))?;
+    if metadata.len() > MAX_FILE_BYTES {
+        budget.limited = true;
+        return Ok(true);
+    }
+    if budget.scanned_bytes.saturating_add(metadata.len()) > MAX_TOTAL_SCAN_BYTES {
+        budget.limited = true;
+        return Ok(false);
+    }
+
     let mut bytes = Vec::new();
-    reader
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    let truncated = bytes.len() > limit;
-    bytes.truncate(limit);
-    Ok((bytes, truncated))
+    File::open(path)
+        .with_context(|| format!("无法打开搜索文件 {}", display_path(path, cwd)))?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FILE_BYTES as usize {
+        budget.limited = true;
+        return Ok(true);
+    }
+    if budget.scanned_bytes.saturating_add(bytes.len() as u64) > MAX_TOTAL_SCAN_BYTES {
+        budget.limited = true;
+        return Ok(false);
+    }
+    budget.scanned_bytes = budget.scanned_bytes.saturating_add(bytes.len() as u64);
+    if bytes.contains(&0) {
+        return Ok(true);
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(true);
+    };
+    let label = display_path(path, cwd);
+    if options.multiline {
+        scan_multiline(text, &label, options, collector, budget)
+    } else {
+        scan_lines(text, &label, options, collector, budget)
+    }
 }
 
-async fn drain_capped(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
-    limit: usize,
-) -> Result<Vec<u8>> {
-    let mut kept = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = reader.read(&mut chunk).await?;
-        if count == 0 {
+fn matches_filters(path: &Path, relative: &Path, options: &SearchOptions) -> bool {
+    if let Some(glob) = &options.glob
+        && !glob.is_match(relative)
+        && !path
+            .file_name()
+            .is_some_and(|file_name| glob.is_match(Path::new(file_name)))
+    {
+        return false;
+    }
+    options
+        .kind
+        .as_deref()
+        .is_none_or(|kind| matches_type(path, kind))
+}
+
+fn matches_type(path: &Path, kind: &str) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let allowed: &[&str] = match kind.trim_start_matches('.') {
+        "rust" => &["rs"],
+        "python" => &["py", "pyi"],
+        "javascript" | "js" => &["js", "jsx", "mjs", "cjs"],
+        "typescript" | "ts" => &["ts", "tsx", "mts", "cts"],
+        "json" => &["json", "jsonl"],
+        "toml" => &["toml"],
+        "yaml" => &["yaml", "yml"],
+        "markdown" | "md" => &["md", "mdx", "markdown"],
+        "shell" | "sh" => &["sh", "bash", "zsh", "fish"],
+        "c" => &["c", "h"],
+        "cpp" | "c++" => &["cc", "cpp", "cxx", "hh", "hpp", "hxx"],
+        "java" => &["java"],
+        "go" => &["go"],
+        "ruby" => &["rb"],
+        "swift" => &["swift"],
+        "text" | "txt" => &["txt"],
+        other => return extension == other,
+    };
+    allowed.contains(&extension.as_str())
+}
+
+fn scan_lines(
+    text: &str,
+    label: &str,
+    options: &SearchOptions,
+    collector: &mut Collector,
+    budget: &SearchBudget,
+) -> Result<bool> {
+    let lines = text.split('\n').collect::<Vec<_>>();
+    match options.output_mode {
+        OutputMode::FilesWithMatches => {
+            for (index, line) in lines.iter().enumerate() {
+                if index % 4096 == 0 {
+                    budget.check_time()?;
+                }
+                if options.regex.is_match(line.trim_end_matches('\r')) {
+                    return Ok(collector.push(label.to_owned()));
+                }
+            }
+            Ok(true)
+        }
+        OutputMode::Count => {
+            let mut count = 0usize;
+            for (index, line) in lines.iter().enumerate() {
+                if index % 4096 == 0 {
+                    budget.check_time()?;
+                }
+                if options.regex.is_match(line.trim_end_matches('\r')) {
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                Ok(true)
+            } else {
+                Ok(collector.push(format!("{label}:{count}")))
+            }
+        }
+        OutputMode::Content => {
+            for (index, line) in lines.iter().enumerate() {
+                if index % 4096 == 0 {
+                    budget.check_time()?;
+                }
+                if options.regex.is_match(line.trim_end_matches('\r')) {
+                    let record = render_window(
+                        &lines,
+                        label,
+                        index,
+                        index,
+                        options.before,
+                        options.after,
+                        options.line_numbers,
+                    );
+                    if !collector.push(record) {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn scan_multiline(
+    text: &str,
+    label: &str,
+    options: &SearchOptions,
+    collector: &mut Collector,
+    budget: &SearchBudget,
+) -> Result<bool> {
+    if !options.regex.is_match(text) {
+        return Ok(true);
+    }
+    match options.output_mode {
+        OutputMode::FilesWithMatches => Ok(collector.push(label.to_owned())),
+        OutputMode::Count => {
+            Ok(collector.push(format!("{label}:{}", options.regex.find_iter(text).count())))
+        }
+        OutputMode::Content => {
+            let lines = text.split('\n').collect::<Vec<_>>();
+            let starts = std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+                .collect::<Vec<_>>();
+            for (index, found) in options.regex.find_iter(text).enumerate() {
+                if index % 1024 == 0 {
+                    budget.check_time()?;
+                }
+                let start_line = line_index(&starts, found.start());
+                let end_offset = found.end().saturating_sub(1).max(found.start());
+                let end_line = line_index(&starts, end_offset);
+                let record = render_window(
+                    &lines,
+                    label,
+                    start_line,
+                    end_line,
+                    options.before,
+                    options.after,
+                    options.line_numbers,
+                );
+                if !collector.push(record) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn line_index(starts: &[usize], offset: usize) -> usize {
+    starts
+        .partition_point(|start| *start <= offset)
+        .saturating_sub(1)
+}
+
+fn render_window(
+    lines: &[&str],
+    label: &str,
+    match_start: usize,
+    match_end: usize,
+    before: usize,
+    after: usize,
+    line_numbers: bool,
+) -> String {
+    let start = match_start.saturating_sub(before);
+    let end = match_end
+        .saturating_add(after)
+        .saturating_add(1)
+        .min(lines.len());
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate().take(end).skip(start) {
+        let matched = (match_start..=match_end).contains(&index);
+        let separator = if matched { ':' } else { '-' };
+        let line = line.trim_end_matches('\r');
+        let mut rendered = if line_numbers {
+            format!("{label}{separator}{}{separator}{line}", index + 1)
+        } else {
+            format!("{label}{separator}{line}")
+        };
+        let separator_bytes = usize::from(!output.is_empty());
+        let remaining = MAX_RECORD_BYTES.saturating_sub(output.len() + separator_bytes);
+        if rendered.len() > remaining {
+            const MARKER: &str = "\n[context window truncated]";
+            truncate_utf8(&mut rendered, remaining.saturating_sub(MARKER.len()));
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&rendered);
+            output.push_str(MARKER);
             break;
         }
-        let remaining = limit.saturating_sub(kept.len());
-        kept.extend_from_slice(&chunk[..count.min(remaining)]);
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&rendered);
     }
-    Ok(kept)
+    output
+}
+
+struct Collector {
+    offset: usize,
+    limit: usize,
+    seen: usize,
+    bytes: usize,
+    entries: Vec<String>,
+    truncated: bool,
+}
+
+impl Collector {
+    fn new(offset: usize, limit: usize) -> Self {
+        Self {
+            offset,
+            limit,
+            seen: 0,
+            bytes: 0,
+            entries: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, mut record: String) -> bool {
+        self.seen += 1;
+        if self.seen <= self.offset {
+            return true;
+        }
+        if self.entries.len() >= self.limit {
+            self.truncated = true;
+            return false;
+        }
+        if record.len() > MAX_RECORD_BYTES {
+            truncate_utf8(&mut record, MAX_RECORD_BYTES - 32);
+            record.push_str("\n[match record truncated]");
+            self.truncated = true;
+        }
+        let added = record.len() + usize::from(!self.entries.is_empty());
+        if self.bytes.saturating_add(added) > MAX_RESULT_BYTES {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += added;
+        self.entries.push(record);
+        true
+    }
+
+    fn finish(mut self, offset: usize, limit: usize, resource_limited: bool) -> Result<String> {
+        self.truncated |= resource_limited;
+        if self.entries.is_empty() {
+            return Ok(if self.seen > 0 {
+                format!("No results returned at offset {offset}")
+            } else if self.truncated {
+                "No matches found before a search resource limit was reached".into()
+            } else {
+                "No matches found".into()
+            });
+        }
+        let mut output = self.entries.join("\n");
+        if self.truncated {
+            output.push_str(&format!(
+                "\n\n[Showing bounded results with pagination = limit: {}, offset: {}]",
+                if limit == usize::MAX { 0 } else { limit },
+                offset
+            ));
+        }
+        Ok(output)
+    }
+}
+
+fn truncate_utf8(value: &mut String, mut end: usize) {
+    end = end.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn include_entry(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    !matches!(
+        entry.file_name().to_str(),
+        Some(".git" | ".svn" | ".hg" | ".bzr" | ".jj" | ".sl")
+    )
+}
+
+fn display_path(path: &Path, cwd: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return if relative.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            relative.display().to_string()
+        };
+    }
+    if let Some(home) = dirs::home_dir()
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        return format!("~/{}", relative.display());
+    }
+    path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collector_applies_offset_limit_and_utf8_safe_bounds() {
+        let mut collector = Collector::new(1, 1);
+        assert!(collector.push("skip".into()));
+        assert!(collector.push("保留".into()));
+        assert!(!collector.push("extra".into()));
+        let output = collector.finish(1, 1, false).unwrap();
+        assert!(output.contains("保留"));
+        assert!(output.contains("bounded results"));
+    }
+
+    #[test]
+    fn type_filters_cover_common_rust_and_text_files() {
+        assert!(matches_type(Path::new("src/main.rs"), "rust"));
+        assert!(matches_type(Path::new("notes.txt"), "text"));
+        assert!(!matches_type(Path::new("src/main.rs"), "python"));
+    }
 }
