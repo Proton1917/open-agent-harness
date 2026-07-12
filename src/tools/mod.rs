@@ -232,7 +232,7 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let parent = path.parent().context("目标文件没有父目录")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("无法创建目录 {}", parent.display()))?;
-    let temp = parent.join(format!(".agent-harness-{}.tmp", uuid::Uuid::new_v4()));
+    let temp = parent.join(format!(".open-agent-harness-{}.tmp", uuid::Uuid::new_v4()));
     std::fs::write(&temp, content)
         .with_context(|| format!("无法写入临时文件 {}", temp.display()))?;
     if let Ok(metadata) = std::fs::metadata(path) {

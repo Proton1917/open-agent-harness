@@ -20,6 +20,9 @@
 | CLI 与输出格式 | `src/main.rs`, `src/cli.rs` | 已实现 | help/version smoke |
 | messages endpoint | `src/api.rs` | 已实现 | mock SSE query-loop |
 | query/tool loop | `src/query.rs` | 已实现 | 分块 tool input 与 result round trip |
+| 消息规范化 | `src/messages.rs` | 已实现 | 合并、孤立结果清理、配对修复测试 |
+| token 估算 | `src/tokens.rs` | 已实现 | 文本、JSON、媒体估算测试 |
+| context compact | `src/compact.rs` | 已实现 | mock SSE 摘要、自动阈值、格式化测试 |
 | 工具 registry | `src/tools/mod.rs` | 已实现 | JSON Schema 与真实执行测试 |
 | 文件工具 | `src/tools/read.rs`, `edit.rs`, `write.rs` | 已实现 | 陈旧拒绝、partial-read 拒绝、原子写入 |
 | 搜索工具 | `src/tools/glob.rs`, `grep.rs` | 已实现 | 临时目录真实匹配 |
@@ -27,6 +30,7 @@
 | 权限 | `src/permissions.rs` | 已实现 | deny precedence、非交互拒绝 |
 | settings | `src/config.rs` | 已实现 | 递归 merge 测试 |
 | session | `src/session.rs` | 已实现 | JSONL resume 路径 |
+| compact transcript | `src/session.rs` | 已实现 | boundary 替换旧历史测试 |
 | `AGENTS.md` 指令 | `src/context.rs` | 已实现 | 分层顺序与 bare 模式测试 |
 
 ## 完成门槛
@@ -37,8 +41,8 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 scripts/audit-harness.sh
-target/release/agent-harness --help
-target/release/agent-harness --version
+target/release/open-agent-harness --help
+target/release/open-agent-harness --version
 ```
 
 审计脚本必须证明 Rust 成品和工程文档中不存在被移除的厂商品牌字符串；原始 `reference/` 快照只读且不属于成品扫描范围。

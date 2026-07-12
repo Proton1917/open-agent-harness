@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 
-use agent_harness::{
+use open_agent_harness::{
     api::ModelClient,
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
@@ -73,6 +73,7 @@ async fn query_engine_round_trips_tool_use_and_result() {
             text_delta_sink: Some(Arc::new(move |delta| {
                 captured_deltas.lock().unwrap().push_str(delta);
             })),
+            compact_config: None,
         },
     );
 

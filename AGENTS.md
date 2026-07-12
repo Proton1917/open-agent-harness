@@ -1,4 +1,4 @@
-# agent-harness engineering guide
+# open-agent-harness engineering guide
 
 ## Scope
 
@@ -24,4 +24,4 @@ cargo build --release
 scripts/audit-harness.sh
 ```
 
-工程日志应直接整合到本文件，保持简短；当前核心 harness、8 个工具、SSE 流、权限、会话和分层 `AGENTS.md` 已迁移。
+工程日志应直接整合到本文件，保持简短；当前核心 harness、8 个工具、SSE 流、权限、会话、分层 `AGENTS.md`、消息规范化、token 估算和自动/手动 compact 已迁移。

@@ -1,16 +1,16 @@
 [package]
-name = "agent-harness"
+name = "open-agent-harness"
 version = "0.1.0"
 edition = "2024"
 description = "A provider-neutral Rust coding-agent harness"
 license = "MIT"
 
 [lib]
-name = "agent_harness"
+name = "open_agent_harness"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agent-harness"
+name = "open-agent-harness"
 path = "src/main.rs"
 
 [dependencies]

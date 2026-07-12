@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_harness::{
+use open_agent_harness::{
     permissions::{PermissionManager, PermissionMode},
     tools::{ToolContext, ToolRegistry},
 };

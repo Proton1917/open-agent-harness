@@ -16,6 +16,8 @@ struct Record {
     session_id: Uuid,
     cwd: PathBuf,
     timestamp_ms: u128,
+    #[serde(default)]
+    compact_boundary: bool,
     message: Message,
 }
 
@@ -103,6 +105,37 @@ impl SessionStore {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis(),
+                compact_boundary: false,
+                message: message.clone(),
+            };
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    pub fn replace_history(&self, messages: &[Message]) -> Result<()> {
+        if !self.enabled || messages.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+            .with_context(|| format!("无法打开 transcript {}", self.file.display()))?;
+        for (index, message) in messages.iter().enumerate() {
+            let record = Record {
+                session_id: self.id,
+                cwd: self.cwd.clone(),
+                timestamp_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                compact_boundary: index == 0,
                 message: message.clone(),
             };
             serde_json::to_writer(&mut file, &record)?;
@@ -126,7 +159,7 @@ fn project_directory(cwd: &Path) -> Result<PathBuf> {
             }
         })
         .collect::<String>();
-    let directory = home.join(".agent-harness/projects").join(key);
+    let directory = home.join(".open-agent-harness/projects").join(key);
     fs::create_dir_all(&directory)?;
     Ok(directory)
 }
@@ -136,10 +169,40 @@ fn load_messages(file: &Path) -> Result<Vec<Message>> {
     reader
         .lines()
         .enumerate()
-        .map(|(index, line)| {
+        .try_fold(Vec::new(), |mut messages, (index, line)| {
             let record: Record = serde_json::from_str(&line?)
                 .with_context(|| format!("transcript 第 {} 行损坏", index + 1))?;
-            Ok(record.message)
+            if record.compact_boundary {
+                messages.clear();
+            }
+            messages.push(record.message);
+            Ok(messages)
         })
-        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_boundary_replaces_prior_history_on_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore {
+            id: Uuid::new_v4(),
+            cwd: temp.path().to_owned(),
+            file: temp.path().join("session.jsonl"),
+            enabled: true,
+        };
+        store
+            .append(&[
+                Message::user_text("old user"),
+                Message::assistant(vec![serde_json::json!({"type":"text","text":"old reply"})]),
+            ])
+            .unwrap();
+        store
+            .replace_history(&[Message::user_text("compact summary")])
+            .unwrap();
+        let loaded = load_messages(&store.file).unwrap();
+        assert_eq!(loaded, vec![Message::user_text("compact summary")]);
+    }
 }

@@ -29,10 +29,16 @@ impl Settings {
 
         if !bare {
             if let Some(home) = dirs::home_dir() {
-                merge_file_if_present(&mut merged, &home.join(".agent-harness/settings.json"))?;
+                merge_file_if_present(
+                    &mut merged,
+                    &home.join(".open-agent-harness/settings.json"),
+                )?;
             }
-            merge_file_if_present(&mut merged, &cwd.join(".agent-harness/settings.json"))?;
-            merge_file_if_present(&mut merged, &cwd.join(".agent-harness/settings.local.json"))?;
+            merge_file_if_present(&mut merged, &cwd.join(".open-agent-harness/settings.json"))?;
+            merge_file_if_present(
+                &mut merged,
+                &cwd.join(".open-agent-harness/settings.local.json"),
+            )?;
         }
 
         if let Some(source) = explicit {

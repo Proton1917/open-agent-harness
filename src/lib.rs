@@ -1,10 +1,13 @@
 pub mod api;
 pub mod cli;
 pub mod commands;
+pub mod compact;
 pub mod config;
 pub mod context;
+pub mod messages;
 pub mod permissions;
 pub mod query;
 pub mod session;
+pub mod tokens;
 pub mod tools;
 pub mod types;

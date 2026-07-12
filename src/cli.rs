@@ -12,7 +12,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "agent-harness", version, about)]
+#[command(name = "open-agent-harness", version, about)]
 pub struct Cli {
     /// Prompt. If omitted in print mode, stdin is read to EOF.
     pub prompt: Option<String>,

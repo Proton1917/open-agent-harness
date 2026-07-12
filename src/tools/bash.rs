@@ -124,7 +124,7 @@ async fn spawn_background(
     let id = Uuid::new_v4().to_string();
     let base = dirs::home_dir()
         .context("无法确定主目录")?
-        .join(".agent-harness/tasks");
+        .join(".open-agent-harness/tasks");
     tokio::fs::create_dir_all(&base).await?;
     let output_path = base.join(format!("{id}.output"));
     let stdout = OpenOptions::new()

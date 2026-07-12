@@ -17,7 +17,7 @@ pub async fn discover_agent_instructions(cwd: &Path, bare: bool) -> Result<Vec<I
 
     let mut candidates = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".agent-harness/AGENTS.md"));
+        candidates.push(home.join(".open-agent-harness/AGENTS.md"));
     }
 
     let mut ancestors = cwd.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();

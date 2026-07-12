@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 
 use crate::{
     api::ModelClient,
+    compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
+    messages::normalize_for_api,
+    tokens::estimate_messages,
     tools::{ToolContext, ToolRegistry},
     types::{Message, SessionUsage},
 };
@@ -23,6 +26,8 @@ pub struct QueryEngine {
     pub usage: SessionUsage,
     debug: bool,
     text_delta_sink: Option<TextDeltaSink>,
+    compact_config: CompactConfig,
+    pub compaction_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +35,7 @@ pub struct TurnResult {
     pub text: String,
     pub new_messages: Vec<Message>,
     pub streamed_text: bool,
+    pub compacted: bool,
 }
 
 pub struct QueryOptions {
@@ -39,6 +45,7 @@ pub struct QueryOptions {
     pub messages: Vec<Message>,
     pub debug: bool,
     pub text_delta_sink: Option<TextDeltaSink>,
+    pub compact_config: Option<CompactConfig>,
 }
 
 impl QueryEngine {
@@ -59,6 +66,10 @@ impl QueryEngine {
             usage: SessionUsage::default(),
             debug: options.debug,
             text_delta_sink: options.text_delta_sink,
+            compact_config: options
+                .compact_config
+                .unwrap_or_else(|| CompactConfig::from_env(options.max_tokens)),
+            compaction_count: 0,
         }
     }
 
@@ -67,8 +78,19 @@ impl QueryEngine {
         self.messages.push(Message::user_text(prompt));
         let mut final_text = String::new();
         let mut streamed_text = false;
+        let mut compacted = false;
 
         for round in 0..MAX_TOOL_ROUNDS {
+            if !compacted && self.compact_config.should_auto_compact(&self.messages) {
+                let stats = self.compact(None).await?;
+                compacted = true;
+                if self.debug {
+                    eprintln!(
+                        "[debug] auto compact: {} -> {} estimated tokens",
+                        stats.before_tokens, stats.after_tokens
+                    );
+                }
+            }
             if self.debug {
                 eprintln!(
                     "[debug] API round {}, messages={}",
@@ -76,13 +98,14 @@ impl QueryEngine {
                     self.messages.len()
                 );
             }
+            let api_messages = normalize_for_api(&self.messages);
             let message_result = self
                 .client
                 .messages(
                     &self.model,
                     self.max_tokens,
                     &self.system,
-                    &self.messages,
+                    &api_messages,
                     &self.registry.definitions(),
                     self.text_delta_sink.as_deref(),
                 )
@@ -110,8 +133,13 @@ impl QueryEngine {
             if tool_uses.is_empty() {
                 return Ok(TurnResult {
                     text: final_text,
-                    new_messages: self.messages[start..].to_vec(),
+                    new_messages: if compacted {
+                        self.messages.clone()
+                    } else {
+                        self.messages[start..].to_vec()
+                    },
                     streamed_text,
+                    compacted,
                 });
             }
             let mut tool_results = Vec::with_capacity(tool_uses.len());
@@ -149,6 +177,67 @@ impl QueryEngine {
 
     pub fn clear(&mut self) {
         self.messages.clear();
+    }
+
+    pub fn estimated_tokens(&self) -> usize {
+        estimate_messages(&normalize_for_api(&self.messages))
+    }
+
+    pub fn context_status(&self) -> (usize, usize, usize) {
+        (
+            self.estimated_tokens(),
+            self.compact_config.auto_threshold(),
+            self.compact_config.effective_window(),
+        )
+    }
+
+    pub async fn compact(&mut self, custom_instructions: Option<&str>) -> Result<CompactStats> {
+        if !self.compact_config.enabled {
+            bail!("compaction 已被 HARNESS_DISABLE_COMPACT 禁用")
+        }
+        if self.messages.len() < 2 {
+            bail!("消息不足，至少需要一轮对话才能 compact")
+        }
+
+        let messages_before = self.messages.len();
+        let before_tokens = self.estimated_tokens();
+        let mut summary_input = normalize_for_api(&self.messages);
+        summary_input.push(Message::user_text(compact_prompt(custom_instructions)));
+        summary_input = normalize_for_api(&summary_input);
+
+        let result = self
+            .client
+            .messages(
+                &self.model,
+                self.max_tokens.min(20_000),
+                &self.system,
+                &summary_input,
+                &[],
+                None,
+            )
+            .await?;
+        if let Some(usage) = &result.response.usage {
+            self.usage.add(usage);
+        }
+        let raw_summary = result
+            .response
+            .content
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        if raw_summary.trim().is_empty() {
+            bail!("compact endpoint 返回了空摘要")
+        }
+
+        self.messages = vec![Message::user_text(continuation_message(&raw_summary))];
+        self.compaction_count += 1;
+        Ok(CompactStats {
+            before_tokens,
+            after_tokens: self.estimated_tokens(),
+            messages_before,
+            messages_after: self.messages.len(),
+        })
     }
 }
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ "$(basename "$root")" != "agent-harness-rs" ]]; then
+if [[ "$(basename "$root")" != "open-agent-harness" ]]; then
   echo 'project_directory_name_valid=false' >&2
   exit 1
 fi
@@ -21,7 +21,6 @@ scan_paths=(
   "$root/src"
   "$root/tests"
   "$root/scripts"
-  "$root/README.md"
   "$root/MIGRATION.md"
   "$root/AGENTS.md"
 )
@@ -32,8 +31,8 @@ for term in "${removed_terms[@]}"; do
     echo 'brand_free=false' >&2
     exit 1
   fi
-  if [[ -x "$root/target/release/agent-harness" ]] \
-    && strings "$root/target/release/agent-harness" | rg -q -i "$term"; then
+  if [[ -x "$root/target/release/open-agent-harness" ]] \
+    && strings "$root/target/release/open-agent-harness" | rg -q -i "$term"; then
     echo 'binary_brand_free=false' >&2
     exit 1
   fi
@@ -41,6 +40,12 @@ done
 
 echo 'brand_free=true'
 echo 'binary_brand_free=true'
+
+if ! rg -q -i "${removed_terms[1]}" "$root/README.md"; then
+  echo 'readme_critique_present=false' >&2
+  exit 1
+fi
+echo 'readme_critique_present=true'
 
 reference_git="$(find "$root/reference" -mindepth 2 -maxdepth 2 -type d -name .git -print -quit)"
 if [[ -n "$reference_git" ]]; then

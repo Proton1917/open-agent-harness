@@ -8,7 +8,7 @@ use clap::Parser;
 use serde_json::json;
 use uuid::Uuid;
 
-use agent_harness::{
+use open_agent_harness::{
     api::ModelClient,
     cli::{Cli, OutputFormat},
     commands::{self, CommandOutcome},
@@ -67,18 +67,22 @@ async fn run() -> Result<()> {
             messages: history,
             debug: cli.debug,
             text_delta_sink,
+            compact_config: None,
         },
     );
 
     if cli.print {
         let prompt = print_prompt(&cli)?;
         let result = engine.run_turn(prompt).await?;
-        store.append(&result.new_messages)?;
+        persist_turn(&store, &engine, &result)?;
         print_result(&cli, &engine, &store, &result.text, result.streamed_text)?;
         return Ok(());
     }
 
-    println!("agent-harness · {} · session {}", engine.model, store.id);
+    println!(
+        "open-agent-harness · {} · session {}",
+        engine.model, store.id
+    );
     let mut initial = cli.prompt.clone();
     loop {
         let input = match initial.take() {
@@ -88,6 +92,22 @@ async fn run() -> Result<()> {
         if input.trim().is_empty() {
             continue;
         }
+        if let Some(instructions) = compact_command(input.trim()) {
+            match engine.compact(instructions).await {
+                Ok(stats) => {
+                    store.replace_history(&engine.messages)?;
+                    println!(
+                        "Compacted {} messages to {} (estimated tokens: {} → {}).",
+                        stats.messages_before,
+                        stats.messages_after,
+                        stats.before_tokens,
+                        stats.after_tokens
+                    );
+                }
+                Err(error) => eprintln!("Compact failed: {error:#}"),
+            }
+            continue;
+        }
         match commands::handle(input.trim(), &mut engine, mode) {
             CommandOutcome::Exit => break,
             CommandOutcome::Handled => continue,
@@ -95,7 +115,7 @@ async fn run() -> Result<()> {
         }
         match engine.run_turn(input).await {
             Ok(result) => {
-                store.append(&result.new_messages)?;
+                persist_turn(&store, &engine, &result)?;
                 if result.streamed_text {
                     println!("\n");
                 } else {
@@ -108,10 +128,32 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn persist_turn(
+    store: &SessionStore,
+    engine: &QueryEngine,
+    result: &open_agent_harness::query::TurnResult,
+) -> Result<()> {
+    if result.compacted {
+        store.replace_history(&engine.messages)
+    } else {
+        store.append(&result.new_messages)
+    }
+}
+
+fn compact_command(input: &str) -> Option<Option<&str>> {
+    if input == "/compact" {
+        return Some(None);
+    }
+    input
+        .strip_prefix("/compact ")
+        .map(str::trim)
+        .map(|instructions| (!instructions.is_empty()).then_some(instructions))
+}
+
 fn open_session(
     cli: &Cli,
     cwd: &std::path::Path,
-) -> Result<(SessionStore, Vec<agent_harness::types::Message>)> {
+) -> Result<(SessionStore, Vec<open_agent_harness::types::Message>)> {
     let enabled = !cli.no_session_persistence;
     if cli.r#continue && cli.resume.is_some() {
         bail!("--continue 与 --resume 不能同时使用")

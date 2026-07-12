@@ -41,8 +41,18 @@ pub fn handle(input: &str, engine: &mut QueryEngine, mode: PermissionMode) -> Co
             println!("Permission mode: {mode:?}");
             CommandOutcome::Handled
         }
+        "/context" => {
+            let (used, auto_threshold, effective_window) = engine.context_status();
+            println!(
+                "estimated={} auto_compact={} effective_window={}",
+                used, auto_threshold, effective_window
+            );
+            CommandOutcome::Handled
+        }
         "/help" => {
-            println!("/help  /model [name]  /cost  /permissions  /clear  /exit");
+            println!(
+                "/help  /model [name]  /cost  /context  /compact [instructions]  /permissions  /clear  /exit"
+            );
             CommandOutcome::Handled
         }
         _ => {
