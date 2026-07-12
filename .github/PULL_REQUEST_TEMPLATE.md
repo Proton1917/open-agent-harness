@@ -9,10 +9,15 @@ List the tests, reproducible inputs/outputs, or source-level argument that suppo
 ## Authorship and review
 
 - [ ] I have read and can explain every submitted line, including AI-assisted code.
+- [ ] I identified every AI-assisted part below and documented how I independently verified it.
 - [ ] I independently obtained any lawful comparison material needed for parity claims.
 - [ ] This is an original implementation; no private binary, extracted source, prompt, asset, credential, or personal data is included.
-- [ ] Runtime and shipped harness behavior remain Rust; any shell change is short, transparent repository automation.
+- [ ] The harness core and primary executable remain Rust; ancillary tooling is transparent, scoped, and justified.
 - [ ] The patch contains no placeholder, dead branch, unexplained suppression, or speculative compatibility claim.
+
+### AI-assistance disclosure
+
+List the files or sections that used AI assistance, what the model produced, and the tests or source-level review you performed yourself. Write `None` only when no AI system contributed to the patch.
 
 ## Verification
 

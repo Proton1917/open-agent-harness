@@ -4,13 +4,13 @@ Thank you for helping build a coding-agent harness that belongs to its users. Co
 
 ## Non-negotiable requirements
 
-### 1. Core product logic must be Rust
+### 1. The harness core stays Rust; repository tooling stays practical
 
-All shipped harness behavior and runtime logic must be implemented in Rust.
+The primary implementation, executable, agent loop, model protocol, permission boundary, persistence, and built-in tools must remain Rust. This is a Rust project, not a language-purity contest.
 
-- Do not add JavaScript, TypeScript, Python, Go, Java, C, C++, Swift, native add-ons, opaque binaries, or another language runtime to implement a harness feature.
-- Do not hide a non-Rust implementation behind code generation, a bundled interpreter, FFI, a downloaded executable, or a shell wrapper.
-- Markdown, TOML, lockfiles, license files, CI/workflow configuration, and small transparent shell scripts for auditing, building, packaging, and repository maintenance are allowed. Those scripts must not implement runtime behavior, conceal another product implementation, or become a required language runtime for the harness.
+- Transparent Shell or other source-based helpers are allowed when they are the practical choice for auditing, building, testing, packaging, releasing, fixture generation, and repository maintenance. `scripts/audit-harness.sh` is an intentional part of the quality gate and must not be removed merely to make the language count look purer.
+- Keep ancillary tooling narrow, readable, and replaceable. It must not conceal an alternative harness core, require a proprietary runtime, download opaque executable logic, or turn the Rust binary into a thin launcher for another implementation.
+- Native libraries and FFI require an explicit security, licensing, portability, and maintenance justification. Opaque binaries and closed-source runtime dependencies are not accepted.
 - Prefer the Rust standard library and existing dependencies. A new crate must be open source, have a declared SPDX-compatible license, and be justified in the pull request.
 
 ### 2. AI assistance does not lower the bar
@@ -18,6 +18,7 @@ All shipped harness behavior and runtime logic must be implemented in Rust.
 AI-assisted contributions are allowed. The submitter nevertheless owns every line and must be able to review, explain, test, and maintain it.
 
 - Do not submit bulk-generated code that you have not read or cannot explain.
+- Disclose which parts were AI-assisted and how you verified them. Maintainers may request a line-by-line explanation; inability to provide one is grounds to close the pull request.
 - Do not leave placeholders, dead branches, speculative abstractions, fabricated compatibility claims, or warning suppressions that merely hide a defect.
 - Every behavioral claim needs a test, reproducible evidence, or a precise source-code argument.
 - Keep patches coherent and reviewable. Generated volume is never a substitute for correctness.
@@ -74,7 +75,8 @@ scripts/audit-harness.sh
 
 ## Pull-request checklist
 
-- [ ] All shipped harness behavior and runtime logic is Rust.
+- [ ] The harness core and primary executable remain Rust; ancillary tooling is transparent, scoped, and justified.
+- [ ] I disclosed AI-assisted sections and can explain every submitted line without delegating responsibility to a model.
 - [ ] The change is provider-neutral and has no hard-coded vendor endpoint.
 - [ ] No proprietary comparison material is included or quoted.
 - [ ] Tool inputs are schema-validated before permission or execution.
@@ -96,13 +98,13 @@ By submitting a contribution, you agree that your original contribution is licen
 
 ## 不可妥协的要求
 
-### 1. 核心产品逻辑必须使用 Rust
+### 1. Harness 核心坚持 Rust，仓库工具务求实用
 
-所有随项目发布的 harness 行为与运行时逻辑必须用 Rust 实现。
+主体实现、可执行程序、agent 循环、模型协议、权限边界、持久化和内置工具必须继续以 Rust 实现。这是一个 Rust 项目，但不是语言洁癖比赛。
 
-- 不得用 JavaScript、TypeScript、Python、Go、Java、C、C++、Swift、原生插件、黑盒二进制或其他语言运行时实现 harness 功能。
-- 不得通过代码生成、捆绑解释器、FFI、运行时下载程序或 shell 包装器藏入非 Rust 实现。
-- Markdown、TOML、锁文件、许可证、CI/workflow 配置，以及用于审计、构建、打包和仓库维护的短小透明 shell 脚本均可保留。这些脚本不得实现运行时行为、藏入另一套产品实现，也不得让 harness 依赖额外的语言运行时。
+- 审计、构建、测试、打包、发行、fixture 生成和仓库维护中，哪种工具方便、透明、可靠，就可以采用哪种源码工具；Shell 或其他辅助语言均可。`scripts/audit-harness.sh` 是质量门槛的一部分，不能为了让语言统计看起来更“纯”而删除。
+- 辅助工具必须范围清楚、便于阅读、可以替换；不得借此藏入另一套 harness 核心、依赖专有运行时、下载黑盒可执行逻辑，或把 Rust 二进制变成其他实现的薄启动器。
+- 原生库与 FFI 必须明确说明安全、许可证、可移植性和维护理由；不接受黑盒二进制与闭源运行时依赖。
 - 优先使用 Rust 标准库和现有依赖。新增 crate 必须开源、声明兼容的 SPDX 许可证，并在 PR 中说明必要性。
 
 ### 2. 使用 AI 不会降低贡献门槛
@@ -110,6 +112,7 @@ By submitting a contribution, you agree that your original contribution is licen
 允许使用 AI 辅助贡献，但提交者仍然必须对每一行代码负责，并能够审阅、解释、测试和维护它。
 
 - 不得提交自己没有读过、无法解释的大批量生成代码。
+- 必须披露哪些部分使用了 AI 辅助，以及自己如何完成验证。维护者可以要求逐行解释；无法解释即可关闭 PR。
 - 不得留下占位实现、死分支、臆想抽象、伪造的兼容性声明，或仅用于掩盖缺陷的 warning 抑制。
 - 每项行为声明都必须有测试、可复现证据或严密的源码论证。
 - 补丁必须连贯、可审计；生成代码的数量永远不能替代正确性。
@@ -166,7 +169,8 @@ scripts/audit-harness.sh
 
 ## Pull Request 检查表
 
-- [ ] 所有随项目发布的 harness 行为与运行时逻辑均为 Rust。
+- [ ] Harness 核心与主体可执行程序仍以 Rust 实现；辅助工具透明、范围明确且理由充分。
+- [ ] 已披露 AI 辅助部分，并能逐行解释提交内容，不把责任推给模型。
 - [ ] 改动提供方无关，不含硬编码厂商 endpoint。
 - [ ] 未包含或引用任何专有比对材料。
 - [ ] 工具输入在权限判断和执行前完成 schema 校验。

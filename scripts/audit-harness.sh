@@ -41,6 +41,26 @@ if ! rg -q 'rustflags = \["-D", "warnings"\]' "$root/.cargo/config.toml" \
 fi
 echo 'warnings_are_errors=true'
 
+if rg -n \
+  -e '#!?\[allow\([^]]*(warnings|dead_code|unused(_[a-z_]+)?|clippy::(all|correctness|suspicious))[^]]*\)\]' \
+  -e 'todo!\(' \
+  -e 'unimplemented!\(' \
+  -e 'dbg!\(' \
+  -e '\b(TODO|FIXME|XXX)\b' \
+  "$root/src"; then
+  echo 'source_quality_shortcut_free=false' >&2
+  exit 1
+fi
+if rg -n \
+  -e '-A[[:space:]]*warnings' \
+  -e '--cap-lints[=[:space:]]*allow' \
+  "$root/.cargo" "$root/.github" "$root/scripts"; then
+  echo 'warning_bypass_free=false' >&2
+  exit 1
+fi
+echo 'source_quality_shortcut_free=true'
+echo 'warning_bypass_free=true'
+
 removed_terms=('cl''aude' 'anth''ropic')
 release_binary="$root/target/release/open-agent-harness"
 if [[ ! -x "$release_binary" ]]; then
