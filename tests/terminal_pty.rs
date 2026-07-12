@@ -100,19 +100,20 @@ fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
 fn spawn_terminal(extra_env: &[&str]) -> (Child, File) {
     let mut master = -1;
     let mut slave = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: 30,
         ws_col: 100,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    let size_ptr = std::ptr::addr_of!(size).cast_mut();
     let result = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            size_ptr,
         )
     };
     assert_eq!(result, 0, "{}", io::Error::last_os_error());
