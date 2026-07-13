@@ -5,9 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use serde_json::{Map, Value};
 
-use crate::permissions::PermissionMode;
+use crate::{
+    permissions::PermissionMode,
+    protocol::{ApiFormat, ChatTokensField},
+};
 
 pub const DEFAULT_MODEL: &str = "default";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
@@ -215,24 +219,56 @@ fn merge_json(target: &mut Value, incoming: Value) {
     }
 }
 
-pub fn endpoint_config() -> EndpointConfig {
+pub fn endpoint_config() -> Result<EndpointConfig> {
     let token = env::var("HARNESS_API_KEY")
         .or_else(|_| env::var("HARNESS_AUTH_TOKEN"))
         .ok()
         .filter(|value| !value.is_empty());
-    EndpointConfig {
+    let api_format = env::var("HARNESS_API_FORMAT")
+        .ok()
+        .map(|value| {
+            ApiFormat::from_str(&value, true)
+                .map_err(|error| anyhow::anyhow!("HARNESS_API_FORMAT 无效: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(ApiFormat::Auto);
+    let chat_tokens_field = env::var("HARNESS_CHAT_TOKENS_FIELD")
+        .ok()
+        .map(|value| {
+            ChatTokensField::from_str(&value, true)
+                .map_err(|error| anyhow::anyhow!("HARNESS_CHAT_TOKENS_FIELD 无效: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(ChatTokensField::MaxCompletionTokens);
+    Ok(EndpointConfig {
         token,
         base_url: env::var("HARNESS_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
             .trim_end_matches('/')
             .to_owned(),
-        messages_path: env::var("HARNESS_MESSAGES_PATH")
+        messages_path: env::var("HARNESS_API_PATH")
+            .or_else(|_| env::var("HARNESS_MESSAGES_PATH"))
             .unwrap_or_else(|_| "/v1/messages".to_owned()),
+        api_format,
+        stream: env_bool("HARNESS_STREAM", true)?,
+        chat_tokens_field,
+        include_stream_usage: env_bool("HARNESS_INCLUDE_STREAM_USAGE", true)?,
         allow_env_proxy: env::var("HARNESS_ALLOW_ENV_PROXY")
             .ok()
             .is_some_and(|value| {
                 matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
             }),
+    })
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    let Ok(value) = env::var(name) else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{name} 必须是 true/false、yes/no、on/off 或 1/0"),
     }
 }
 
@@ -241,6 +277,10 @@ pub struct EndpointConfig {
     pub token: Option<String>,
     pub base_url: String,
     pub messages_path: String,
+    pub api_format: ApiFormat,
+    pub stream: bool,
+    pub chat_tokens_field: ChatTokensField,
+    pub include_stream_usage: bool,
     pub allow_env_proxy: bool,
 }
 
@@ -251,6 +291,10 @@ impl fmt::Debug for EndpointConfig {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
             .field("messages_path", &self.messages_path)
+            .field("api_format", &self.api_format)
+            .field("stream", &self.stream)
+            .field("chat_tokens_field", &self.chat_tokens_field)
+            .field("include_stream_usage", &self.include_stream_usage)
             .field("allow_env_proxy", &self.allow_env_proxy)
             .finish()
     }

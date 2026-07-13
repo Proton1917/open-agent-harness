@@ -285,6 +285,7 @@ fn sanitize_for_storage(message: &Message) -> Message {
     let Some(blocks) = sanitized.content.as_array_mut() else {
         return sanitized;
     };
+    blocks.retain(|block| block.get("type").and_then(Value::as_str) != Some("provider_state"));
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
@@ -322,6 +323,22 @@ mod tests {
             .append(&[Message::user_text("not persisted")])
             .unwrap();
         assert!(store.file.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn opaque_provider_state_is_never_persisted() {
+        let message = Message::assistant(vec![serde_json::json!({
+            "type":"provider_state",
+            "format":"responses",
+            "item":{"type":"reasoning","encrypted_content":"opaque-secret-state"}
+        })]);
+        let sanitized = sanitize_for_storage(&message);
+        assert_eq!(sanitized.content, serde_json::json!([]));
+        assert!(
+            !serde_json::to_string(&sanitized)
+                .unwrap()
+                .contains("opaque-secret-state")
+        );
     }
 
     #[test]

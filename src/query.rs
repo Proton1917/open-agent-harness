@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -18,6 +18,9 @@ use crate::{
 const MAX_TOOL_ROUNDS: usize = 64;
 const MAX_TOOL_CALLS_PER_ROUND: usize = 32;
 const MAX_TOOL_CALLS_PER_TURN: usize = 128;
+const MAX_TOOL_USE_ID_BYTES: usize = 256;
+const MAX_TOOL_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_CONTENT_BLOCKS: usize = 8_192;
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type QueryEventSink = Arc<dyn Fn(&QueryEvent) + Send + Sync>;
 
@@ -209,6 +212,13 @@ impl QueryEngine {
         self.event_sink = event_sink;
     }
 
+    pub fn set_model(&mut self, model: String) {
+        if let Ok(runtime) = self.tool_context.agent_runtime() {
+            runtime.set_default_model(model.clone());
+        }
+        self.model = model;
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         self.tool_context.permissions.effective_mode()
     }
@@ -240,24 +250,43 @@ impl QueryEngine {
                 hook_outcome.additional_context.join("\n")
             )
         };
-        let start = self.messages.len();
-        self.messages.push(Message::user_text(prompt));
+        let pending = Message::user_text(prompt);
         let mut final_text = String::new();
         let mut streamed_text = false;
         let mut compacted = false;
         let mut tool_call_count = 0usize;
+        if self.compact_config.auto_enabled
+            && self.messages.len() >= 2
+            && self
+                .estimated_tokens()
+                .saturating_add(estimate_messages(std::slice::from_ref(&pending)))
+                >= self.compact_config.auto_threshold()
+        {
+            let stats = self.compact(None).await?;
+            compacted = true;
+            if self.debug {
+                eprintln!(
+                    "[debug] auto compact before current prompt: {} -> {} estimated tokens",
+                    stats.before_tokens, stats.after_tokens
+                );
+            }
+        }
+        let mut start = self.messages.len();
+        self.messages.push(pending);
 
         for round in 0..MAX_TOOL_ROUNDS {
             if !compacted
                 && self.compact_config.auto_enabled
-                && self.messages.len() >= 2
+                && round > 0
+                && start >= 2
                 && self.estimated_tokens() >= self.compact_config.auto_threshold()
             {
-                let stats = self.compact(None).await?;
+                let stats = self.compact_prefix(start).await?;
                 compacted = true;
+                start = 1;
                 if self.debug {
                     eprintln!(
-                        "[debug] auto compact: {} -> {} estimated tokens",
+                        "[debug] auto compact before current turn: {} -> {} estimated tokens",
                         stats.before_tokens, stats.after_tokens
                     );
                 }
@@ -285,6 +314,9 @@ impl QueryEngine {
                 .await?;
             streamed_text |= message_result.streamed_text;
             let response = message_result.response;
+            if response.content.len() > MAX_RESPONSE_CONTENT_BLOCKS {
+                bail!("模型响应 content block 超过 {MAX_RESPONSE_CONTENT_BLOCKS} 个限制")
+            }
             if let Some(usage) = &response.usage {
                 self.usage.add(usage);
             }
@@ -296,14 +328,20 @@ impl QueryEngine {
                     final_text.push_str(text)
                 }
             }
-            self.messages
-                .push(Message::assistant(response.content.clone()));
             let tool_uses = response
                 .content
                 .iter()
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                 .cloned()
                 .collect::<Vec<_>>();
+            if !tool_uses.is_empty() && response.stop_reason.as_deref() != Some("tool_use") {
+                bail!("模型返回工具调用，但响应未以 tool_use 完整结束")
+            }
+            if tool_uses.is_empty() && response.stop_reason.as_deref() == Some("tool_use") {
+                bail!("模型响应以 tool_use 结束，但没有完整工具调用")
+            }
+            self.messages
+                .push(Message::assistant(response.content.clone()));
             if tool_uses.is_empty() {
                 return Ok(TurnResult {
                     text: final_text,
@@ -323,24 +361,12 @@ impl QueryEngine {
                     "工具调用超过每轮 {MAX_TOOL_CALLS_PER_ROUND} 个或每 turn {MAX_TOOL_CALLS_PER_TURN} 个的限制"
                 )
             }
-            tool_call_count += tool_uses.len();
-            let mut calls = Vec::with_capacity(tool_uses.len());
-            for use_block in tool_uses {
-                let id = use_block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .context("tool_use 缺少 id")?
-                    .to_owned();
-                let name = use_block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("tool_use 缺少 name")?
-                    .to_owned();
-                let input = use_block.get("input").cloned().unwrap_or_else(|| json!({}));
+            let calls = validate_tool_calls(&tool_uses)?;
+            tool_call_count += calls.len();
+            for (_, name, input) in &calls {
                 if self.debug {
                     eprintln!("[debug] tool {name}({input})");
                 }
-                calls.push((id, name, input));
             }
             let execution_inputs = calls
                 .iter()
@@ -399,12 +425,6 @@ impl QueryEngine {
                 }));
             }
             self.messages.push(Message::tool_results(tool_results));
-            if response.stop_reason.as_deref() != Some("tool_use") && self.debug {
-                eprintln!(
-                    "[debug] 响应包含工具调用，但 stop_reason={:?}",
-                    response.stop_reason
-                );
-            }
         }
         bail!("单轮工具调用超过 {MAX_TOOL_ROUNDS} 轮，已停止以避免无限循环")
     }
@@ -434,59 +454,84 @@ impl QueryEngine {
     }
 
     pub async fn compact(&mut self, custom_instructions: Option<&str>) -> Result<CompactStats> {
+        self.compact_preserving_suffix(custom_instructions, Vec::new(), None)
+            .await
+    }
+
+    async fn compact_preserving_suffix(
+        &mut self,
+        custom_instructions: Option<&str>,
+        suffix: Vec<Message>,
+        full_before_tokens: Option<usize>,
+    ) -> Result<CompactStats> {
         if !self.compact_config.enabled {
+            self.messages.extend(suffix);
             bail!("compaction 已被 HARNESS_DISABLE_COMPACT 禁用")
         }
         if self.messages.len() < 2 {
+            self.messages.extend(suffix);
             bail!("消息不足，至少需要一轮对话才能 compact")
         }
         self.emit(QueryEvent::CompactStarted);
-        self.tool_context
-            .hooks()
-            .run(
-                "PreCompact",
-                None,
-                json!({
-                    "message_count": self.messages.len(),
-                    "custom_instructions": custom_instructions,
-                }),
-                &self.tool_context.cwd(),
-            )
-            .await?;
+        let prefix_messages = self.messages.len();
+        let messages_before = prefix_messages.saturating_add(suffix.len());
+        let before_tokens = full_before_tokens.unwrap_or_else(|| self.estimated_tokens());
+        let summary = async {
+            self.tool_context
+                .hooks()
+                .run(
+                    "PreCompact",
+                    None,
+                    json!({
+                        "message_count": prefix_messages,
+                        "preserved_message_count": suffix.len(),
+                        "custom_instructions": custom_instructions,
+                    }),
+                    &self.tool_context.cwd(),
+                )
+                .await?;
 
-        let messages_before = self.messages.len();
-        let before_tokens = self.estimated_tokens();
-        let mut summary_input = normalize_for_api(&self.messages);
-        summary_input.push(Message::user_text(compact_prompt(custom_instructions)));
-        summary_input = normalize_for_api(&summary_input);
-
-        let system = self.effective_system_prompt();
-        let result = self
-            .client
-            .messages(
-                &self.model,
-                self.max_tokens.min(20_000),
-                &system,
-                &summary_input,
-                &[],
-                None,
-            )
-            .await?;
-        if let Some(usage) = &result.response.usage {
-            self.usage.add(usage);
+            let mut summary_input = normalize_for_api(&self.messages);
+            summary_input.push(Message::user_text(compact_prompt(custom_instructions)));
+            summary_input = normalize_for_api(&summary_input);
+            let system = self.effective_system_prompt();
+            let result = self
+                .client
+                .messages(
+                    &self.model,
+                    self.max_tokens.min(20_000),
+                    &system,
+                    &summary_input,
+                    &[],
+                    None,
+                )
+                .await?;
+            if let Some(usage) = &result.response.usage {
+                self.usage.add(usage);
+            }
+            let raw_summary = result
+                .response
+                .content
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<String>();
+            if raw_summary.trim().is_empty() {
+                bail!("compact endpoint 返回了空摘要")
+            }
+            Ok(raw_summary)
         }
-        let raw_summary = result
-            .response
-            .content
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<String>();
-        if raw_summary.trim().is_empty() {
-            bail!("compact endpoint 返回了空摘要")
-        }
+        .await;
+        let raw_summary = match summary {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.messages.extend(suffix);
+                return Err(error);
+            }
+        };
 
         self.messages = vec![Message::user_text(continuation_message(&raw_summary))];
+        self.messages.extend(suffix);
         self.compaction_count += 1;
         let stats = CompactStats {
             before_tokens,
@@ -517,6 +562,16 @@ impl QueryEngine {
             after_tokens: stats.after_tokens,
         });
         Ok(stats)
+    }
+
+    async fn compact_prefix(&mut self, prefix_len: usize) -> Result<CompactStats> {
+        if prefix_len < 2 || prefix_len > self.messages.len() {
+            bail!("可压缩历史前缀至少需要两条消息")
+        }
+        let before_tokens = self.estimated_tokens();
+        let suffix = self.messages.split_off(prefix_len);
+        self.compact_preserving_suffix(None, suffix, Some(before_tokens))
+            .await
     }
 
     fn emit(&self, event: QueryEvent) {
@@ -567,4 +622,120 @@ fn output_preview(content: &str) -> String {
         preview.push('…');
     }
     preview
+}
+
+fn validate_tool_calls(tool_uses: &[Value]) -> Result<Vec<(String, String, Value)>> {
+    let mut ids = HashSet::with_capacity(tool_uses.len());
+    let mut calls = Vec::with_capacity(tool_uses.len());
+
+    for use_block in tool_uses {
+        let id = use_block
+            .get("id")
+            .and_then(Value::as_str)
+            .context("tool_use 缺少 id")?;
+        if id.is_empty() {
+            bail!("tool_use id 不能为空")
+        }
+        if id.len() > MAX_TOOL_USE_ID_BYTES {
+            bail!("tool_use id 超过 {MAX_TOOL_USE_ID_BYTES} 字节限制")
+        }
+        if !ids.insert(id) {
+            bail!("同一响应包含重复 tool_use id")
+        }
+        let name = use_block
+            .get("name")
+            .and_then(Value::as_str)
+            .context("tool_use 缺少 name")?;
+        if name.is_empty() {
+            bail!("tool_use name 不能为空")
+        }
+        let input = use_block
+            .get("input")
+            .cloned()
+            .context("tool_use 缺少 input")?;
+        if !input.is_object() {
+            bail!("tool_use input 必须是 JSON object")
+        }
+        let input_bytes = serde_json::to_vec(&input).context("无法编码 tool_use input")?;
+        if input_bytes.len() > MAX_TOOL_INPUT_BYTES {
+            bail!("tool_use input 超过 {MAX_TOOL_INPUT_BYTES} 字节限制")
+        }
+        calls.push((id.to_owned(), name.to_owned(), input));
+    }
+
+    Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_use(id: &str) -> Value {
+        json!({
+            "type": "tool_use",
+            "id": id,
+            "name": "Read",
+            "input": {"file_path": "fixture.txt"}
+        })
+    }
+
+    #[test]
+    fn validates_complete_tool_call_batch() {
+        let calls = validate_tool_calls(&[tool_use("first"), tool_use("second")]).unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "first");
+        assert_eq!(calls[1].0, "second");
+    }
+
+    #[test]
+    fn rejects_empty_tool_use_id() {
+        let error = validate_tool_calls(&[tool_use("")]).unwrap_err();
+
+        assert_eq!(error.to_string(), "tool_use id 不能为空");
+    }
+
+    #[test]
+    fn rejects_oversized_tool_use_id() {
+        let oversized = "x".repeat(MAX_TOOL_USE_ID_BYTES + 1);
+        let error = validate_tool_calls(&[tool_use(&oversized)]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("tool_use id 超过 {MAX_TOOL_USE_ID_BYTES} 字节限制")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_tool_use_ids_for_the_whole_batch() {
+        let error = validate_tool_calls(&[tool_use("same"), tool_use("same")]).unwrap_err();
+
+        assert_eq!(error.to_string(), "同一响应包含重复 tool_use id");
+    }
+
+    #[test]
+    fn rejects_non_object_and_oversized_tool_inputs() {
+        let mut missing = tool_use("missing-input");
+        missing.as_object_mut().unwrap().remove("input");
+        assert_eq!(
+            validate_tool_calls(&[missing]).unwrap_err().to_string(),
+            "tool_use 缺少 input"
+        );
+
+        let mut non_object = tool_use("bad-shape");
+        non_object["input"] = json!(["not", "an", "object"]);
+        assert_eq!(
+            validate_tool_calls(&[non_object]).unwrap_err().to_string(),
+            "tool_use input 必须是 JSON object"
+        );
+
+        let mut oversized = tool_use("too-large");
+        oversized["input"] = json!({"value":"x".repeat(MAX_TOOL_INPUT_BYTES)});
+        assert!(
+            validate_tool_calls(&[oversized])
+                .unwrap_err()
+                .to_string()
+                .contains("字节限制")
+        );
+    }
 }

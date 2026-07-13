@@ -195,7 +195,9 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
 
 fn tool_use_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"permission-turn","usage":{}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"permission-turn","content":[],"usage":{}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"permission-tool","name":"Bash","input":{}}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"printf should-not-run\"}"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-use crate::permissions::PermissionMode;
+use crate::{
+    permissions::PermissionMode,
+    protocol::{ApiFormat, ChatTokensField},
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
@@ -28,6 +31,14 @@ pub struct Cli {
     /// Model alias or full API model identifier.
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Model endpoint wire format. Auto infers it from the API path.
+    #[arg(long, value_enum)]
+    pub api_format: Option<ApiFormat>,
+
+    /// Token-limit field used by Chat Completions-compatible endpoints.
+    #[arg(long, value_enum)]
+    pub chat_tokens_field: Option<ChatTokensField>,
 
     /// Maximum output tokens for each API request.
     #[arg(long, default_value_t = 16_384)]
@@ -57,7 +68,7 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub permission_mode: Option<PermissionMode>,
 
-    /// Skip all permission checks. This can modify the system without prompting.
+    /// Skip interactive permission prompts. Explicit deny rules still apply.
     #[arg(long)]
     pub dangerously_skip_permissions: bool,
 

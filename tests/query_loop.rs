@@ -7,8 +7,10 @@ use std::{
 
 use open_agent_harness::{
     api::ModelClient,
+    commands::{self, CommandOutcome},
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
+    protocol::ApiFormat,
     query::{QueryEngine, QueryEvent, QueryOptions},
     tools::{ToolContext, ToolRegistry},
 };
@@ -52,6 +54,10 @@ async fn query_engine_round_trips_tool_use_and_result() {
         token: Some("test-key".into()),
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -131,6 +137,94 @@ async fn query_engine_round_trips_tool_use_and_result() {
 }
 
 #[tokio::test]
+async fn init_command_runs_through_the_normal_tool_loop_and_writes_agents_md() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for response in [init_tool_stream(), text_stream()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = read_http_body(&mut stream);
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    std::fs::write(temp.path().join("README.md"), "# Fixture\n").unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    let prompt = match commands::handle("/init", &mut engine) {
+        CommandOutcome::Submit(prompt) => prompt,
+        _ => panic!("/init was not submitted to the model loop"),
+    };
+    assert!(prompt.contains("create or improve its AGENTS.md"));
+
+    let result = engine.run_turn(prompt).await.unwrap();
+    engine.shutdown().await;
+    server.join().unwrap();
+
+    assert_eq!(result.text, "迁移链路完成");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("AGENTS.md")).unwrap(),
+        "# AGENTS.md\n\n- Run `cargo test`.\n"
+    );
+    let requests = requests.lock().unwrap();
+    assert!(
+        serde_json::to_string(&requests[0])
+            .unwrap()
+            .contains("every applicable existing AGENTS.md")
+    );
+    assert!(
+        serde_json::to_string(&requests[1])
+            .unwrap()
+            .contains("tool_result")
+    );
+}
+
+#[tokio::test]
 async fn failed_model_round_rolls_back_unpersisted_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -151,6 +245,10 @@ async fn failed_model_round_rolls_back_unpersisted_messages() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -215,6 +313,10 @@ async fn failed_followup_stops_background_tasks_started_by_the_turn() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -260,6 +362,10 @@ fn context_estimate_includes_system_prompt_and_tool_schemas() {
         token: None,
         base_url: "http://127.0.0.1:9".into(),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -291,7 +397,10 @@ fn context_estimate_includes_system_prompt_and_tool_schemas() {
 
 fn tool_use_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg_tool","usage":{"input_tokens":10,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_tool","content":[],
+            "usage":{"input_tokens":10,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":"Read","input":{}}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_"}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"path\":\"fixture.txt\"}"}}),
@@ -306,7 +415,10 @@ fn tool_use_stream() -> String {
 
 fn text_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg_done","usage":{"input_tokens":15,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_done","content":[],
+            "usage":{"input_tokens":15,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"迁移"}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"链路完成"}}),
@@ -319,10 +431,29 @@ fn text_stream() -> String {
     .collect()
 }
 
+fn init_tool_stream() -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_init","content":[],
+            "usage":{"input_tokens":10,"output_tokens":0}
+        }}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_init","name":"Write","input":{}}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"AGENTS.md\",\"content\":\"# AGENTS.md\\n\\n- Run `cargo test`.\\n\"}"}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(sse_event)
+    .collect()
+}
+
 #[cfg(unix)]
 fn background_tool_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg_background","usage":{}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_background","content":[],"usage":{}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_background","name":"Bash","input":{}}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"sleep 30\",\"run_in_background\":true}"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

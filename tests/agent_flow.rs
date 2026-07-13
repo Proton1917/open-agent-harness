@@ -3,6 +3,7 @@ use std::{
     net::TcpListener,
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use open_agent_harness::{
@@ -10,6 +11,7 @@ use open_agent_harness::{
     api::ModelClient,
     config::{EndpointConfig, Settings},
     permissions::{PermissionManager, PermissionMode},
+    protocol::ApiFormat,
     query::{QueryEngine, QueryOptions},
     tools::{ToolContext, ToolRegistry},
 };
@@ -50,6 +52,10 @@ async fn foreground_agent_uses_independent_history_and_returns_to_parent() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -79,6 +85,7 @@ async fn foreground_agent_uses_independent_history_and_returns_to_parent() {
             compact_config: None,
         },
     );
+    engine.set_model("updated-model".into());
     let result = engine.run_turn("delegate this".into()).await.unwrap();
     engine.shutdown().await;
     server.join().unwrap();
@@ -86,6 +93,11 @@ async fn foreground_agent_uses_independent_history_and_returns_to_parent() {
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["model"] == "updated-model")
+    );
     assert!(
         requests[1]["system"]
             .as_str()
@@ -122,6 +134,10 @@ async fn background_agent_is_available_through_task_output_alias() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -190,11 +206,124 @@ async fn background_agent_is_available_through_task_output_alias() {
     server.join().unwrap();
 }
 
+#[tokio::test]
+async fn nested_foreground_agent_reuses_single_scheduler_slot() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for response in [
+            agent_tool_stream_for("parent-outer", "outer-agent", "run the outer agent"),
+            agent_tool_stream_for("outer-inner", "inner-agent", "run the inner agent"),
+            text_stream("inner result", "inner-final"),
+            text_stream("outer result", "outer-final"),
+            text_stream("parent result", "parent-final"),
+        ] {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "mock server timed out");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock server accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let body = read_http_body(&mut stream);
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let integration = configure_agents(&Settings {
+        raw: json!({"agents": {
+            "maxConcurrent": 1,
+            "defaultTimeoutMs": 3000
+        }}),
+    })
+    .unwrap();
+    let registry = ToolRegistry::with_extensions(integration.deferred_tools, Vec::new()).unwrap();
+    let mut context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    context.set_agent_limits(integration.limits);
+    let mut engine = QueryEngine::new(
+        client,
+        registry,
+        context,
+        QueryOptions {
+            model: "nested-model".into(),
+            max_tokens: 1024,
+            system: "test system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        engine.run_turn("delegate recursively".into()),
+    )
+    .await
+    .expect("nested foreground agents must not deadlock at maxConcurrent=1")
+    .unwrap();
+    engine.shutdown().await;
+    server.join().unwrap();
+
+    assert_eq!(result.text, "parent result");
+    assert_eq!(requests.lock().unwrap().len(), 5);
+}
+
 fn agent_tool_stream() -> String {
+    agent_tool_stream_for("parent-tool", "agent-1", "inspect independently")
+}
+
+fn agent_tool_stream_for(message_id: &str, tool_id: &str, prompt: &str) -> String {
+    let input = serde_json::to_string(&json!({
+        "prompt": prompt,
+        "description": prompt,
+        "timeoutMs": 3000
+    }))
+    .unwrap();
     [
-        serde_json::json!({"type":"message_start","message":{"id":"parent-tool","usage":{}}}),
-        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent-1","name":"Agent","input":{}}}),
-        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"prompt\":\"inspect independently\",\"description\":\"inspection\"}"}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":message_id,"content":[],"usage":{}
+        }}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool_id,"name":"Agent","input":{}}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
         serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
         serde_json::json!({"type":"message_stop"}),
@@ -214,7 +343,10 @@ fn parent_text_stream() -> String {
 
 fn text_stream(text: &str, id: &str) -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":id,"usage":{"input_tokens":1,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":id,"content":[],
+            "usage":{"input_tokens":1,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

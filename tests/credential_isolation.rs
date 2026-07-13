@@ -70,7 +70,9 @@ fn tool_stream() -> String {
     let command = "if printenv HARNESS_API_KEY >/dev/null; then printf credential-leaked; else printf credential-absent; fi";
     let input = serde_json::to_string(&serde_json::json!({"command": command})).unwrap();
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg-tool","usage":{}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg-tool","content":[],"usage":{}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{}}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
@@ -84,7 +86,9 @@ fn tool_stream() -> String {
 
 fn final_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg-final","usage":{}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg-final","content":[],"usage":{}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"credential isolated"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

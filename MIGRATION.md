@@ -12,13 +12,13 @@ The migration preserves the machine-facing CLI contract and rebuilds both the re
 |---|---|---:|---|
 | CLI and output formats | `src/cli.rs`, `src/main.rs`, `src/terminal.rs` | complete for declared surface | stable text/JSON/stream-JSON print paths; Rust composer, history, multiline input, mode cycling, event rows, transactional interrupt |
 | Prompt assembly and init | `src/{prompt,query,commands,compact,agents}.rs` | complete for declared layers | open stable contract, live tools/mode, workspace context, compaction/delegation prompts, `/init` for `AGENTS.md`; no automatic absolute cwd or device metadata |
-| Model endpoint boundary | `src/api.rs`, `src/config.rs` | complete | same-origin validation, no redirects, proxy opt-in, bounded JSON/SSE |
-| Request privacy contract | `src/api.rs`, `tests/privacy_boundary.rs` | complete | raw requests contain only the documented generic body and bearer authorization |
+| Model endpoint boundary | `src/{api,config,protocol}.rs` | complete for declared formats | Messages, OpenAI-compatible Chat Completions and Responses; path inference/override, same-origin validation, no redirects, proxy opt-in, bounded JSON/SSE |
+| Request privacy contract | `src/{api,protocol,session}.rs`, `tests/{privacy_boundary,protocol_compat,protocol_fail_closed}.rs` | complete | protocol-specific raw requests contain only documented fields and bearer authorization; Responses item identity and Chat reasoning state are memory-only and protocol-scoped |
 | Credential isolation | `src/main.rs`, subprocess modules, `tests/credential_isolation.rs` | complete | model token removed before workers and excluded from child environments |
-| Query loop and rollback | `src/query.rs`, `src/messages.rs` | complete | multi-round tool flow, usage accumulation, normalization, atomic failure rollback |
-| Context accounting and compaction | `src/tokens.rs`, `src/compact.rs`, `src/query.rs` | complete | system, messages, tools, output reserve, automatic/manual compaction |
+| Query loop and rollback | `src/query.rs`, `src/messages.rs` | complete | multi-round tool flow, usage accumulation, strict unique call IDs, pairing repair, atomic failure rollback |
+| Context accounting and compaction | `src/tokens.rs`, `src/compact.rs`, `src/query.rs` | complete | system, messages, tools, output reserve, automatic/manual compaction; the active user prompt is preserved verbatim |
 | Strict schemas and scheduling | `src/tools/schema.rs`, `src/tools/mod.rs` | complete | validation before permission; ordered bounded concurrency with mutation barriers |
-| File and notebook tools | `src/tools/{read,write,edit,notebook}.rs` | complete | full-read guard, exact freshness, unique replacement, atomic write, cell operations |
+| File and notebook tools | `src/tools/{read,write,edit,notebook}.rs` | complete | full-read guard, exact freshness, unique replacement, pre-allocation size proof, UTF-8 byte limits, atomic write, cell operations |
 | Native search tools | `src/tools/{glob,grep}.rs` | complete | bounded traversal, regex, filters, context, pagination, file/time/byte ceilings |
 | Shell and background jobs | `src/tools/{bash,tasks}.rs`, `src/process.rs` | complete | private bounded capture, blocking/nonblocking output, stop, Unix groups, Windows trees |
 | Todo and task state | `src/tools/work_items.rs` | complete | bounded private persistence, ownership, dependencies, metadata |
@@ -29,7 +29,7 @@ The migration preserves the machine-facing CLI contract and rebuilds both the re
 | Engineering instructions | `src/context.rs` | complete | broad-to-specific `AGENTS.md`, bare mode, scope-safe symlink handling |
 | Local workflows | `src/skills.rs`, `src/tools/skill.rs` | complete | bounded text loading and precedence; bundled files are never auto-executed |
 | Deferred tool registry | `src/tools/mod.rs` | complete | bounded search/select, exact activation, dynamic refresh, duplicate/size rejection |
-| Local subagents | `src/agents.rs`, `tests/agent_flow.rs` | complete | independent histories, recursion/concurrency/total caps, background/resume/cancel/cleanup |
+| Local subagents | `src/agents.rs`, `tests/agent_flow.rs` | complete | independent histories, recursion/concurrency/total caps, queue-inclusive timeout, active-ID reservation, nested scheduling, background/resume/cancel/cleanup |
 | Git worktree isolation | `src/worktree.rs` | complete | create/enter/keep/remove, dirty refusal, context/instruction/skill refresh, real Git tests |
 | LSP client | `src/lsp.rs`, `src/rpc.rs` | complete for declared operations | lazy initialize/sync/query, diagnostics, restart, cancellation, shutdown, real subprocess test |
 | MCP client | `src/mcp.rs`, `src/rpc.rs` | complete for declared capabilities | stdio and Streamable HTTP, sessions, SSE, pagination, tools/resources/templates/prompts, refresh |
@@ -46,6 +46,7 @@ The always-active base surface remains fifteen local tools. The normal executabl
 “Harness complete” does not mean copying every ornament that has ever surrounded a message loop. The following boundaries are intentional and are not claimed by the README:
 
 - No account, subscription, billing, identity, entitlement, update, experiment, analytics, or hidden remote-control path.
+- No native protocol adapter beyond the three declared formats. Other services are supported only when they deliberately expose one of those open-compatible wire contracts; the harness does not guess from a hostname or silently translate through a hosted relay.
 - No copied terminal implementation, text, branding, or assets. The repository does include an original Rust conversational composer and observable state machine; rich interactive question panels, command-directory browsers, remote-team UI, scheduled notifications, voice characters, and marketing surfaces are not claimed.
 - No image/PDF/browser rendering layer. `Read` and web integrations return bounded textual data; a graphical browser is not implied.
 - MCP advertises no roots, sampling, elicitation, or task client capability. Unsupported server-to-client requests fail closed; `ping` is answered on request-response channels. Tools, resources, templates, prompts, notifications, stdio, and Streamable HTTP are the declared MCP scope.

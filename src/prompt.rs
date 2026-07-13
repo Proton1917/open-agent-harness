@@ -82,7 +82,7 @@ pub fn permission_mode_section(mode: PermissionMode) -> String {
             "Operate read-only. Explore, reason, and prepare a concrete plan, but do not edit files or perform state-changing actions until the mode changes."
         }
         PermissionMode::BypassPermissions => {
-            "The user explicitly enabled unrestricted tool execution. This removes prompts, not responsibility: stay within the requested scope and avoid unnecessary destructive actions."
+            "The user explicitly disabled interactive permission prompts. Explicit deny rules still apply, and removing prompts does not remove responsibility: stay within the requested scope and avoid unnecessary destructive actions."
         }
     };
     format!(
@@ -94,7 +94,7 @@ pub fn permission_mode_section(mode: PermissionMode) -> String {
 pub fn init_prompt() -> &'static str {
     r#"Analyze this repository and create or improve its AGENTS.md instructions for future coding-agent sessions.
 
-First inspect the repository rather than guessing. Read the root README, language manifests, build configuration, CI workflows, formatter and linter configuration, and any existing agent instructions. If other coding-assistant rule files exist, carry over only repository-specific constraints that remain useful here.
+First inspect the repository rather than guessing. Read the root README, language manifests, build configuration, CI workflows, formatter and linter configuration, and every applicable existing AGENTS.md file.
 
 The resulting AGENTS.md should be concise and should contain only information that materially prevents mistakes or repeated rediscovery:
 

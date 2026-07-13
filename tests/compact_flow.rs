@@ -9,6 +9,7 @@ use open_agent_harness::{
     compact::CompactConfig,
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
+    protocol::ApiFormat,
     query::{QueryEngine, QueryOptions},
     tools::{ToolContext, ToolRegistry},
     types::Message,
@@ -41,6 +42,10 @@ async fn compact_replaces_history_with_formatted_continuation() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -84,6 +89,7 @@ async fn compact_replaces_history_with_formatted_continuation() {
 
 #[tokio::test]
 async fn query_auto_compacts_before_normal_model_round() {
+    const CURRENT_PROMPT: &str = "current-prompt-must-remain-verbatim";
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -92,8 +98,10 @@ async fn query_auto_compacts_before_normal_model_round() {
             let request: Value = serde_json::from_slice(&read_http_body(&mut stream)).unwrap();
             if index == 0 {
                 assert_eq!(request["tools"], serde_json::json!([]));
+                assert!(!request.to_string().contains(CURRENT_PROMPT));
             } else {
                 assert!(request.to_string().contains("Current work preserved"));
+                assert!(request.to_string().contains(CURRENT_PROMPT));
             }
             write!(
                 stream,
@@ -110,6 +118,10 @@ async fn query_auto_compacts_before_normal_model_round() {
         token: None,
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     })
     .unwrap();
@@ -145,7 +157,7 @@ async fn query_auto_compacts_before_normal_model_round() {
         },
     );
 
-    let result = engine.run_turn("continue".into()).await.unwrap();
+    let result = engine.run_turn(CURRENT_PROMPT.into()).await.unwrap();
     server.join().unwrap();
     assert!(result.compacted);
     assert_eq!(result.text, "continued");
@@ -154,7 +166,10 @@ async fn query_auto_compacts_before_normal_model_round() {
 
 fn summary_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg_summary","usage":{"input_tokens":30,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_summary","content":[],
+            "usage":{"input_tokens":30,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<analysis>drafting notes</analysis>"}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<summary>Current work preserved.</summary>"}}),
@@ -169,7 +184,10 @@ fn summary_stream() -> String {
 
 fn final_stream() -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"msg_final","usage":{"input_tokens":12,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_final","content":[],
+            "usage":{"input_tokens":12,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"continued"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

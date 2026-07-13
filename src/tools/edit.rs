@@ -8,6 +8,8 @@ use super::{
     parse_input, read_text_bounded, reject_direct_symlink_write,
 };
 
+const MAX_PATH_BYTES: usize = 4096;
+
 #[derive(Deserialize)]
 struct Input {
     file_path: String,
@@ -30,8 +32,12 @@ impl Tool for EditTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "file_path": {"type": "string", "maxLength": 4096},
-                "old_string": {"type": "string", "maxLength": MAX_EDITABLE_FILE_BYTES},
+                "file_path": {"type": "string", "maxLength": MAX_PATH_BYTES},
+                "old_string": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_EDITABLE_FILE_BYTES
+                },
                 "new_string": {"type": "string", "maxLength": MAX_EDITABLE_FILE_BYTES},
                 "replace_all": {"type": "boolean", "default": false}
             }),
@@ -56,6 +62,7 @@ impl Tool for EditTool {
     }
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: Input = parse_input(input)?;
+        validate_input(&input)?;
         if input.old_string == input.new_string {
             bail!("old_string 与 new_string 相同")
         }
@@ -77,11 +84,19 @@ impl Tool for EditTool {
             )
         }
         let replacement = preserve_quote_style(&input.old_string, &actual_old, &input.new_string);
+        let replacement_count = if input.replace_all { matches } else { 1 };
+        let updated_bytes = replacement_output_bytes(
+            original.len(),
+            actual_old.len(),
+            replacement.len(),
+            replacement_count,
+        )?;
         let updated = if input.replace_all {
             original.replace(&actual_old, &replacement)
         } else {
             original.replacen(&actual_old, &replacement, 1)
         };
+        debug_assert_eq!(updated.len(), updated_bytes);
         atomic_write(&path, &updated)?;
         context.remember_read(path.clone(), updated, false).await?;
         Ok(ToolOutput::success(format!(
@@ -89,6 +104,48 @@ impl Tool for EditTool {
             context.display_path(&path)
         )))
     }
+}
+
+fn validate_input(input: &Input) -> Result<()> {
+    ensure_utf8_bytes("file_path", &input.file_path, MAX_PATH_BYTES)?;
+    ensure_utf8_bytes("old_string", &input.old_string, MAX_EDITABLE_FILE_BYTES)?;
+    ensure_utf8_bytes("new_string", &input.new_string, MAX_EDITABLE_FILE_BYTES)?;
+    if input.old_string.is_empty() {
+        bail!("old_string 不能为空")
+    }
+    Ok(())
+}
+
+fn ensure_utf8_bytes(field: &str, value: &str, limit: usize) -> Result<()> {
+    if value.len() > limit {
+        bail!("{field} 超过 {limit} 字节限制")
+    }
+    Ok(())
+}
+
+fn replacement_output_bytes(
+    original_bytes: usize,
+    old_bytes: usize,
+    new_bytes: usize,
+    replacements: usize,
+) -> Result<usize> {
+    if old_bytes == 0 {
+        bail!("old_string 不能为空")
+    }
+    let removed = old_bytes
+        .checked_mul(replacements)
+        .context("计算替换后的文件大小时溢出")?;
+    let added = new_bytes
+        .checked_mul(replacements)
+        .context("计算替换后的文件大小时溢出")?;
+    let updated = original_bytes
+        .checked_sub(removed)
+        .and_then(|remaining| remaining.checked_add(added))
+        .context("计算替换后的文件大小时溢出")?;
+    if updated > MAX_EDITABLE_FILE_BYTES {
+        bail!("更新后的文件超过 {MAX_EDITABLE_FILE_BYTES} 字节限制")
+    }
+    Ok(updated)
 }
 
 fn normalized_quote(ch: char) -> char {
@@ -153,5 +210,59 @@ mod tests {
             find_actual_string("say “hello”", "say \"hello\""),
             Some("say “hello”".into())
         );
+    }
+
+    #[test]
+    fn rejects_empty_old_string() {
+        let input = Input {
+            file_path: "sample.txt".into(),
+            old_string: String::new(),
+            new_string: "replacement".into(),
+            replace_all: true,
+        };
+
+        assert!(validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn replace_all_rejects_output_amplification_before_allocation() {
+        let original = "x".repeat(MAX_EDITABLE_FILE_BYTES);
+        let matches = original.matches('x').count();
+        assert!(replacement_output_bytes(original.len(), 1, 2, matches).is_err());
+    }
+
+    #[test]
+    fn four_byte_unicode_respects_utf8_byte_boundaries() {
+        let at_limit = "🦀".repeat(MAX_EDITABLE_FILE_BYTES / 4);
+        let over_limit = format!("{at_limit}🦀");
+        let path_at_limit = "🦀".repeat(MAX_PATH_BYTES / 4);
+        let path_over_limit = format!("{path_at_limit}🦀");
+        let input = |file_path, old_string, new_string| Input {
+            file_path,
+            old_string,
+            new_string,
+            replace_all: true,
+        };
+
+        assert!(
+            validate_input(&input(
+                path_at_limit.clone(),
+                at_limit.clone(),
+                at_limit.clone(),
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_input(&input(
+                "sample.txt".into(),
+                over_limit.clone(),
+                at_limit.clone(),
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_input(&input("sample.txt".into(), at_limit.clone(), over_limit,)).is_err()
+        );
+        assert!(validate_input(&input(path_over_limit, at_limit, "replacement".into())).is_err());
     }
 }

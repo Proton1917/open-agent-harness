@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -6,11 +6,12 @@ use reqwest::{
     Client, StatusCode,
     header::{HeaderMap, HeaderValue},
 };
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::{
     config::EndpointConfig,
+    protocol::{ApiFormat, RequestParts, StreamDecoder, encode_request, parse_response},
     types::{Message, ModelResponse},
 };
 
@@ -35,6 +36,8 @@ pub struct MessageResult {
 impl ModelClient {
     pub fn new(endpoint: EndpointConfig) -> Result<Self> {
         let messages_url = build_messages_url(&endpoint)?;
+        let mut endpoint = endpoint;
+        endpoint.api_format = endpoint.api_format.infer(&endpoint.messages_path);
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(600))
@@ -59,14 +62,19 @@ impl ModelClient {
         tools: &[Value],
         on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<MessageResult> {
-        let body = json!({
-            "model": model,
-            "max_tokens": max_tokens,
-            "system": system,
-            "messages": messages,
-            "tools": tools,
-            "stream": true,
-        });
+        let body = encode_request(
+            self.endpoint.api_format,
+            RequestParts {
+                model,
+                max_tokens,
+                system,
+                messages,
+                tools,
+                stream: self.endpoint.stream,
+                chat_tokens_field: self.endpoint.chat_tokens_field,
+                include_stream_usage: self.endpoint.include_stream_usage,
+            },
+        )?;
         let encoded_body = serde_json::to_vec(&body).context("无法编码 model request")?;
         if encoded_body.len() > MAX_REQUEST_BYTES {
             bail!("model request 超过 {MAX_REQUEST_BYTES} 字节限制")
@@ -95,29 +103,32 @@ impl ModelClient {
             let status = response.status();
             let retry_after = retry_after(response.headers());
             if status.is_success() {
-                let is_sse = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.contains("text/event-stream"));
+                let is_sse = response_is_sse(response.headers());
                 if is_sse {
-                    return parse_sse(response, on_text_delta, self.endpoint.token.as_deref())
-                        .await;
+                    return parse_sse(
+                        response,
+                        self.endpoint.api_format,
+                        on_text_delta,
+                        self.endpoint.token.as_deref(),
+                    )
+                    .await;
                 }
                 let bytes = read_body_limited(response, MAX_RESPONSE_BYTES, "API 响应").await?;
-                let mut response: ModelResponse =
-                    serde_json::from_slice(&bytes).with_context(|| {
-                        format!(
-                            "API 返回了无法解析的消息响应: {}",
-                            truncate(
-                                &redact_text(
-                                    &String::from_utf8_lossy(&bytes),
-                                    self.endpoint.token.as_deref()
-                                ),
-                                1000
-                            )
+                let mut value: Value = serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "API 返回了无法解析的 JSON 响应: {}",
+                        truncate(
+                            &redact_text(
+                                &String::from_utf8_lossy(&bytes),
+                                self.endpoint.token.as_deref()
+                            ),
+                            1000
                         )
-                    })?;
+                    )
+                })?;
+                redact_value(&mut value, self.endpoint.token.as_deref());
+                let mut response = parse_response(self.endpoint.api_format, value)
+                    .context("API 返回了无效的 model response")?;
                 redact_response(&mut response, self.endpoint.token.as_deref());
                 return Ok(MessageResult {
                     response,
@@ -145,6 +156,7 @@ impl ModelClient {
 
 async fn parse_sse(
     response: reqwest::Response,
+    api_format: ApiFormat,
     on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
     secret: Option<&str>,
 ) -> Result<MessageResult> {
@@ -156,8 +168,9 @@ async fn parse_sse(
     }
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    let mut frames = SseFrameCursor::default();
     let mut received = 0usize;
-    let mut accumulator = StreamAccumulator::default();
+    let mut decoder = StreamDecoder::new(api_format)?;
     let mut streamed_text = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("读取 SSE chunk 失败")?;
@@ -168,34 +181,31 @@ async fn parse_sse(
             bail!("SSE 响应超过 {MAX_RESPONSE_BYTES} 字节限制")
         }
         buffer.extend_from_slice(&chunk);
-        while let Some((frame_end, separator_len)) = find_frame_end(&buffer) {
-            if frame_end > MAX_SSE_FRAME_BYTES {
+        while let Some(frame) = frames.next_frame(&buffer, false) {
+            if frame.len() > MAX_SSE_FRAME_BYTES {
                 bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
             }
-            let frame = buffer.drain(..frame_end).collect::<Vec<_>>();
-            buffer.drain(..separator_len);
-            if let Some(data) = frame_data(&frame)? {
-                if data == "[DONE]" {
-                    continue;
-                }
-                let event: Value = serde_json::from_str(&data)
-                    .with_context(|| format!("无法解析 SSE data: {}", truncate(&data, 1000)))?;
-                streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
-            }
+            streamed_text |= decode_sse_frame(&buffer[frame], &mut decoder, on_text_delta, secret)?;
         }
-        if buffer.len() > MAX_SSE_FRAME_BYTES {
+        if frames.pending_len(buffer.len()) > MAX_SSE_FRAME_BYTES {
             bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
         }
     }
-    if !buffer.iter().all(u8::is_ascii_whitespace) {
-        if let Some(data) = frame_data(&buffer)? {
-            if data != "[DONE]" {
-                let event: Value = serde_json::from_str(&data)?;
-                streamed_text |= accumulator.apply(event, on_text_delta, secret)?;
-            }
+
+    // A trailing CR is ambiguous until the next byte arrives. Resolve it as a
+    // standalone line ending only after EOF, while keeping the incremental scan
+    // cursor so every response byte is inspected a constant number of times.
+    while let Some(frame) = frames.next_frame(&buffer, true) {
+        if frame.len() > MAX_SSE_FRAME_BYTES {
+            bail!("SSE frame 超过 {MAX_SSE_FRAME_BYTES} 字节限制")
         }
+        streamed_text |= decode_sse_frame(&buffer[frame], &mut decoder, on_text_delta, secret)?;
     }
-    let mut response = accumulator.finish()?;
+    let pending = frames.pending(&buffer);
+    if !pending.iter().all(u8::is_ascii_whitespace) {
+        streamed_text |= decode_sse_frame(pending, &mut decoder, on_text_delta, secret)?;
+    }
+    let mut response = decoder.finish()?;
     redact_response(&mut response, secret);
     Ok(MessageResult {
         response,
@@ -203,203 +213,124 @@ async fn parse_sse(
     })
 }
 
-fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-        return Some((index, 4));
+fn decode_sse_frame(
+    frame: &[u8],
+    decoder: &mut StreamDecoder,
+    on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
+    secret: Option<&str>,
+) -> Result<bool> {
+    let Some(data) = frame_data(frame)? else {
+        return Ok(false);
+    };
+    if data == "[DONE]" {
+        decoder.mark_done()?;
+        return Ok(false);
     }
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2))
+    let mut event: Value = serde_json::from_str(&data).with_context(|| {
+        format!(
+            "无法解析 SSE data: {}",
+            truncate(&redact_text(&data, secret), 1000)
+        )
+    })?;
+    redact_value(&mut event, secret);
+    decoder.apply(event, on_text_delta)
+}
+
+#[derive(Default)]
+struct SseFrameCursor {
+    frame_start: usize,
+    scan_index: usize,
+    #[cfg(test)]
+    inspected: usize,
+}
+
+impl SseFrameCursor {
+    fn next_frame(&mut self, buffer: &[u8], eof: bool) -> Option<Range<usize>> {
+        while self.scan_index < buffer.len() {
+            #[cfg(test)]
+            {
+                self.inspected += 1;
+            }
+            let index = self.scan_index;
+            let first = match line_ending(buffer, index, eof) {
+                LineEnding::Complete(length) => length,
+                LineEnding::Incomplete => return None,
+                LineEnding::Absent => {
+                    self.scan_index += 1;
+                    continue;
+                }
+            };
+            let second_index = index + first;
+            match line_ending(buffer, second_index, eof) {
+                LineEnding::Complete(second) => {
+                    let frame = self.frame_start..index;
+                    self.frame_start = second_index + second;
+                    self.scan_index = self.frame_start;
+                    return Some(frame);
+                }
+                LineEnding::Incomplete => return None,
+                LineEnding::Absent => {
+                    // The first line ending cannot begin a separator. Resume
+                    // immediately after it; bytes before that point never need
+                    // to be scanned again.
+                    self.scan_index = second_index;
+                }
+            }
+        }
+        None
+    }
+
+    fn pending_len(&self, buffer_len: usize) -> usize {
+        buffer_len.saturating_sub(self.frame_start)
+    }
+
+    fn pending<'a>(&self, buffer: &'a [u8]) -> &'a [u8] {
+        &buffer[self.frame_start..]
+    }
+}
+
+enum LineEnding {
+    Complete(usize),
+    Incomplete,
+    Absent,
+}
+
+fn line_ending(buffer: &[u8], index: usize, eof: bool) -> LineEnding {
+    match buffer.get(index) {
+        Some(b'\r') if buffer.get(index + 1) == Some(&b'\n') => LineEnding::Complete(2),
+        Some(b'\r') if buffer.get(index + 1).is_none() && !eof => LineEnding::Incomplete,
+        Some(b'\r' | b'\n') => LineEnding::Complete(1),
+        None if !eof => LineEnding::Incomplete,
+        _ => LineEnding::Absent,
+    }
+}
+
+#[cfg(test)]
+fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut cursor = SseFrameCursor::default();
+    cursor.next_frame(buffer, true).map(|frame| {
+        let separator_len = cursor.frame_start - frame.end;
+        (frame.end, separator_len)
+    })
 }
 
 fn frame_data(frame: &[u8]) -> Result<Option<String>> {
     let text = std::str::from_utf8(frame).context("SSE frame 不是有效 UTF-8")?;
-    let parts = text
-        .lines()
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let parts = normalized
+        .split('\n')
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>();
-    Ok((!parts.is_empty()).then(|| parts.join("\n")))
+    let data = parts.join("\n");
+    Ok((!data.is_empty()).then_some(data))
 }
 
-#[derive(Default)]
-struct StreamAccumulator {
-    id: Option<String>,
-    blocks: std::collections::BTreeMap<usize, Value>,
-    partial_json: std::collections::HashMap<usize, String>,
-    stop_reason: Option<String>,
-    usage: Option<crate::types::Usage>,
-}
-
-impl StreamAccumulator {
-    fn apply(
-        &mut self,
-        event: Value,
-        on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
-        secret: Option<&str>,
-    ) -> Result<bool> {
-        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-        match event_type {
-            "message_start" => {
-                let message = &event["message"];
-                self.id = message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                self.usage = message
-                    .get("usage")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?;
-            }
-            "content_block_start" => {
-                let index = event_index(&event)?;
-                let mut block = event
-                    .get("content_block")
-                    .cloned()
-                    .context("content_block_start 缺少 content_block")?;
-                let initial_text = (block.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| block.get("text").and_then(Value::as_str).unwrap_or(""))
-                    .map(|text| redact_text(text, secret))
-                    .unwrap_or_default();
-                match block.as_object_mut() {
-                    Some(object) if !initial_text.is_empty() => {
-                        object.insert("text".into(), Value::String(initial_text.clone()));
-                    }
-                    _ => {}
-                }
-                self.blocks.insert(index, block);
-                if !initial_text.is_empty() {
-                    if let Some(callback) = on_text_delta {
-                        callback(&initial_text);
-                    }
-                    return Ok(true);
-                }
-            }
-            "content_block_delta" => {
-                let index = event_index(&event)?;
-                let delta = event
-                    .get("delta")
-                    .context("content_block_delta 缺少 delta")?;
-                match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                    "text_delta" => {
-                        let text = redact_text(
-                            delta.get("text").and_then(Value::as_str).unwrap_or(""),
-                            secret,
-                        );
-                        append_string(self.blocks.get_mut(&index), "text", &text)?;
-                        if let Some(callback) = on_text_delta {
-                            callback(&text);
-                        }
-                        return Ok(!text.is_empty());
-                    }
-                    "input_json_delta" => {
-                        self.partial_json.entry(index).or_default().push_str(
-                            delta
-                                .get("partial_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                        );
-                    }
-                    "thinking_delta" => append_string(
-                        self.blocks.get_mut(&index),
-                        "thinking",
-                        delta.get("thinking").and_then(Value::as_str).unwrap_or(""),
-                    )?,
-                    "signature_delta" => append_string(
-                        self.blocks.get_mut(&index),
-                        "signature",
-                        delta.get("signature").and_then(Value::as_str).unwrap_or(""),
-                    )?,
-                    _ => {}
-                }
-            }
-            "content_block_stop" => {
-                let index = event_index(&event)?;
-                if let Some(partial) = self.partial_json.remove(&index) {
-                    let input: Value = serde_json::from_str(&partial).with_context(|| {
-                        format!("tool input JSON 拼接失败: {}", truncate(&partial, 1000))
-                    })?;
-                    self.blocks
-                        .get_mut(&index)
-                        .and_then(Value::as_object_mut)
-                        .context("tool_use content block 不是 object")?
-                        .insert("input".into(), input);
-                }
-            }
-            "message_delta" => {
-                self.stop_reason = event
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                if let Some(usage) = event.get("usage") {
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    self.usage.get_or_insert_with(default_usage).output_tokens = output;
-                }
-            }
-            "error" => {
-                let message = redact_text(
-                    event
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("未知 SSE error"),
-                    secret,
-                );
-                anyhow::bail!("Model stream error: {message}")
-            }
-            "ping" | "message_stop" => {}
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    fn finish(self) -> Result<ModelResponse> {
-        if !self.partial_json.is_empty() {
-            bail!("SSE 在工具输入 JSON 完成前中断")
-        }
-        Ok(ModelResponse {
-            id: self.id.context("SSE 流缺少 message_start.id")?,
-            content: self.blocks.into_values().collect(),
-            stop_reason: self.stop_reason,
-            usage: self.usage,
-        })
-    }
-}
-
-fn event_index(event: &Value) -> Result<usize> {
-    event
-        .get("index")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .context("SSE content event 缺少 index")
-}
-
-fn append_string(block: Option<&mut Value>, field: &str, delta: &str) -> Result<()> {
-    let object: &mut Map<String, Value> = block
-        .and_then(Value::as_object_mut)
-        .context("SSE delta 对应的 content block 不存在")?;
-    let target = object
-        .entry(field)
-        .or_insert_with(|| Value::String(String::new()));
-    target
-        .as_str()
-        .context("SSE content block 字段不是 string")?;
-    if let Value::String(value) = target {
-        value.push_str(delta);
-    }
-    Ok(())
-}
-
-fn default_usage() -> crate::types::Usage {
-    crate::types::Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-    }
+fn response_is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn retryable(status: StatusCode) -> bool {
@@ -430,7 +361,7 @@ fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
         bail!("HARNESS_BASE_URL 不得包含 query 或 fragment")
     }
     if endpoint.messages_path.contains('#') {
-        bail!("HARNESS_MESSAGES_PATH 不得包含 fragment")
+        bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得包含 fragment")
     }
     let separator = if endpoint.messages_path.starts_with('/') {
         ""
@@ -451,7 +382,7 @@ fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
         && url.username().is_empty()
         && url.password().is_none();
     if !same_origin {
-        bail!("HARNESS_MESSAGES_PATH 不得改变 endpoint origin")
+        bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得改变 endpoint origin")
     }
     Ok(url)
 }
@@ -549,12 +480,17 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn endpoint(base_url: &str, messages_path: &str) -> EndpointConfig {
         EndpointConfig {
             token: None,
             base_url: base_url.into(),
             messages_path: messages_path.into(),
+            api_format: ApiFormat::Auto,
+            stream: true,
+            chat_tokens_field: crate::protocol::ChatTokensField::MaxCompletionTokens,
+            include_stream_usage: true,
             allow_env_proxy: false,
         }
     }
@@ -593,29 +529,52 @@ mod tests {
     }
 
     #[test]
-    fn initial_sse_text_is_streamed_before_later_deltas() {
-        let captured = std::sync::Mutex::new(String::new());
-        let callback = |text: &str| captured.lock().unwrap().push_str(text);
-        let mut accumulator = StreamAccumulator::default();
+    fn sse_framing_uses_the_earliest_mixed_line_ending() {
+        let buffer = b"data: one\n\ndata: two\r\n\r\n";
+        assert_eq!(find_frame_end(buffer), Some((9, 2)));
+        assert_eq!(frame_data(&buffer[..9]).unwrap().as_deref(), Some("one"));
+        assert_eq!(find_frame_end(b"data: one\r\r"), Some((9, 2)));
+    }
+
+    #[test]
+    fn single_byte_sse_chunks_are_scanned_linearly() {
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+        let mut buffer = vec![b'x'; PAYLOAD_BYTES];
+        let mut cursor = SseFrameCursor::default();
+
+        for length in 1..=PAYLOAD_BYTES {
+            assert!(cursor.next_frame(&buffer[..length], false).is_none());
+        }
+        for byte in b"\r\n\r\n" {
+            buffer.push(*byte);
+            if buffer.len() < PAYLOAD_BYTES + 4 {
+                assert!(cursor.next_frame(&buffer, false).is_none());
+            }
+        }
+
+        assert_eq!(cursor.next_frame(&buffer, false), Some(0..PAYLOAD_BYTES));
+        assert_eq!(cursor.pending_len(buffer.len()), 0);
         assert!(
-            accumulator
-                .apply(
-                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hello"}}),
-                    Some(&callback),
-                    None,
-                )
-                .unwrap()
+            cursor.inspected <= buffer.len() + 4,
+            "{} bytes caused {} scan steps",
+            buffer.len(),
+            cursor.inspected
         );
-        assert!(
-            accumulator
-                .apply(
-                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}),
-                    Some(&callback),
-                    None,
-                )
-                .unwrap()
+    }
+
+    #[test]
+    fn empty_data_and_comment_frames_are_ignored() {
+        assert_eq!(frame_data(b"data:").unwrap(), None);
+        assert_eq!(frame_data(b": keepalive").unwrap(), None);
+    }
+
+    #[test]
+    fn sse_media_type_is_case_insensitive_and_ignores_parameters() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("Text/Event-Stream; charset=UTF-8"),
         );
-        assert_eq!(*captured.lock().unwrap(), "hello world");
-        assert_eq!(accumulator.blocks[&0]["text"], "hello world");
+        assert!(response_is_sse(&headers));
     }
 }

@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, RwLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot, watch},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
 use uuid::Uuid;
 
@@ -33,6 +33,7 @@ const MAX_AGENT_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AGENT_HISTORIES: usize = 32;
 const MIN_AGENT_TIMEOUT_MS: u64 = 1_000;
 const MAX_AGENT_TIMEOUT_MS: u64 = 3_600_000;
+const AGENT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentLimits {
@@ -111,13 +112,14 @@ pub fn configure_agents(settings: &Settings) -> Result<AgentIntegration> {
 pub(crate) struct AgentRuntime {
     client: ModelClient,
     registry: ToolRegistry,
-    model: String,
+    model: RwLock<String>,
     max_tokens: u32,
     system: String,
     debug: bool,
     limits: AgentLimits,
     slots: Arc<Semaphore>,
     total_started: AtomicUsize,
+    active_ids: StdMutex<HashSet<Uuid>>,
     jobs: Mutex<HashMap<Uuid, BackgroundAgent>>,
     histories: Mutex<HistoryStore>,
 }
@@ -125,7 +127,57 @@ pub(crate) struct AgentRuntime {
 struct BackgroundAgent {
     description: String,
     launch_token: Uuid,
+    cancel: Option<oneshot::Sender<()>>,
+    result: watch::Receiver<Option<Arc<ToolOutput>>>,
+    handle: JoinHandle<()>,
+    _reservation: Arc<ActiveAgentReservation>,
+}
+
+struct ActiveAgentReservation {
+    runtime: Weak<AgentRuntime>,
+    id: Uuid,
+}
+
+impl Drop for ActiveAgentReservation {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        runtime
+            .active_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
+struct ForegroundAgentRun {
+    cancel: Option<oneshot::Sender<()>>,
     handle: JoinHandle<Result<AgentRun>>,
+}
+
+enum Controlled<T> {
+    Completed(T),
+    Cancelled,
+    TimedOut,
+}
+
+impl ForegroundAgentRun {
+    async fn wait(mut self) -> Result<AgentRun> {
+        let result = (&mut self.handle)
+            .await
+            .context("foreground agent task failed")?;
+        self.cancel.take();
+        result
+    }
+}
+
+impl Drop for ForegroundAgentRun {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -197,16 +249,45 @@ impl AgentRuntime {
         Arc::new(Self {
             client,
             registry,
-            model,
+            model: RwLock::new(model),
             max_tokens,
             system,
             debug,
             limits,
             slots: Arc::new(Semaphore::new(limits.max_concurrent)),
             total_started: AtomicUsize::new(0),
+            active_ids: StdMutex::new(HashSet::new()),
             jobs: Mutex::new(HashMap::new()),
             histories: Mutex::new(HistoryStore::default()),
         })
+    }
+
+    pub(crate) fn set_default_model(&self, model: String) {
+        *self
+            .model
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = model;
+    }
+
+    fn default_model(&self) -> String {
+        self.model
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn reserve_active(self: &Arc<Self>, id: Uuid) -> Result<Arc<ActiveAgentReservation>> {
+        let mut active = self
+            .active_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(id) {
+            bail!("agent 已经在运行或结果尚未读取: {id}")
+        }
+        Ok(Arc::new(ActiveAgentReservation {
+            runtime: Arc::downgrade(self),
+            id,
+        }))
     }
 
     async fn start(
@@ -214,7 +295,7 @@ impl AgentRuntime {
         parent: &ToolContext,
         input: AgentInput,
     ) -> Result<ToolOutput> {
-        self.validate_start(parent, &input).await?;
+        self.validate_start(parent, &input)?;
         let id = input
             .resume
             .as_deref()
@@ -233,7 +314,7 @@ impl AgentRuntime {
         } else {
             Vec::new()
         };
-        let model = input.model.unwrap_or_else(|| self.model.clone());
+        let model = input.model.unwrap_or_else(|| self.default_model());
         let max_tokens = input
             .max_tokens
             .unwrap_or(self.max_tokens)
@@ -251,6 +332,7 @@ impl AgentRuntime {
         let context = parent.fork_for_agent();
         let prompt = input.prompt;
         let depth = context.agent_depth();
+        let acquire_slot = input.run_in_background || parent.agent_depth() == 0;
 
         if input.run_in_background {
             let mut jobs = self.jobs.lock().await;
@@ -260,49 +342,9 @@ impl AgentRuntime {
                     self.limits.max_background
                 )
             }
-            if jobs.contains_key(&id) {
-                bail!("agent 已经在运行: {id}")
-            }
+            let reservation = self.reserve_active(id)?;
             self.reserve_start()?;
-            let runtime = Arc::clone(self);
-            let handle = tokio::spawn(async move {
-                let permit = runtime.acquire_slot().await?;
-                let result = timeout(
-                    Duration::from_millis(timeout_ms),
-                    runtime.run_once(AgentRunRequest {
-                        id,
-                        context,
-                        prompt,
-                        history,
-                        model,
-                        max_tokens,
-                        depth,
-                    }),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("agent {id} 超过 {timeout_ms}ms timeout"))??;
-                drop(permit);
-                runtime.store_snapshot(&result).await;
-                Ok(result)
-            });
-            jobs.insert(
-                id,
-                BackgroundAgent {
-                    description: description.clone(),
-                    launch_token: Uuid::new_v4(),
-                    handle,
-                },
-            );
-            return Ok(ToolOutput::success(format!(
-                "Agent running in background\nagent_id={id}\ndescription={description}"
-            )));
-        }
-
-        self.reserve_start()?;
-        let permit = self.acquire_slot().await?;
-        let result = timeout(
-            Duration::from_millis(timeout_ms),
-            self.run_once(AgentRunRequest {
+            let request = AgentRunRequest {
                 id,
                 context,
                 prompt,
@@ -310,16 +352,75 @@ impl AgentRuntime {
                 model,
                 max_tokens,
                 depth,
-            }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("agent {id} 超过 {timeout_ms}ms timeout"))??;
-        drop(permit);
+            };
+            let (cancel, cancel_rx) = oneshot::channel();
+            let (result_tx, result) = watch::channel(None);
+            let runtime = Arc::clone(self);
+            let task_reservation = Arc::clone(&reservation);
+            let handle = tokio::spawn(async move {
+                let output = match runtime
+                    .run_controlled(
+                        request,
+                        timeout_ms,
+                        acquire_slot,
+                        cancel_rx,
+                        task_reservation,
+                    )
+                    .await
+                {
+                    Ok(run) => {
+                        runtime.store_snapshot(&run).await;
+                        render_agent_run(&run)
+                    }
+                    Err(error) => ToolOutput::error(format!("Agent {id} failed: {error:#}")),
+                };
+                let _ = result_tx.send(Some(Arc::new(output)));
+            });
+            jobs.insert(
+                id,
+                BackgroundAgent {
+                    description: description.clone(),
+                    launch_token: Uuid::new_v4(),
+                    cancel: Some(cancel),
+                    result,
+                    handle,
+                    _reservation: reservation,
+                },
+            );
+            return Ok(ToolOutput::success(format!(
+                "Agent running in background\nagent_id={id}\ndescription={description}"
+            )));
+        }
+
+        let reservation = self.reserve_active(id)?;
+        self.reserve_start()?;
+        let request = AgentRunRequest {
+            id,
+            context,
+            prompt,
+            history,
+            model,
+            max_tokens,
+            depth,
+        };
+        let (cancel, cancel_rx) = oneshot::channel();
+        let runtime = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_controlled(request, timeout_ms, acquire_slot, cancel_rx, reservation)
+                .await
+        });
+        let result = ForegroundAgentRun {
+            cancel: Some(cancel),
+            handle,
+        }
+        .wait()
+        .await?;
         self.store_snapshot(&result).await;
         Ok(render_agent_run(&result))
     }
 
-    async fn validate_start(&self, parent: &ToolContext, input: &AgentInput) -> Result<()> {
+    fn validate_start(&self, parent: &ToolContext, input: &AgentInput) -> Result<()> {
         if input.prompt.trim().is_empty() || input.prompt.len() > MAX_AGENT_PROMPT_BYTES {
             bail!("agent prompt 为空或超过 {MAX_AGENT_PROMPT_BYTES} 字节限制")
         }
@@ -343,12 +444,6 @@ impl AgentRuntime {
         if self.total_started.load(Ordering::Acquire) >= self.limits.max_total {
             bail!("agent session 达到 {} 次启动限制", self.limits.max_total)
         }
-        if let Some(resume) = &input.resume {
-            let id = parse_agent_id(resume)?;
-            if self.jobs.lock().await.contains_key(&id) {
-                bail!("不能 resume 正在运行的 agent: {id}")
-            }
-        }
         Ok(())
     }
 
@@ -357,6 +452,31 @@ impl AgentRuntime {
             .acquire_owned()
             .await
             .context("agent scheduler 已关闭")
+    }
+
+    async fn run_controlled(
+        self: &Arc<Self>,
+        request: AgentRunRequest,
+        timeout_ms: u64,
+        acquire_slot: bool,
+        mut cancel: oneshot::Receiver<()>,
+        _reservation: Arc<ActiveAgentReservation>,
+    ) -> Result<AgentRun> {
+        let id = request.id;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let _permit = if acquire_slot {
+            Some(tokio::select! {
+                result = self.acquire_slot() => result?,
+                _ = &mut cancel => bail!("agent {id} 已取消"),
+                _ = sleep_until(deadline) => {
+                    bail!("agent {id} 超过 {timeout_ms}ms timeout（包含调度等待）")
+                }
+            })
+        } else {
+            None
+        };
+        self.run_once(request, deadline, timeout_ms, &mut cancel)
+            .await
     }
 
     fn reserve_start(&self) -> Result<()> {
@@ -377,7 +497,13 @@ impl AgentRuntime {
         }
     }
 
-    async fn run_once(&self, request: AgentRunRequest) -> Result<AgentRun> {
+    async fn run_once(
+        &self,
+        request: AgentRunRequest,
+        deadline: Instant,
+        timeout_ms: u64,
+        cancel: &mut oneshot::Receiver<()>,
+    ) -> Result<AgentRun> {
         let AgentRunRequest {
             id,
             context,
@@ -388,15 +514,20 @@ impl AgentRuntime {
             depth,
         } = request;
         let mut system = self.system.clone();
-        let start_hook = context
-            .hooks()
-            .run(
+        let hooks = context.hooks();
+        let hook_cwd = context.cwd();
+        let start_hook = tokio::select! {
+            result = hooks.run(
                 "SubagentStart",
                 None,
                 json!({"agent_id": id, "depth": depth, "prompt": &prompt}),
-                &context.cwd(),
-            )
-            .await?;
+                &hook_cwd,
+            ) => result?,
+            _ = &mut *cancel => bail!("agent {id} 已取消"),
+            _ = sleep_until(deadline) => {
+                bail!("agent {id} 超过 {timeout_ms}ms timeout")
+            }
+        };
         system.push_str(&format!(
             "\n\nYou are a delegated local coding agent at recursion depth {depth}. Work only on the assigned prompt, preserve the shared workspace, and return a concrete result to the parent agent."
         ));
@@ -405,8 +536,6 @@ impl AgentRuntime {
             system.push_str(&start_hook.additional_context.join("\n"));
             system.push_str("\n</subagent-start-hook-context>");
         }
-        let hooks = context.hooks();
-        let hook_cwd = context.cwd();
         let mut engine = QueryEngine::new(
             self.client.clone(),
             self.registry.clone(),
@@ -421,16 +550,55 @@ impl AgentRuntime {
                 compact_config: None,
             },
         );
-        let turn = engine.run_turn(prompt).await;
-        let result = match turn {
-            Ok(turn) => AgentRun {
-                id,
-                text: turn.text,
-                messages: engine.messages.clone(),
-                usage: engine.usage.clone(),
-            },
+        let descendant_checkpoint = self.background_checkpoint().await;
+        let outcome = {
+            let turn = engine.run_turn(prompt);
+            tokio::pin!(turn);
+            tokio::select! {
+                result = &mut turn => Controlled::Completed(result),
+                _ = &mut *cancel => Controlled::Cancelled,
+                _ = sleep_until(deadline) => Controlled::TimedOut,
+            }
+        };
+        let (mut result, forced_cleanup) = match outcome {
+            Controlled::Completed(Ok(turn)) => (
+                Ok(AgentRun {
+                    id,
+                    text: turn.text,
+                    messages: engine.messages.clone(),
+                    usage: engine.usage.clone(),
+                }),
+                false,
+            ),
+            Controlled::Completed(Err(error)) => (Err(error), false),
+            Controlled::Cancelled => (Err(anyhow::anyhow!("agent {id} 已取消")), true),
+            Controlled::TimedOut => (
+                Err(anyhow::anyhow!("agent {id} 超过 {timeout_ms}ms timeout")),
+                true,
+            ),
+        };
+        if forced_cleanup {
+            self.rollback_new_background(&descendant_checkpoint).await;
+        }
+        engine.shutdown().await;
+        match &mut result {
+            Ok(run) => {
+                let stop_hook = hooks
+                    .run(
+                        "SubagentStop",
+                        None,
+                        json!({"agent_id": id, "depth": depth, "success": true}),
+                        &hook_cwd,
+                    )
+                    .await;
+                if let Ok(outcome) = stop_hook {
+                    if !outcome.additional_context.is_empty() {
+                        run.text.push_str("\n\n[Subagent stop hook context]\n");
+                        run.text.push_str(&outcome.additional_context.join("\n"));
+                    }
+                }
+            }
             Err(error) => {
-                engine.shutdown().await;
                 let _ = hooks
                     .run(
                         "SubagentStop",
@@ -439,27 +607,9 @@ impl AgentRuntime {
                         &hook_cwd,
                     )
                     .await;
-                return Err(error);
             }
-        };
-        engine.shutdown().await;
-        let stop_hook = hooks
-            .run(
-                "SubagentStop",
-                None,
-                json!({"agent_id": id, "depth": depth, "success": true}),
-                &hook_cwd,
-            )
-            .await;
-        let mut result = result;
-        match stop_hook {
-            Ok(outcome) if !outcome.additional_context.is_empty() => {
-                result.text.push_str("\n\n[Subagent stop hook context]\n");
-                result.text.push_str(&outcome.additional_context.join("\n"));
-            }
-            _ => {}
         }
-        Ok(result)
+        result
     }
 
     async fn store_snapshot(&self, run: &AgentRun) {
@@ -488,8 +638,9 @@ impl AgentRuntime {
 
     async fn output(&self, input: AgentOutputInput) -> Result<ToolOutput> {
         let id = parse_agent_id(&input.agent_id)?;
-        let mut jobs = self.jobs.lock().await;
-        let Some(mut job) = jobs.remove(&id) else {
+        let jobs = self.jobs.lock().await;
+        let Some(job) = jobs.get(&id) else {
+            drop(jobs);
             if self.histories.lock().await.values.contains_key(&id) {
                 return Ok(ToolOutput::success(format!(
                     "Agent {id} completed earlier; use Agent with resume={id} to continue it"
@@ -497,46 +648,64 @@ impl AgentRuntime {
             }
             bail!("background agent 不存在: {id}")
         };
-        if !input.wait && !job.handle.is_finished() {
-            let description = job.description.clone();
-            jobs.insert(id, job);
+        let mut result = job.result.clone();
+        let description = job.description.clone();
+        let launch_token = job.launch_token;
+        let handle_finished = job.handle.is_finished();
+        drop(jobs);
+
+        let current = result.borrow().clone();
+        if !input.wait && current.is_none() && !handle_finished {
             return Ok(ToolOutput::success(format!(
                 "Agent still running\nagent_id={id}\ndescription={description}"
             )));
         }
-        drop(jobs);
-        let result = if input.wait {
+        let output = if let Some(output) = current {
+            (*output).clone()
+        } else if input.wait {
             let wait_ms = input
                 .timeout_ms
                 .unwrap_or(30_000)
                 .clamp(1, MAX_AGENT_TIMEOUT_MS);
-            match timeout(Duration::from_millis(wait_ms), &mut job.handle).await {
-                Ok(result) => result,
+            match timeout(
+                Duration::from_millis(wait_ms),
+                wait_for_background_result(&mut result, id),
+            )
+            .await
+            {
+                Ok(output) => output,
                 Err(_) => {
-                    self.jobs.lock().await.insert(id, job);
                     return Ok(ToolOutput::success(format!(
                         "Agent still running after {wait_ms}ms\nagent_id={id}"
                     )));
                 }
             }
         } else {
-            job.handle.await
+            wait_for_background_result(&mut result, id).await
         };
-        match result {
-            Ok(Ok(run)) => Ok(render_agent_run(&run)),
-            Ok(Err(error)) => Ok(ToolOutput::error(format!("Agent {id} failed: {error:#}"))),
-            Err(error) => Ok(ToolOutput::error(format!(
-                "Agent {id} task failed: {error}"
-            ))),
+
+        let completed = {
+            let mut jobs = self.jobs.lock().await;
+            if jobs
+                .get(&id)
+                .is_some_and(|job| job.launch_token == launch_token)
+            {
+                jobs.remove(&id)
+            } else {
+                None
+            }
+        };
+        if let Some(job) = completed {
+            let _ = job.handle.await;
         }
+        Ok(output)
     }
 
     async fn stop(&self, id: Uuid) -> Result<ToolOutput> {
         let Some(job) = self.jobs.lock().await.remove(&id) else {
             bail!("background agent 不存在: {id}")
         };
-        job.handle.abort();
-        let _ = job.handle.await;
+        cancel_background_job(job).await;
         Ok(ToolOutput::success(format!("Stopped agent {id}")))
     }
 
@@ -576,12 +745,11 @@ impl AgentRuntime {
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
             ids.into_iter()
-                .filter_map(|id| jobs.remove(&id).map(|job| job.handle))
+                .filter_map(|id| jobs.remove(&id))
                 .collect::<Vec<_>>()
         };
-        for handle in jobs {
-            handle.abort();
-            let _ = handle.await;
+        for job in jobs {
+            cancel_background_job(job).await;
         }
     }
 
@@ -591,12 +759,35 @@ impl AgentRuntime {
             .lock()
             .await
             .drain()
-            .map(|(_, job)| job.handle)
+            .map(|(_, job)| job)
             .collect::<Vec<_>>();
-        for handle in jobs {
-            handle.abort();
-            let _ = handle.await;
+        for job in jobs {
+            cancel_background_job(job).await;
         }
+    }
+}
+
+async fn wait_for_background_result(
+    result: &mut watch::Receiver<Option<Arc<ToolOutput>>>,
+    id: Uuid,
+) -> ToolOutput {
+    loop {
+        if let Some(output) = result.borrow().clone() {
+            return (*output).clone();
+        }
+        if result.changed().await.is_err() {
+            return ToolOutput::error(format!("Agent {id} task ended before publishing a result"));
+        }
+    }
+}
+
+async fn cancel_background_job(mut job: BackgroundAgent) {
+    if let Some(cancel) = job.cancel.take() {
+        let _ = cancel.send(());
+    }
+    if timeout(AGENT_CANCEL_GRACE, &mut job.handle).await.is_err() {
+        job.handle.abort();
+        let _ = job.handle.await;
     }
 }
 
@@ -780,6 +971,52 @@ fn truncate_text(value: &str, maximum: usize) -> &str {
 mod tests {
     use super::*;
     use crate::config::EndpointConfig;
+    use crate::protocol::{ApiFormat, ChatTokensField};
+
+    fn pending_background_agent(
+        runtime: &Arc<AgentRuntime>,
+        id: Uuid,
+        description: &str,
+    ) -> BackgroundAgent {
+        let reservation = runtime.reserve_active(id).unwrap();
+        let (cancel, cancel_rx) = oneshot::channel();
+        let (result_tx, result) = watch::channel(None);
+        let handle = tokio::spawn(async move {
+            let _result_tx = result_tx;
+            let _ = cancel_rx.await;
+        });
+        BackgroundAgent {
+            description: description.to_owned(),
+            launch_token: Uuid::new_v4(),
+            cancel: Some(cancel),
+            result,
+            handle,
+            _reservation: reservation,
+        }
+    }
+
+    fn test_runtime(limits: AgentLimits) -> Arc<AgentRuntime> {
+        let client = ModelClient::new(EndpointConfig {
+            token: None,
+            base_url: "http://127.0.0.1:9".to_owned(),
+            messages_path: "/v1/messages".to_owned(),
+            api_format: ApiFormat::Messages,
+            stream: true,
+            chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+            include_stream_usage: true,
+            allow_env_proxy: false,
+        })
+        .unwrap();
+        AgentRuntime::new(
+            client,
+            ToolRegistry::default(),
+            "test".to_owned(),
+            128,
+            "test".to_owned(),
+            false,
+            limits,
+        )
+    }
 
     #[test]
     fn limits_from_settings_are_clamped() {
@@ -806,6 +1043,10 @@ mod tests {
             token: None,
             base_url: "http://127.0.0.1:9".to_owned(),
             messages_path: "/v1/messages".to_owned(),
+            api_format: ApiFormat::Messages,
+            stream: true,
+            chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+            include_stream_usage: true,
             allow_env_proxy: false,
         })
         .unwrap();
@@ -820,23 +1061,14 @@ mod tests {
         );
         let existing = Uuid::new_v4();
         let descendant = Uuid::new_v4();
-        let pending = || tokio::spawn(async { std::future::pending::<Result<AgentRun>>().await });
         runtime.jobs.lock().await.insert(
             existing,
-            BackgroundAgent {
-                description: "existing".to_owned(),
-                launch_token: Uuid::new_v4(),
-                handle: pending(),
-            },
+            pending_background_agent(&runtime, existing, "existing"),
         );
         let checkpoint = runtime.background_checkpoint().await;
         runtime.jobs.lock().await.insert(
             descendant,
-            BackgroundAgent {
-                description: "descendant".to_owned(),
-                launch_token: Uuid::new_v4(),
-                handle: pending(),
-            },
+            pending_background_agent(&runtime, descendant, "descendant"),
         );
 
         runtime.rollback_new_background(&checkpoint).await;
@@ -853,6 +1085,10 @@ mod tests {
             token: None,
             base_url: "http://127.0.0.1:9".to_owned(),
             messages_path: "/v1/messages".to_owned(),
+            api_format: ApiFormat::Messages,
+            stream: true,
+            chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+            include_stream_usage: true,
             allow_env_proxy: false,
         })
         .unwrap();
@@ -866,29 +1102,139 @@ mod tests {
             AgentLimits::default(),
         );
         let reused_id = Uuid::new_v4();
-        let pending = || tokio::spawn(async { std::future::pending::<Result<AgentRun>>().await });
         runtime.jobs.lock().await.insert(
             reused_id,
-            BackgroundAgent {
-                description: "before checkpoint".to_owned(),
-                launch_token: Uuid::new_v4(),
-                handle: pending(),
-            },
+            pending_background_agent(&runtime, reused_id, "before checkpoint"),
         );
         let checkpoint = runtime.background_checkpoint().await;
         let old = runtime.jobs.lock().await.remove(&reused_id).unwrap();
-        old.handle.abort();
-        let _ = old.handle.await;
+        cancel_background_job(old).await;
         runtime.jobs.lock().await.insert(
             reused_id,
-            BackgroundAgent {
-                description: "relaunched during turn".to_owned(),
-                launch_token: Uuid::new_v4(),
-                handle: pending(),
-            },
+            pending_background_agent(&runtime, reused_id, "relaunched during turn"),
         );
 
         runtime.rollback_new_background(&checkpoint).await;
         assert!(!runtime.jobs.lock().await.contains_key(&reused_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_output_wait_keeps_background_agent_tracked() {
+        let runtime = test_runtime(AgentLimits::default());
+        let id = Uuid::new_v4();
+        runtime.jobs.lock().await.insert(
+            id,
+            pending_background_agent(&runtime, id, "wait cancellation"),
+        );
+
+        let waiter_runtime = Arc::clone(&runtime);
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .output(AgentOutputInput {
+                    agent_id: id.to_string(),
+                    wait: true,
+                    timeout_ms: Some(60_000),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waiter.abort();
+        let _ = waiter.await;
+
+        assert!(runtime.jobs.lock().await.contains_key(&id));
+        let stopped = runtime.stop(id).await.unwrap();
+        assert!(!stopped.is_error, "{}", stopped.content);
+    }
+
+    #[tokio::test]
+    async fn scheduler_wait_is_covered_by_agent_timeout() {
+        let limits = AgentLimits {
+            max_concurrent: 1,
+            default_timeout_ms: MIN_AGENT_TIMEOUT_MS,
+            ..AgentLimits::default()
+        };
+        let runtime = test_runtime(limits);
+        let permit = runtime.acquire_slot().await.unwrap();
+        let context = ToolContext::new(
+            std::env::current_dir().unwrap(),
+            crate::permissions::PermissionManager::new(
+                crate::permissions::PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.start(
+                &context,
+                AgentInput {
+                    prompt: "will wait for the scheduler".to_owned(),
+                    description: None,
+                    model: None,
+                    run_in_background: false,
+                    resume: None,
+                    timeout_ms: Some(MIN_AGENT_TIMEOUT_MS),
+                    max_tokens: None,
+                },
+            ),
+        )
+        .await
+        .expect("agent timeout must include semaphore queue time")
+        .unwrap_err();
+        assert!(format!("{result:#}").contains("包含调度等待"));
+        assert!(
+            runtime
+                .active_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_an_id_reserved_by_background_agent() {
+        let runtime = test_runtime(AgentLimits::default());
+        let id = Uuid::new_v4();
+        runtime.histories.lock().await.values.insert(
+            id,
+            AgentSnapshot {
+                messages: vec![Message::user_text("previous run")],
+            },
+        );
+        runtime
+            .jobs
+            .lock()
+            .await
+            .insert(id, pending_background_agent(&runtime, id, "active resume"));
+        let context = ToolContext::new(
+            std::env::current_dir().unwrap(),
+            crate::permissions::PermissionManager::new(
+                crate::permissions::PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let error = runtime
+            .start(
+                &context,
+                AgentInput {
+                    prompt: "resume concurrently".to_owned(),
+                    description: None,
+                    model: None,
+                    run_in_background: false,
+                    resume: Some(id.to_string()),
+                    timeout_ms: Some(MIN_AGENT_TIMEOUT_MS),
+                    max_tokens: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("已经在运行或结果尚未读取"));
+        runtime.shutdown_all().await;
     }
 }

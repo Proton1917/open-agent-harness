@@ -26,7 +26,7 @@ AI-assisted contributions are allowed. The submitter nevertheless owns every lin
 
 ### 3. Obtain comparison material yourself
 
-Every code contributor must independently obtain their own lawful, authorized local copy of the relevant Claude Code release or related research material before making or reviewing behavioral-parity claims. This repository does not publish or redistribute those materials.
+Before submitting code, every contributor must independently obtain their own lawful, authorized local copy of a relevant Claude Code release or equivalent first-party comparison material. This repository does not publish or redistribute those materials. The requirement exists so contributors can check observable behavior themselves instead of repeating an AI-generated compatibility claim; it does not authorize access, copying, or redistribution.
 
 - Follow the license, terms, and laws that apply to you.
 - Do not commit or upload vendor binaries, extracted bundles, bytecode, native modules, decompiled source, proprietary system prompts, credentials, account data, telemetry captures containing personal data, or copyrighted documentation.
@@ -77,6 +77,7 @@ scripts/audit-harness.sh
 ## Pull-request checklist
 
 - [ ] The harness core and primary executable remain Rust; ancillary tooling is transparent, scoped, and justified.
+- [ ] I independently obtained lawful, authorized comparison material; none of it is included in this contribution.
 - [ ] I disclosed AI-assisted sections and can explain every submitted line without delegating responsibility to a model.
 - [ ] The change is provider-neutral and has no hard-coded vendor endpoint.
 - [ ] No proprietary comparison material is included or quoted.
@@ -121,7 +122,7 @@ By submitting a contribution, you agree that your original contribution is licen
 
 ### 3. 比对材料必须自行取得
 
-每一位代码贡献者在提出或审阅行为一致性声明前，都必须自行、合法、经授权取得需要比对的 Claude Code 版本或相关研究材料。本仓库不发布、也不转发这些材料。
+每一位贡献者在提交代码前，都必须自行、合法、经授权取得一份相关的 Claude Code 版本或等价的一方比对材料。本仓库不发布、也不转发这些材料。这项要求的目的，是让贡献者亲自核对可观察行为，而不是复读 AI 生成的兼容性声明；它不授权任何访问、复制或再分发行为。
 
 - 遵守适用于你的许可证、服务条款与法律。
 - 不得提交或上传厂商二进制、拆包产物、bytecode、原生模块、反编译源码、专有系统提示词、凭据、账户数据、含个人信息的遥测记录或受版权保护的文档。
@@ -172,6 +173,7 @@ scripts/audit-harness.sh
 ## Pull Request 检查表
 
 - [ ] Harness 核心与主体可执行程序仍以 Rust 实现；辅助工具透明、范围明确且理由充分。
+- [ ] 已自行取得合法、经授权的比对材料；本贡献未包含其中任何内容。
 - [ ] 已披露 AI 辅助部分，并能逐行解释提交内容，不把责任推给模型。
 - [ ] 改动提供方无关，不含硬编码厂商 endpoint。
 - [ ] 未包含或引用任何专有比对材料。

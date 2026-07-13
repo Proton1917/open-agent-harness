@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0 — 2026-07-13
+
+- Added native provider-neutral adapters for content-block Messages, OpenAI-compatible Chat Completions, and OpenAI-compatible Responses, with path inference, explicit format selection, streaming and complete JSON responses, legacy Chat token-field selection, and optional streamed usage negotiation.
+- Added strict protocol-specific SSE state machines. Truncated streams, non-completed or stream-conflicting terminal payloads, mismatched finish reasons, missing/conflicting/sparse indices, mixed tool-call dialects, duplicate lifecycle events, malformed tool arguments, and all documented midstream endpoint error forms now fail before tool execution; null usage and OpenRouter keepalive/usage conventions are handled safely.
+- Added both documented OpenRouter Responses event-name families, exact stateless Responses item replay, and ordered Chat `reasoning_details` continuity without persisting opaque provider state or forwarding it to another wire protocol.
+- Hardened tool execution against duplicate call IDs, malformed historical pairing, empty replacements, UTF-8 byte-limit bypasses, and replacement amplification before allocation.
+- Reworked local-agent scheduling and cleanup so cancellation remains observable, timeouts include queueing, nested foreground delegation cannot deadlock at concurrency one, active IDs are reserved atomically, and model changes propagate to future subagents.
+- Preserved the current user prompt verbatim across automatic history compaction and made `Ctrl-C` transactional in plain interactive and `--print` modes as well as the conversational terminal.
+- Added local mock-server compatibility tests for multi-round Chat and Responses tool flows, OpenRouter stream conventions, complete JSON mode, credential redaction, and fail-closed truncation. No public endpoint or real credential is used by the test suite.
+
 ## v0.3.0 — 2026-07-12
 
 - Rebuilt the interactive conversational-terminal structure in Rust: startup card, bordered Unicode composer, bounded paste, history, multiline input, safe permission-mode cycling, live request state, streamed response rendering, and tool-call/result rows.

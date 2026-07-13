@@ -36,10 +36,18 @@ use open_agent_harness::{
 
 fn main() {
     if let Err(error) = bootstrap() {
-        eprintln!("Error: {error:#}");
-        std::process::exit(1);
+        if error.downcast_ref::<CliInterrupted>().is_some() {
+            std::process::exit(130);
+        } else {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("turn interrupted by user")]
+struct CliInterrupted;
 
 fn bootstrap() -> Result<()> {
     let cli = Cli::parse();
@@ -47,7 +55,13 @@ fn bootstrap() -> Result<()> {
     let mut settings = Settings::load(&cwd, cli.settings.as_deref(), cli.bare)?;
     // SAFETY: bootstrap is still single-threaded; the async runtime is created below.
     unsafe { settings.apply_environment() };
-    let endpoint = endpoint_config();
+    let mut endpoint = endpoint_config()?;
+    if let Some(api_format) = cli.api_format {
+        endpoint.api_format = api_format;
+    }
+    if let Some(chat_tokens_field) = cli.chat_tokens_field {
+        endpoint.chat_tokens_field = chat_tokens_field;
+    }
     // SAFETY: bootstrap is still single-threaded. Keep endpoint credentials only in memory so
     // subprocess tools cannot inherit them after the runtime starts.
     unsafe {
@@ -165,7 +179,11 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
 
     if cli.print {
         let prompt = print_prompt(&cli)?;
-        let result = engine.run_turn(prompt).await?;
+        let Some(result) = engine.run_turn_interruptible(prompt).await? else {
+            run_session_end_hook(&hooks, store.id, &cwd, "print_interrupted", cli.debug).await;
+            engine.shutdown().await;
+            return Err(CliInterrupted.into());
+        };
         persist_turn(&store, &engine, &result)?;
         print_result(&cli, &engine, &store, &result.text, result.streamed_text)?;
         run_session_end_hook(&hooks, store.id, &cwd, "print_complete", cli.debug).await;
@@ -236,11 +254,7 @@ async fn run(cli: Cli, cwd: PathBuf, settings: Settings, endpoint: EndpointConfi
             CommandOutcome::Submit(prompt) => prompt,
             CommandOutcome::NotCommand => input,
         };
-        let turn = if enhanced_terminal {
-            engine.run_turn_interruptible(input).await
-        } else {
-            engine.run_turn(input).await.map(Some)
-        };
+        let turn = engine.run_turn_interruptible(input).await;
         match turn {
             Ok(Some(result)) => {
                 persist_turn(&store, &engine, &result)?;

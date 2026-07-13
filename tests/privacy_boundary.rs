@@ -5,7 +5,9 @@ use std::{
     thread,
 };
 
-use open_agent_harness::{api::ModelClient, config::EndpointConfig, types::Message};
+use open_agent_harness::{
+    api::ModelClient, config::EndpointConfig, protocol::ApiFormat, types::Message,
+};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -16,7 +18,9 @@ async fn model_request_contains_only_the_documented_contract() {
         let (mut stream, _) = listener.accept().unwrap();
         let request = read_request(&mut stream);
         let body = json!({
+            "type":"message",
             "id":"response-1",
+            "role":"assistant",
             "content":[{"type":"text","text":"ok"}],
             "stop_reason":"end_turn"
         })
@@ -158,7 +162,9 @@ async fn interrupted_tool_input_json_is_rejected() {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = read_request(&mut stream);
         let body = [
-            json!({"type":"message_start","message":{"id":"broken","usage":{}}}),
+            json!({"type":"message_start","message":{
+                "type":"message","role":"assistant","id":"broken","content":[],"usage":{}
+            }}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Read","input":{}}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":"}}),
             json!({"type":"message_stop"}),
@@ -190,7 +196,10 @@ async fn interrupted_tool_input_json_is_rejected() {
         Err(error) => error,
     };
     server.join().unwrap();
-    assert!(error.to_string().contains("JSON"));
+    assert!(
+        error.to_string().contains("content block") || error.to_string().contains("JSON"),
+        "unexpected error: {error:#}"
+    );
 }
 
 struct CapturedRequest {
@@ -233,6 +242,10 @@ fn endpoint(address: std::net::SocketAddr, token: Option<&str>) -> EndpointConfi
         token: token.map(str::to_owned),
         base_url: format!("http://{address}"),
         messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
         allow_env_proxy: false,
     }
 }

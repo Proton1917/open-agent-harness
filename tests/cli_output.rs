@@ -77,7 +77,9 @@ fn run_cli(format: &str, response: String) -> String {
 
 fn json_response(text: &str) -> String {
     serde_json::json!({
+        "type": "message",
         "id": "response-output",
+        "role": "assistant",
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 1, "output_tokens": 1}
@@ -87,7 +89,10 @@ fn json_response(text: &str) -> String {
 
 fn sse_response(text: &str) -> String {
     [
-        serde_json::json!({"type":"message_start","message":{"id":"stream-output","usage":{"input_tokens":1,"output_tokens":0}}}),
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"stream-output","content":[],
+            "usage":{"input_tokens":1,"output_tokens":0}
+        }}),
         serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
         serde_json::json!({"type":"content_block_stop","index":0}),

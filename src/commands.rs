@@ -26,7 +26,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             CommandOutcome::Handled
         }
         "/model" => {
-            engine.model = argument.trim().to_owned();
+            engine.set_model(argument.trim().to_owned());
             println!("Model: {}", engine.model);
             CommandOutcome::Handled
         }

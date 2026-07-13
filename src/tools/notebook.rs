@@ -8,6 +8,9 @@ use super::{
     parse_input, read_text_bounded, reject_direct_symlink_write,
 };
 
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_CELL_ID_BYTES: usize = 256;
+
 #[derive(Deserialize)]
 struct Input {
     notebook_path: String,
@@ -37,8 +40,8 @@ impl Tool for NotebookEditTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "notebook_path": {"type": "string", "maxLength": 4096},
-                "cell_id": {"type": "string", "maxLength": 256},
+                "notebook_path": {"type": "string", "maxLength": MAX_PATH_BYTES},
+                "cell_id": {"type": "string", "maxLength": MAX_CELL_ID_BYTES},
                 "new_source": {"type": "string", "maxLength": MAX_EDITABLE_FILE_BYTES},
                 "cell_type": {"type": "string", "enum": ["code", "markdown"]},
                 "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete"]}
@@ -77,6 +80,7 @@ impl Tool for NotebookEditTool {
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: Input = parse_input(input)?;
+        validate_input_bytes(&input)?;
         let path = context.resolve_path(&input.notebook_path)?;
         if path.extension().and_then(|value| value.to_str()) != Some("ipynb") {
             bail!("NotebookEdit 只接受 .ipynb 文件")
@@ -116,6 +120,21 @@ impl Tool for NotebookEditTool {
         context.remember_read(path, updated, false).await?;
         Ok(ToolOutput::success(result))
     }
+}
+
+fn validate_input_bytes(input: &Input) -> Result<()> {
+    ensure_utf8_bytes("notebook_path", &input.notebook_path, MAX_PATH_BYTES)?;
+    if let Some(cell_id) = &input.cell_id {
+        ensure_utf8_bytes("cell_id", cell_id, MAX_CELL_ID_BYTES)?;
+    }
+    ensure_utf8_bytes("new_source", &input.new_source, MAX_EDITABLE_FILE_BYTES)
+}
+
+fn ensure_utf8_bytes(field: &str, value: &str, limit: usize) -> Result<()> {
+    if value.len() > limit {
+        bail!("{field} 超过 {limit} 字节限制")
+    }
+    Ok(())
 }
 
 fn notebook_supports_cell_ids(notebook: &Map<String, Value>) -> bool {
@@ -230,5 +249,50 @@ fn normalize_cell_kind(cell: &mut Map<String, Value>, cell_type: &str) {
             cell.remove("outputs");
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn four_byte_unicode_respects_source_byte_boundaries() {
+        let at_limit = "🦀".repeat(MAX_EDITABLE_FILE_BYTES / 4);
+        let over_limit = format!("{at_limit}🦀");
+        let valid: Input = serde_json::from_value(json!({
+            "notebook_path": "analysis.ipynb",
+            "cell_id": "cell-a",
+            "new_source": at_limit,
+        }))
+        .unwrap();
+        let oversized: Input = serde_json::from_value(json!({
+            "notebook_path": "analysis.ipynb",
+            "cell_id": "cell-a",
+            "new_source": over_limit,
+        }))
+        .unwrap();
+
+        assert!(validate_input_bytes(&valid).is_ok());
+        assert!(validate_input_bytes(&oversized).is_err());
+    }
+
+    #[test]
+    fn path_and_cell_id_limits_are_checked_in_utf8_bytes() {
+        let path_at_limit = "🦀".repeat(MAX_PATH_BYTES / 4);
+        let path_over_limit = format!("{path_at_limit}🦀");
+        let cell_at_limit = "🦀".repeat(MAX_CELL_ID_BYTES / 4);
+        let cell_over_limit = format!("{cell_at_limit}🦀");
+        let input = |notebook_path, cell_id| Input {
+            notebook_path,
+            cell_id: Some(cell_id),
+            new_source: String::new(),
+            cell_type: None,
+            edit_mode: default_edit_mode(),
+        };
+
+        assert!(validate_input_bytes(&input(path_at_limit.clone(), cell_at_limit.clone())).is_ok());
+        assert!(validate_input_bytes(&input(path_over_limit, cell_at_limit)).is_err());
+        assert!(validate_input_bytes(&input(path_at_limit, cell_over_limit)).is_err());
     }
 }
