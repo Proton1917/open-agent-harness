@@ -192,12 +192,12 @@ impl DomainProxy {
         })
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn tcp_port(&self) -> u16 {
         self.inner.tcp_addr.port()
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn http_url(&self) -> String {
         format!(
             "http://oah:{}@127.0.0.1:{}",
@@ -206,7 +206,7 @@ impl DomainProxy {
         )
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn socks_url(&self) -> String {
         format!(
             "socks5h://oah:{}@127.0.0.1:{}",
