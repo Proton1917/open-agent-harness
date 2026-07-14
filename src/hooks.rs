@@ -2114,14 +2114,9 @@ mod tests {
             .await
             .unwrap();
 
-        let started = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        runner.finalize_async().await;
+        let started = receiver.try_recv().unwrap();
+        let response = receiver.try_recv().unwrap();
         let HookExecutionEvent::HookStarted {
             id: started_id,
             event: started_event,
