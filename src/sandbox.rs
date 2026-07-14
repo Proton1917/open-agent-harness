@@ -864,7 +864,8 @@ mod tests {
         assert!(profile.contains("(deny file-read*"));
         assert!(profile.contains("(deny file-write*"));
         assert!(!profile.contains("(allow network*)"));
-        assert!(profile.contains(fs::canonicalize(allowed).unwrap().to_str().unwrap()));
+        let canonical_allowed = fs::canonicalize(allowed).unwrap();
+        assert!(profile.contains(&scheme_escape(&canonical_allowed).unwrap()));
     }
 
     #[test]

@@ -989,7 +989,11 @@ fn sanitize_absolute_lsp_path(path: &Path, workspace: &Path) -> String {
 }
 
 fn workspace_relative_path(path: &Path, workspace: &Path) -> Option<String> {
-    let relative = path.strip_prefix(workspace).ok()?;
+    let relative = platform_relative_path(path, workspace).or_else(|| {
+        let path = std::fs::canonicalize(path).ok()?;
+        let workspace = std::fs::canonicalize(workspace).ok()?;
+        platform_relative_path(&path, &workspace)
+    })?;
     if relative.components().any(|component| {
         matches!(
             component,
@@ -1005,6 +1009,35 @@ fn workspace_relative_path(path: &Path, workspace: &Path) -> Option<String> {
     } else {
         Some(relative.to_string_lossy().replace('\\', "/"))
     }
+}
+
+#[cfg(not(windows))]
+fn platform_relative_path(path: &Path, workspace: &Path) -> Option<PathBuf> {
+    path.strip_prefix(workspace).ok().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn platform_relative_path(path: &Path, workspace: &Path) -> Option<PathBuf> {
+    let path = normalize_windows_file_path(path)?;
+    let workspace = normalize_windows_file_path(workspace)?;
+    path.strip_prefix(workspace).ok().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn normalize_windows_file_path(path: &Path) -> Option<PathBuf> {
+    let normalized = path.to_str()?.replace('\\', "/");
+    let normalized = if let Some(local) = normalized.strip_prefix("//?/") {
+        if let Some(unc) = local.strip_prefix("UNC/") {
+            format!("//{unc}")
+        } else if local.as_bytes().get(1) == Some(&b':') {
+            local.to_owned()
+        } else {
+            return None;
+        }
+    } else {
+        normalized
+    };
+    Some(PathBuf::from(normalized))
 }
 
 fn replace_embedded_file_uris(value: &str, workspace: &Path) -> String {
@@ -1073,7 +1106,11 @@ mod tests {
     #[test]
     fn lsp_paths_are_workspace_relative_or_explicitly_redacted() {
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
         let inside = workspace.path().join("src/main.rs");
+        std::fs::write(&inside, "fn main() {}\n").unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "").unwrap();
+        let canonical_workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let inside_uri = file_uri(&inside).unwrap();
         let outside = std::env::temp_dir().join("outside-private.rs");
         let outside_uri = file_uri(&outside).unwrap();
@@ -1086,10 +1123,10 @@ mod tests {
                 file_uri(&workspace.path().join("src/lib.rs")).unwrap(): [],
                 "file:///definitely/outside.rs": []
             },
-            "hover": format!("defined at {} and file:///definitely/outside.rs", workspace.path().display()),
+            "hover": format!("defined at {} and file:///definitely/outside.rs", canonical_workspace.display()),
             "data": {"private": true}
         });
-        let sanitized = sanitize_lsp_value(value, workspace.path());
+        let sanitized = sanitize_lsp_value(value, &canonical_workspace);
         let encoded = serde_json::to_string(&sanitized).unwrap();
         assert_eq!(sanitized["uri"], "src/main.rs");
         assert_eq!(sanitized["absolute"], "src/main.rs");
@@ -1099,10 +1136,10 @@ mod tests {
         assert!(sanitized["changes"].get(OUTSIDE_WORKSPACE_URI).is_some());
         assert!(sanitized.get("data").is_none());
         assert!(!encoded.contains("file://"));
-        assert!(!encoded.contains(workspace.path().to_string_lossy().as_ref()));
+        assert!(!encoded.contains(canonical_workspace.to_string_lossy().as_ref()));
         let position = sanitize_lsp_value(
             json!({"range":{"start":{"line":0,"character":0},"end":{"line":4,"character":8}}}),
-            workspace.path(),
+            &canonical_workspace,
         );
         assert_eq!(position["range"]["start"]["line"], 1);
         assert_eq!(position["range"]["start"]["character"], 1);

@@ -681,14 +681,20 @@ mod tests {
 
     #[test]
     fn trusted_extension_settings_are_typed_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_one = temp.path().join("one");
+        let plugin_two = temp.path().join("two");
         let settings = Settings {
             raw: serde_json::json!({
-                "plugins":{"directories":["/tmp/one", "/tmp/two"]},
+                "plugins":{"directories":[&plugin_one, &plugin_two]},
                 "memory":{"enabled":true, "autoExtract":true, "path":"memory-root"},
                 "outputStyle":"runtime:brief"
             }),
         };
-        assert_eq!(settings.plugin_directories().unwrap().len(), 2);
+        assert_eq!(
+            settings.plugin_directories().unwrap(),
+            vec![plugin_one, plugin_two]
+        );
         assert_eq!(settings.output_style().unwrap(), Some("runtime:brief"));
         assert_eq!(
             settings.auto_memory_settings().unwrap(),

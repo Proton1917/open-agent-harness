@@ -1307,11 +1307,11 @@ mod tests {
                 .unwrap(),
             "Check src"
         );
-        assert!(
-            catalog.hooks()["SessionStart"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains(plugin.to_str().unwrap())
+        let canonical_plugin = fs::canonicalize(&plugin).unwrap();
+        let expected_hook_command = format!("{}/bin/check", canonical_plugin.to_str().unwrap());
+        assert_eq!(
+            catalog.hooks()["SessionStart"][0]["hooks"][0]["command"],
+            expected_hook_command
         );
     }
 

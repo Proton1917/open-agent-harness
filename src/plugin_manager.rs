@@ -1774,7 +1774,7 @@ fn sync_tree(path: &Path) -> Result<()> {
         bail!("拒绝 fsync symlink plugin tree")
     }
     if metadata.is_file() {
-        open_regular_nofollow(path)?.sync_all()?;
+        open_regular_for_sync(path)?.sync_all()?;
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -1784,6 +1784,27 @@ fn sync_tree(path: &Path) -> Result<()> {
         sync_tree(&entry?.path())?;
     }
     sync_directory(path)
+}
+
+fn open_regular_for_sync(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // FlushFileBuffers requires a handle opened with write access. Unix fsync
+    // accepts a read-only descriptor, so keep the narrower access there.
+    #[cfg(windows)]
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("无法打开普通 plugin file 进行 fsync: {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("plugin fsync 路径不是普通文件: {}", path.display())
+    }
+    Ok(file)
 }
 
 fn normalize_private_tree_directories(path: &Path) -> Result<()> {
@@ -2360,6 +2381,16 @@ mod tests {
         let mut file = create_private_file(path).unwrap();
         file.write_all(bytes).unwrap();
         file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn sync_tree_flushes_regular_files_with_platform_appropriate_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        ensure_private_directory(&tree).unwrap();
+        write_private_test_file(&tree.join("payload"), b"durable");
+
+        sync_tree(&tree).unwrap();
     }
 
     #[tokio::test]

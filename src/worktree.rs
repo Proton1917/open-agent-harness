@@ -1393,6 +1393,21 @@ mod tests {
             std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
             "base"
         );
+        let permission_candidates = context
+            .permission_path_candidates_for_resolved(&worktree.join("tracked.txt"))
+            .unwrap();
+        assert!(
+            permission_candidates
+                .iter()
+                .any(|candidate| candidate == "tracked.txt")
+        );
+        #[cfg(windows)]
+        assert!(
+            permission_candidates
+                .iter()
+                .all(|candidate| !candidate.starts_with("//?/")),
+            "permission identities must not expose the canonical verbatim prefix: {permission_candidates:?}"
+        );
         let read = registry
             .execute(&context, "Read", json!({"file_path":"tracked.txt"}))
             .await;

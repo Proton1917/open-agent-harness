@@ -2691,7 +2691,12 @@ impl ToolContext {
         &self,
         path: &Path,
     ) -> Result<Vec<String>> {
-        reject_windows_network_or_device_path(&path.to_string_lossy())?;
+        // `std::fs::canonicalize` returns a verbatim local-disk path on
+        // Windows (`\\?\C:\...`). Raw model input using that namespace is
+        // still rejected in `resolve_path`; only this already-resolved path
+        // boundary unwraps the local-disk prefix before applying the same
+        // UNC/device/ADS/reserved-name checks.
+        reject_windows_network_or_device_resolved_path(path)?;
         let lexical = normalize_lexical_path(path);
         let canonical = canonicalize_for_scope(&lexical)
             .with_context(|| format!("无法规范化权限路径: {}", path.display()))?;
@@ -3061,11 +3066,24 @@ fn truncate_utf8_with_marker(value: &mut String, maximum: usize, marker: &str) {
 pub(crate) fn normalize_path_for_display(value: String) -> String {
     #[cfg(windows)]
     {
-        value.replace('\\', "/")
+        normalize_windows_local_path_text(&value)
     }
     #[cfg(not(windows))]
     {
         value
+    }
+}
+
+fn normalize_windows_local_path_text(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let Some(local) = normalized.strip_prefix("//?/") else {
+        return normalized;
+    };
+    let bytes = local.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        local.to_owned()
+    } else {
+        normalized
     }
 }
 
@@ -4683,6 +4701,15 @@ fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn reject_windows_network_or_device_resolved_path(path: &Path) -> Result<()> {
+    reject_windows_network_or_device_resolved_text(&path.to_string_lossy())
+}
+
+fn reject_windows_network_or_device_resolved_text(value: &str) -> Result<()> {
+    let normalized = normalize_windows_local_path_text(value);
+    reject_windows_network_or_device_path(&normalized)
+}
+
 pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T> {
     serde_json::from_value(input).context("工具输入不符合 schema")
 }
@@ -4882,6 +4909,9 @@ mod tests {
     #[test]
     fn windows_native_namespace_strings_are_rejected_before_path_conversion() {
         for path in [
+            r"\\?\C:\secret.txt",
+            r"\\?\UNC\server\share\secret.txt",
+            r"\\.\PhysicalDrive0",
             r"\??\C:\secret.txt",
             r"\Device\Mup\server\share\secret.txt",
             r"\DosDevices\C:\secret.txt",
@@ -4896,6 +4926,26 @@ mod tests {
             assert!(
                 reject_windows_network_or_device_path(path).is_ok(),
                 "ordinary drive path was rejected: {path}"
+            );
+        }
+
+        assert_eq!(
+            normalize_windows_local_path_text(r"\\?\C:\Users\user\file.txt"),
+            "C:/Users/user/file.txt"
+        );
+        assert!(
+            reject_windows_network_or_device_resolved_text(r"\\?\C:\Users\user\file.txt").is_ok(),
+            "trusted canonical local-disk path must normalize"
+        );
+        for path in [
+            r"\\?\UNC\server\share\secret.txt",
+            r"\\.\PhysicalDrive0",
+            r"\??\C:\secret.txt",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\secret.txt",
+        ] {
+            assert!(
+                reject_windows_network_or_device_resolved_text(path).is_err(),
+                "resolved network/device namespace path was accepted: {path}"
             );
         }
     }
