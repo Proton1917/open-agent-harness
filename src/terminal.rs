@@ -1545,7 +1545,10 @@ mod tests {
             .draw(&mut output, "ab", 2, PermissionMode::Default, "")
             .unwrap();
 
-        let mut screen = TestScreen::new(80, 24);
+        let screen_width = terminal::size()
+            .map(|(width, _)| usize::from(width).max(4))
+            .unwrap_or(80);
+        let mut screen = TestScreen::new(screen_width, 24);
         screen.feed(&output);
         let lines = screen.lines();
         assert_eq!(lines.len(), 4, "final screen was {lines:#?}");

@@ -354,6 +354,14 @@ impl ClientStream {
             Self::Unix(stream) => stream.shutdown(Shutdown::Both),
         }
     }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.shutdown(Shutdown::Write),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(Shutdown::Write),
+        }
+    }
 }
 
 impl Read for ClientStream {
@@ -538,7 +546,8 @@ fn handle_http(mut client: ClientStream, first: u8, policy: &ProxyPolicy) -> Res
             )
         });
     if !authorized {
-        client.write_all(
+        finish_http_response(
+            &mut client,
             b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"open-agent-harness\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         )?;
         bail!("HTTP proxy authentication failed")
@@ -660,10 +669,17 @@ fn parse_http_target(target: &str, headers: &[(String, String)]) -> Result<(Url,
 }
 
 fn write_http_error(client: &mut ClientStream, code: u16, reason: &str) -> io::Result<()> {
-    write!(
+    finish_http_response(
         client,
-        "HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        format!("HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            .as_bytes(),
     )
+}
+
+fn finish_http_response(client: &mut ClientStream, response: &[u8]) -> io::Result<()> {
+    client.write_all(response)?;
+    client.flush()?;
+    client.shutdown_write()
 }
 
 fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
