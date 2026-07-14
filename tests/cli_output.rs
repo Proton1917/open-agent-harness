@@ -40,6 +40,28 @@ fn print_text_json_and_stream_json_contracts_are_stable() {
     assert_eq!(lines[2]["type"], "assistant");
     assert_eq!(lines[3]["type"], "result");
     assert_eq!(lines[3]["result"], "stream response");
+
+    let chat_stream = run_cli_for_api(
+        "stream-json",
+        chat_reasoning_sse_response("visible chat"),
+        "/v1/chat/completions",
+        "chat-completions",
+    );
+    assert!(!chat_stream.contains("private-raw-reasoning"));
+    assert!(!chat_stream.contains("private-reasoning-details"));
+    assert!(!chat_stream.contains("provider_state"));
+    let lines = chat_stream
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let assistant = lines
+        .iter()
+        .find(|line| line["type"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        assistant["message"]["content"],
+        serde_json::json!([{"type":"text","text":"visible chat"}])
+    );
 }
 
 #[test]
@@ -675,6 +697,10 @@ fn stream_json_control_accepts_dont_ask_permission_mode() {
 }
 
 fn run_cli(format: &str, response: String) -> String {
+    run_cli_for_api(format, response, "/v1/messages", "messages")
+}
+
+fn run_cli_for_api(format: &str, response: String, api_path: &str, api_format: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -704,7 +730,9 @@ fn run_cli(format: &str, response: String) -> String {
             "verify output",
         ])
         .env("HARNESS_BASE_URL", format!("http://{address}"))
-        .env("HARNESS_MESSAGES_PATH", "/v1/messages")
+        .env("HARNESS_API_PATH", api_path)
+        .env("HARNESS_API_FORMAT", api_format)
+        .env_remove("HARNESS_MESSAGES_PATH")
         .env_remove("HARNESS_API_KEY")
         .env_remove("HARNESS_AUTH_TOKEN")
         .output()
@@ -745,6 +773,28 @@ fn sse_response(text: &str) -> String {
     .into_iter()
     .map(|value| format!("data: {value}\n\n"))
     .collect()
+}
+
+fn chat_reasoning_sse_response(text: &str) -> String {
+    let events = [
+        serde_json::json!({
+            "id":"chat-private","model":"router/alias",
+            "choices":[{"index":0,"delta":{
+                "role":"assistant","content":text,
+                "reasoning":"private-raw-reasoning",
+                "reasoning_details":[{"type":"reasoning.encrypted","data":"private-reasoning-details"}]
+            },"finish_reason":"stop"}]
+        }),
+        serde_json::json!({
+            "id":"chat-private","model":"provider/model",
+            "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1}
+        }),
+    ]
+    .into_iter()
+    .map(|value| format!("data: {value}\n\n"))
+    .collect::<String>();
+    format!("{events}data: [DONE]\n\n")
 }
 
 fn read_request(stream: &mut std::net::TcpStream) {

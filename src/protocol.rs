@@ -549,6 +549,7 @@ fn chat_assistant_message(content: &Value) -> Result<Value> {
     let mut text = String::new();
     let mut calls = Vec::new();
     let mut reasoning_details = Vec::new();
+    let mut reasoning = None;
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
@@ -556,6 +557,11 @@ fn chat_assistant_message(content: &Value) -> Result<Value> {
                 if block.get("format").and_then(Value::as_str) == Some("chat-completions") =>
             {
                 append_reasoning_details(&mut reasoning_details, block.get("reasoning_details"))?;
+                set_consistent_optional_string(
+                    &mut reasoning,
+                    optional_reasoning_value(block)?,
+                    "Chat reasoning",
+                )?;
             }
             Some("tool_use") => {
                 let id = block
@@ -592,6 +598,8 @@ fn chat_assistant_message(content: &Value) -> Result<Value> {
     }
     if !reasoning_details.is_empty() {
         message.insert("reasoning_details".into(), Value::Array(reasoning_details));
+    } else if let Some(reasoning) = reasoning {
+        message.insert("reasoning".into(), Value::String(reasoning));
     }
     Ok(Value::Object(message))
 }
@@ -610,12 +618,55 @@ fn append_reasoning_details(output: &mut Vec<Value>, value: Option<&Value>) -> R
     }
 }
 
-fn chat_provider_state(reasoning_details: Vec<Value>) -> Value {
-    json!({
-        "type":"provider_state",
-        "format":"chat-completions",
-        "reasoning_details":reasoning_details,
-    })
+fn optional_reasoning_string(value: &Map<String, Value>) -> Result<Option<&str>> {
+    let reasoning = optional_string_or_null(value.get("reasoning"), "reasoning")?;
+    let alias = optional_string_or_null(value.get("reasoning_content"), "reasoning_content")?;
+    if let (Some(reasoning), Some(alias)) = (reasoning, alias) {
+        if reasoning != alias {
+            bail!("reasoning 与 reasoning_content 内容冲突")
+        }
+    }
+    Ok(reasoning.or(alias))
+}
+
+fn optional_reasoning_value(value: &Value) -> Result<Option<&str>> {
+    let value = value
+        .as_object()
+        .context("Chat provider_state 必须是 object")?;
+    optional_reasoning_string(value)
+}
+
+fn optional_string_or_null<'a>(value: Option<&'a Value>, field: &str) -> Result<Option<&'a str>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => bail!("{field} 必须是 string 或 null"),
+    }
+}
+
+fn set_consistent_optional_string(
+    target: &mut Option<String>,
+    value: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    set_consistent_string(target, value, label)
+}
+
+fn chat_provider_state(reasoning_details: Vec<Value>, reasoning: Option<String>) -> Value {
+    let mut state = Map::from_iter([
+        ("type".into(), Value::String("provider_state".into())),
+        ("format".into(), Value::String("chat-completions".into())),
+    ]);
+    if !reasoning_details.is_empty() {
+        state.insert("reasoning_details".into(), Value::Array(reasoning_details));
+    }
+    if let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) {
+        state.insert("reasoning".into(), Value::String(reasoning));
+    }
+    Value::Object(state)
 }
 
 fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
@@ -1029,8 +1080,9 @@ fn parse_chat_response(value: &Value) -> Result<ModelResponse> {
     let mut content = Vec::new();
     let mut reasoning_details = Vec::new();
     append_reasoning_details(&mut reasoning_details, message.get("reasoning_details"))?;
-    if !reasoning_details.is_empty() {
-        content.push(chat_provider_state(reasoning_details));
+    let reasoning = optional_reasoning_string(message)?.map(ToOwned::to_owned);
+    if !reasoning_details.is_empty() || reasoning.is_some() {
+        content.push(chat_provider_state(reasoning_details, reasoning));
     }
     append_chat_content(&mut content, message.get("content"))?;
     append_chat_tool_calls(&mut content, message.get("tool_calls"))?;
@@ -1199,14 +1251,15 @@ fn append_response_item(content: &mut Vec<Value>, item: &Value) -> Result<()> {
                 "type":"tool_use","id":call_id,"name":name,"input":input,
             }));
         }
-        Some("reasoning")
+        Some("reasoning") => {
+            validate_response_reasoning(item, true)?;
             if item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
-                .is_some_and(|encrypted| !encrypted.is_empty()) =>
-        {
-            require_nonempty_string(item, "id", "Responses reasoning item")?;
-            content.push(response_provider_state(item));
+                .is_some_and(|encrypted| !encrypted.is_empty())
+            {
+                content.push(response_reasoning_provider_state(item));
+            }
         }
         _ => {}
     }
@@ -1219,6 +1272,14 @@ fn response_provider_state(item: &Value) -> Value {
         "format":"responses",
         "item":item,
     })
+}
+
+fn response_reasoning_provider_state(item: &Value) -> Value {
+    let mut item = item.clone();
+    if let Some(item) = item.as_object_mut() {
+        item.remove("content");
+    }
+    response_provider_state(&item)
 }
 
 fn response_message_text(item: &Value) -> String {
@@ -1248,6 +1309,61 @@ fn validate_response_message(item: &Value) -> Result<()> {
         .context("Responses message 缺少 content array")?;
     if parts.len() > MAX_CONTENT_BLOCKS {
         bail!("Responses message content 超过 {MAX_CONTENT_BLOCKS} 个限制")
+    }
+    for part in parts {
+        let part_type = require_nonempty_string(part, "type", "Responses message content part")?;
+        if part_type == "reasoning_text" {
+            bail!("Responses message 不得包含 reasoning_text content part")
+        }
+        let _ = response_part_text(part, part_type)?;
+    }
+    Ok(())
+}
+
+fn validate_response_reasoning(item: &Value, completed: bool) -> Result<()> {
+    require_nonempty_string(item, "id", "Responses reasoning item")?;
+    match item.get("status") {
+        None => {}
+        Some(Value::String(status))
+            if (completed && status == "completed") || (!completed && status == "in_progress") => {}
+        Some(_) if completed => {
+            bail!("Responses completed reasoning status 若存在必须是 completed")
+        }
+        Some(_) => bail!("Responses added reasoning status 若存在必须是 in_progress"),
+    }
+    match item.get("content") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(parts)) => {
+            if parts.len() > MAX_CONTENT_BLOCKS {
+                bail!("Responses reasoning content 超过 {MAX_CONTENT_BLOCKS} 个限制")
+            }
+            for part in parts {
+                let part_type =
+                    require_nonempty_string(part, "type", "Responses reasoning content part")?;
+                let _ = response_reasoning_part_text(part, part_type)?;
+            }
+        }
+        Some(_) => bail!("Responses reasoning content 必须是 array 或 null"),
+    }
+    if let Some(summary) = item.get("summary") {
+        let summary = summary
+            .as_array()
+            .context("Responses reasoning summary 必须是 array")?;
+        if summary.len() > MAX_CONTENT_BLOCKS {
+            bail!("Responses reasoning summary 超过 {MAX_CONTENT_BLOCKS} 个限制")
+        }
+    }
+    if item
+        .get("encrypted_content")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        bail!("Responses reasoning encrypted_content 必须是 string 或 null")
+    }
+    if item
+        .get("format")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        bail!("Responses reasoning format 必须是 string 或 null")
     }
     Ok(())
 }
@@ -1689,8 +1805,11 @@ pub(crate) struct ChatStream {
     text: String,
     calls: BTreeMap<usize, ChatToolCall>,
     reasoning_details: Vec<Value>,
+    reasoning: String,
     stop_reason: Option<String>,
+    raw_stop_reason: Option<String>,
     usage: Option<Usage>,
+    terminal_usage_replay_seen: bool,
     saw_modern_calls: bool,
     saw_legacy_call: bool,
     done: bool,
@@ -1707,25 +1826,37 @@ impl ChatStream {
         if self.done {
             bail!("[DONE] 之后收到额外 Chat Completions 事件")
         }
+        if self.terminal_usage_replay_seen {
+            bail!("Chat terminal usage choice 之后收到额外 JSON 事件")
+        }
         common_response_error(&event)?;
         if let Some(id) = event.get("id").and_then(Value::as_str) {
             set_consistent_string(&mut self.id, id, "Chat response id")?;
         }
-        if let Some(usage) = chat_usage(event.get("usage")) {
-            self.usage = Some(usage);
-        }
         let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            merge_chat_usage(&mut self.usage, event.get("usage"));
             return Ok(false);
         };
         if choices.is_empty() {
+            merge_chat_usage(&mut self.usage, event.get("usage"));
             return Ok(false);
         }
         if choices.len() != 1 {
             bail!("Chat Completions stream 必须只包含一个 choice")
         }
         if self.stop_reason.is_some() {
-            bail!("Chat finish_reason 之后收到额外 choice")
+            validate_repeated_chat_terminal_choice(
+                &choices[0],
+                self.raw_stop_reason
+                    .as_deref()
+                    .context("Chat terminal state 缺少原始 finish_reason")?,
+                event.get("usage"),
+            )?;
+            merge_chat_usage(&mut self.usage, event.get("usage"));
+            self.terminal_usage_replay_seen = true;
+            return Ok(false);
         }
+        merge_chat_usage(&mut self.usage, event.get("usage"));
         let choice = &choices[0];
         if choice.get("index").and_then(Value::as_u64) != Some(0) {
             bail!("Chat Completions stream choice index 必须是 0")
@@ -1767,6 +1898,9 @@ impl ChatStream {
                 }
             }
             append_reasoning_details(&mut self.reasoning_details, delta.get("reasoning_details"))?;
+            if let Some(reasoning) = optional_reasoning_string(delta)? {
+                self.reasoning.push_str(reasoning);
+            }
             if let Some(calls) = delta.get("tool_calls") {
                 let calls = calls
                     .as_array()
@@ -1841,6 +1975,7 @@ impl ChatStream {
             if reason == "error" {
                 bail!("Chat Completions stream 以 error 结束")
             }
+            self.raw_stop_reason = Some(reason.to_owned());
             self.stop_reason = Some(canonical_stop_reason(reason));
         }
         Ok(streamed)
@@ -1862,8 +1997,11 @@ impl ChatStream {
             bail!("Chat Completions stream 缺少 finish_reason")
         }
         let mut content = Vec::new();
-        if !self.reasoning_details.is_empty() {
-            content.push(chat_provider_state(self.reasoning_details));
+        if !self.reasoning_details.is_empty() || !self.reasoning.is_empty() {
+            content.push(chat_provider_state(
+                self.reasoning_details,
+                (!self.reasoning.is_empty()).then_some(self.reasoning),
+            ));
         }
         if !self.text.is_empty() {
             content.push(json!({"type":"text","text":self.text}));
@@ -1904,6 +2042,133 @@ impl ChatStream {
     }
 }
 
+fn validate_repeated_chat_terminal_choice(
+    choice: &Value,
+    raw_stop_reason: &str,
+    usage: Option<&Value>,
+) -> Result<()> {
+    strict_chat_terminal_usage(usage)?;
+    let choice = choice
+        .as_object()
+        .context("Chat terminal usage choice 必须是 object")?;
+    if choice.get("index").and_then(Value::as_u64) != Some(0) {
+        bail!("Chat terminal usage choice index 必须是 0")
+    }
+    for field in choice.keys() {
+        if !matches!(
+            field.as_str(),
+            "index" | "delta" | "finish_reason" | "native_finish_reason" | "logprobs"
+        ) {
+            bail!("Chat terminal usage choice 包含不支持的字段 {field}")
+        }
+    }
+    if choice.contains_key("error") {
+        bail!("Chat terminal usage choice 不得包含 error 字段")
+    }
+    let delta = choice
+        .get("delta")
+        .and_then(Value::as_object)
+        .context("Chat terminal usage choice 必须包含 delta object")?;
+    if delta.len() != 2
+        || delta.get("role").and_then(Value::as_str) != Some("assistant")
+        || delta.get("content").and_then(Value::as_str) != Some("")
+    {
+        bail!("Chat terminal usage choice delta 必须严格为空 assistant 文本")
+    }
+    let repeated_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .context("Chat terminal usage choice 缺少 string finish_reason")?;
+    if repeated_reason != raw_stop_reason {
+        bail!("Chat terminal usage choice 改变了 finish_reason")
+    }
+    if choice
+        .get("native_finish_reason")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        bail!("Chat terminal usage choice native_finish_reason 必须是 string 或 null")
+    }
+    if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+        bail!("Chat terminal usage choice logprobs 若存在必须是 null")
+    }
+    Ok(())
+}
+
+fn strict_chat_terminal_usage(value: Option<&Value>) -> Result<()> {
+    let usage = value
+        .and_then(Value::as_object)
+        .context("Chat terminal usage choice 缺少 usage object")?;
+    let _ = strict_usage_counter(usage, "prompt_tokens", true)?;
+    let _ = strict_usage_counter(usage, "completion_tokens", true)?;
+    let _ = strict_usage_counter(usage, "total_tokens", false)?;
+    if let Some(details) = usage
+        .get("prompt_tokens_details")
+        .filter(|details| !details.is_null())
+    {
+        let details = details
+            .as_object()
+            .context("Chat usage prompt_tokens_details 必须是 object")?;
+        let _ = strict_usage_counter(details, "cache_write_tokens", false)?;
+        let _ = strict_usage_counter(details, "cached_tokens", false)?;
+    }
+    if let Some(details) = usage
+        .get("completion_tokens_details")
+        .filter(|details| !details.is_null())
+    {
+        let details = details
+            .as_object()
+            .context("Chat usage completion_tokens_details 必须是 object")?;
+        let _ = strict_usage_counter(details, "reasoning_tokens", false)?;
+    }
+    Ok(())
+}
+
+fn strict_usage_counter(
+    object: &Map<String, Value>,
+    field: &str,
+    required: bool,
+) -> Result<Option<u64>> {
+    match object.get(field) {
+        Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .with_context(|| format!("Chat usage {field} 必须是非负整数或 null")),
+        None if required => bail!("Chat usage 缺少 {field}"),
+        None => Ok(None),
+    }
+}
+
+fn merge_chat_usage(target: &mut Option<Usage>, value: Option<&Value>) {
+    let Some(value) = value.and_then(Value::as_object) else {
+        return;
+    };
+    let mut usage = target.clone().unwrap_or(Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+    if let Some(tokens) = value.get("prompt_tokens").and_then(Value::as_u64) {
+        usage.input_tokens = tokens;
+    }
+    if let Some(tokens) = value.get("completion_tokens").and_then(Value::as_u64) {
+        usage.output_tokens = tokens;
+    }
+    if let Some(details) = value
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object)
+    {
+        if let Some(tokens) = details.get("cache_write_tokens").and_then(Value::as_u64) {
+            usage.cache_creation_input_tokens = tokens;
+        }
+        if let Some(tokens) = details.get("cached_tokens").and_then(Value::as_u64) {
+            usage.cache_read_input_tokens = tokens;
+        }
+    }
+    *target = Some(usage);
+}
+
 #[derive(Default)]
 struct ResponseCall {
     call_id: Option<String>,
@@ -1912,11 +2177,26 @@ struct ResponseCall {
     arguments_done: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsePartOwner {
+    Message,
+    Reasoning,
+}
+
+impl ResponsePartOwner {
+    fn item_type(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
 struct ResponseContentPart {
+    owner: ResponsePartOwner,
     part_type: String,
     streamed: String,
-    output_text_done: Option<String>,
+    typed_done_text: Option<String>,
     content_part_done: bool,
     content_part_done_text: Option<String>,
 }
@@ -2002,7 +2282,7 @@ impl ResponsesStream {
             }
             "response.content_part.added" => {
                 let index = output_index(&event)?;
-                self.require_event_item(&event, index, "message")?;
+                let owner = self.require_content_item(&event, index)?;
                 self.require_open_item(index)?;
                 let content_index = content_index(&event)?;
                 let key = (index, content_index);
@@ -2013,25 +2293,39 @@ impl ResponsesStream {
                     .get("part")
                     .context("response.content_part.added 缺少 part")?;
                 let part_type = require_nonempty_string(part, "type", "Responses content part")?;
-                let initial = response_part_text(part, part_type)?.unwrap_or_default();
+                let initial =
+                    response_content_part_text(part, owner, part_type)?.unwrap_or_default();
                 self.content_parts.insert(
                     key,
                     ResponseContentPart {
+                        owner,
                         part_type: part_type.to_owned(),
                         streamed: initial.to_owned(),
-                        ..ResponseContentPart::default()
+                        typed_done_text: None,
+                        content_part_done: false,
+                        content_part_done_text: None,
                     },
                 );
-                if !initial.is_empty() {
+                if owner == ResponsePartOwner::Message && !initial.is_empty() {
                     if let Some(callback) = on_text_delta {
                         callback(initial);
                     }
                     return Ok(true);
                 }
             }
-            "response.output_text.delta" | "response.content_part.delta" => {
+            "response.output_text.delta"
+            | "response.content_part.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning.delta" => {
                 let index = output_index(&event)?;
-                self.require_event_item(&event, index, "message")?;
+                let owner = match event_type {
+                    "response.output_text.delta" => ResponsePartOwner::Message,
+                    "response.reasoning_text.delta" | "response.reasoning.delta" => {
+                        ResponsePartOwner::Reasoning
+                    }
+                    _ => self.require_content_item(&event, index)?,
+                };
+                self.require_event_item(&event, index, owner.item_type())?;
                 self.require_open_item(index)?;
                 let content_index = content_index(&event)?;
                 let text = event
@@ -2046,54 +2340,87 @@ impl ResponsesStream {
                             "Responses text delta 在 content_part.added 之前引用 ({index}, {content_index})"
                         )
                     })?;
-                if event_type == "response.output_text.delta"
-                    && !matches!(part.part_type.as_str(), "output_text" | "text")
-                {
-                    bail!("Responses output_text delta 引用了非 output_text part")
+                if part.owner != owner {
+                    bail!("Responses text delta 的 output item owner 与 added 冲突")
                 }
-                if response_part_field(&part.part_type).is_none() {
-                    bail!("Responses text delta 引用了非文本 content part")
+                match event_type {
+                    "response.output_text.delta"
+                        if !matches!(part.part_type.as_str(), "output_text" | "text") =>
+                    {
+                        bail!("Responses output_text delta 引用了非 output_text part")
+                    }
+                    "response.reasoning_text.delta" | "response.reasoning.delta"
+                        if part.part_type != "reasoning_text" =>
+                    {
+                        bail!("Responses reasoning_text delta 引用了非 reasoning_text part")
+                    }
+                    "response.content_part.delta"
+                        if !response_part_is_text(owner, &part.part_type) =>
+                    {
+                        bail!("Responses text delta 引用了非文本 content part")
+                    }
+                    _ => {}
                 }
-                if part.output_text_done.is_some() || part.content_part_done {
+                if part.typed_done_text.is_some() || part.content_part_done {
                     bail!("Responses text delta 出现在 content part done 之后")
                 }
                 part.streamed.push_str(text);
-                if let Some(callback) = on_text_delta {
-                    callback(text);
+                if owner == ResponsePartOwner::Message {
+                    if let Some(callback) = on_text_delta {
+                        callback(text);
+                    }
+                    return Ok(!text.is_empty());
                 }
-                return Ok(!text.is_empty());
             }
-            "response.output_text.done" => {
+            "response.output_text.done"
+            | "response.reasoning_text.done"
+            | "response.reasoning.done" => {
                 let index = output_index(&event)?;
-                self.require_event_item(&event, index, "message")?;
+                let owner = match event_type {
+                    "response.output_text.done" => ResponsePartOwner::Message,
+                    "response.reasoning_text.done" | "response.reasoning.done" => {
+                        ResponsePartOwner::Reasoning
+                    }
+                    _ => unreachable!(),
+                };
+                self.require_event_item(&event, index, owner.item_type())?;
                 self.require_open_item(index)?;
                 let content_index = content_index(&event)?;
                 let text = event
                     .get("text")
                     .and_then(Value::as_str)
-                    .context("response.output_text.done 缺少 text")?;
+                    .with_context(|| format!("{event_type} 缺少 text"))?;
                 let part = self
                     .content_parts
                     .get_mut(&(index, content_index))
                     .with_context(|| {
                         format!(
-                            "response.output_text.done 在 content_part.added 之前引用 ({index}, {content_index})"
+                            "{event_type} 在 content_part.added 之前引用 ({index}, {content_index})"
                         )
                     })?;
-                if !matches!(part.part_type.as_str(), "output_text" | "text") {
-                    bail!("response.output_text.done 引用了非 output_text part")
+                if part.owner != owner {
+                    bail!("{event_type} 的 output item owner 与 added 冲突")
                 }
-                if part.output_text_done.is_some() {
-                    bail!("Responses content part 包含重复 output_text.done")
+                if (owner == ResponsePartOwner::Message
+                    && !matches!(part.part_type.as_str(), "output_text" | "text"))
+                    || (owner == ResponsePartOwner::Reasoning && part.part_type != "reasoning_text")
+                {
+                    bail!("{event_type} 引用了错误类型的 content part")
+                }
+                if part.typed_done_text.is_some() {
+                    bail!("Responses content part 包含重复 typed text done")
+                }
+                if part.content_part_done {
+                    bail!("{event_type} 出现在 content_part.done 之后")
                 }
                 if part.streamed != text {
-                    bail!("response.output_text.done 与 text delta 不一致")
+                    bail!("{event_type} 与 text delta 不一致")
                 }
-                part.output_text_done = Some(text.to_owned());
+                part.typed_done_text = Some(text.to_owned());
             }
             "response.content_part.done" => {
                 let index = output_index(&event)?;
-                self.require_event_item(&event, index, "message")?;
+                let owner = self.require_content_item(&event, index)?;
                 self.require_open_item(index)?;
                 let content_index = content_index(&event)?;
                 let done_part = event
@@ -2112,16 +2439,19 @@ impl ResponsesStream {
                 if part.content_part_done {
                     bail!("Responses content part 包含重复 content_part.done")
                 }
+                if part.owner != owner {
+                    bail!("response.content_part.done 的 output item owner 与 added 冲突")
+                }
                 if part.part_type != done_type {
                     bail!("response.content_part.done 的 part type 与 added 冲突")
                 }
-                let done_text = response_part_text(done_part, done_type)?;
+                let done_text = response_content_part_text(done_part, owner, done_type)?;
                 if let Some(done_text) = done_text {
                     if part.streamed != done_text {
                         bail!("response.content_part.done 与 text delta 不一致")
                     }
                     if part
-                        .output_text_done
+                        .typed_done_text
                         .as_deref()
                         .is_some_and(|snapshot| snapshot != done_text)
                     {
@@ -2249,6 +2579,19 @@ impl ResponsesStream {
         Ok(())
     }
 
+    fn require_content_item(&self, event: &Value, index: usize) -> Result<ResponsePartOwner> {
+        let item = self.items.get(&index).with_context(|| {
+            format!("Responses event 在 output_item.added 前引用 index {index}")
+        })?;
+        let owner = match item.get("type").and_then(Value::as_str) {
+            Some("message") => ResponsePartOwner::Message,
+            Some("reasoning") => ResponsePartOwner::Reasoning,
+            _ => bail!("Responses content event 引用了错误类型的 output item"),
+        };
+        self.require_event_item(event, index, owner.item_type())?;
+        Ok(owner)
+    }
+
     fn require_open_item(&self, index: usize) -> Result<()> {
         if self.completed_items.contains(&index) {
             bail!("Responses content event 出现在 output_item.done 之后")
@@ -2331,7 +2674,10 @@ impl ResponsesStream {
                 }
             }
             "reasoning" => {
-                require_nonempty_string(item, "id", "Responses reasoning item")?;
+                validate_response_reasoning(item, completed)?;
+                if completed {
+                    self.validate_completed_reasoning_parts(index, item)?;
+                }
             }
             _ => {}
         }
@@ -2353,6 +2699,9 @@ impl ResponsesStream {
             .any(|(_, part)| response_part_field(&part.part_type).is_some());
         let mut streamed_all = String::new();
         for ((_, content_index), streamed) in streamed_parts {
+            if streamed.owner != ResponsePartOwner::Message {
+                bail!("Responses message output 包含 reasoning content part")
+            }
             let complete_part = completed.get(*content_index).with_context(|| {
                 format!("Responses completed message 缺少 streamed content_index {content_index}")
             })?;
@@ -2370,7 +2719,7 @@ impl ResponsesStream {
                     )
                 }
                 if streamed
-                    .output_text_done
+                    .typed_done_text
                     .as_deref()
                     .is_some_and(|snapshot| snapshot != complete_text)
                     || streamed
@@ -2408,6 +2757,57 @@ impl ResponsesStream {
             }
             if streamed_all != completed_all {
                 bail!("Responses completed message 与 streamed text 整体不一致")
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_completed_reasoning_parts(&self, output_index: usize, item: &Value) -> Result<()> {
+        let streamed_parts = self
+            .content_parts
+            .range((output_index, 0)..=(output_index, MAX_CONTENT_BLOCKS - 1))
+            .collect::<Vec<_>>();
+        if streamed_parts.is_empty() {
+            return Ok(());
+        }
+        let completed = item
+            .get("content")
+            .and_then(Value::as_array)
+            .context("Responses completed reasoning 缺少 content array")?;
+        if completed.len() != streamed_parts.len() {
+            bail!("Responses completed reasoning 与 streamed content part 数量不一致")
+        }
+        for ((_, content_index), streamed) in streamed_parts {
+            if streamed.owner != ResponsePartOwner::Reasoning {
+                bail!("Responses reasoning output 包含 message content part")
+            }
+            let complete_part = completed.get(*content_index).with_context(|| {
+                format!("Responses completed reasoning 缺少 content_index {content_index}")
+            })?;
+            let complete_type = require_nonempty_string(
+                complete_part,
+                "type",
+                "Responses completed reasoning part",
+            )?;
+            if streamed.part_type != complete_type {
+                bail!(
+                    "Responses reasoning part ({output_index}, {content_index}) type 在 stream 中发生冲突"
+                )
+            }
+            let complete_text = response_reasoning_part_text(complete_part, complete_type)?;
+            if streamed.streamed != complete_text
+                || streamed
+                    .typed_done_text
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot != complete_text)
+                || streamed
+                    .content_part_done_text
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot != complete_text)
+            {
+                bail!(
+                    "Responses reasoning part ({output_index}, {content_index}) 与 streamed snapshot 不一致"
+                )
             }
         }
         Ok(())
@@ -2508,6 +2908,10 @@ fn response_event_requires_created(event_type: &str) -> bool {
             | "response.content_part.done"
             | "response.output_text.delta"
             | "response.output_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.reasoning.delta"
+            | "response.reasoning.done"
             | "response.function_call_arguments.delta"
             | "response.function_call_arguments.done"
             | "response.completed"
@@ -2541,6 +2945,38 @@ fn response_part_text<'a>(part: &'a Value, part_type: &str) -> Result<Option<&'a
         .and_then(Value::as_str)
         .map(Some)
         .with_context(|| format!("Responses {part_type} content part 缺少 string {field}"))
+}
+
+fn response_content_part_text<'a>(
+    part: &'a Value,
+    owner: ResponsePartOwner,
+    part_type: &str,
+) -> Result<Option<&'a str>> {
+    match owner {
+        ResponsePartOwner::Message => {
+            if part_type == "reasoning_text" {
+                bail!("Responses message 不得包含 reasoning_text content part")
+            }
+            response_part_text(part, part_type)
+        }
+        ResponsePartOwner::Reasoning => Ok(Some(response_reasoning_part_text(part, part_type)?)),
+    }
+}
+
+fn response_reasoning_part_text<'a>(part: &'a Value, part_type: &str) -> Result<&'a str> {
+    if part_type != "reasoning_text" {
+        bail!("Responses reasoning content 只接受 reasoning_text part")
+    }
+    part.get("text")
+        .and_then(Value::as_str)
+        .context("Responses reasoning_text part 缺少 string text")
+}
+
+fn response_part_is_text(owner: ResponsePartOwner, part_type: &str) -> bool {
+    match owner {
+        ResponsePartOwner::Message => response_part_field(part_type).is_some(),
+        ResponsePartOwner::Reasoning => part_type == "reasoning_text",
+    }
 }
 
 fn validate_terminal_response_item(index: usize, streamed: &Value, terminal: &Value) -> Result<()> {
@@ -2619,6 +3055,8 @@ fn validate_terminal_response_item(index: usize, streamed: &Value, terminal: &Va
             }
         }
         Some("reasoning") => {
+            validate_response_reasoning(streamed, true)?;
+            validate_response_reasoning(terminal, true)?;
             if streamed != terminal {
                 bail!("Responses terminal reasoning item {index} 与 streamed item 不一致")
             }
@@ -3448,7 +3886,9 @@ mod tests {
     #[test]
     fn responses_replay_preserves_required_item_identity_and_order() {
         let reasoning = json!({
-            "type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque"
+            "type":"reasoning","id":"rs-1","status":"completed","summary":[],
+            "encrypted_content":"opaque",
+            "content":[{"type":"reasoning_text","text":"private analysis"}]
         });
         let message = json!({
             "type":"message","id":"msg-1","status":"completed","role":"assistant",
@@ -3487,11 +3927,23 @@ mod tests {
         )
         .unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0], reasoning);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs-1");
+        assert_eq!(input[0]["encrypted_content"], "opaque");
+        assert!(input[0].get("content").is_none());
+        assert!(!body.to_string().contains("private analysis"));
         assert_eq!(input[1], message);
         assert_eq!(input[2], function_call);
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call-1");
+
+        let malformed_reasoning = json!({
+            "id":"resp-bad","status":"completed","output":[{
+                "type":"reasoning","id":"rs-bad","status":"completed","summary":[],
+                "content":[{"type":"output_text","text":"wrong owner"}]
+            }]
+        });
+        assert!(parse_response(ApiFormat::Responses, malformed_reasoning).is_err());
     }
 
     #[test]
@@ -3531,6 +3983,46 @@ mod tests {
         .unwrap();
         assert_eq!(body["messages"][1]["reasoning_details"], details);
         assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call-1");
+
+        let raw_response = parse_response(
+            ApiFormat::ChatCompletions,
+            json!({
+                "id":"chat-raw",
+                "choices":[{"index":0,"message":{
+                    "role":"assistant","content":null,
+                    "reasoning_content":"raw private state",
+                    "tool_calls":[{"id":"call-raw","type":"function","function":{
+                        "name":"Read","arguments":"{\"path\":\"b.txt\"}"
+                    }}]
+                },"finish_reason":"tool_calls"}]
+            }),
+        )
+        .unwrap();
+        let raw_body = encode_request(
+            ApiFormat::ChatCompletions,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &[Message::assistant(raw_response.content)],
+                tools: &[],
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(raw_body["messages"][1]["reasoning"], "raw private state");
+        assert!(raw_body["messages"][1].get("reasoning_details").is_none());
+
+        let conflicting_aliases = json!({
+            "id":"chat-conflict",
+            "choices":[{"index":0,"message":{
+                "role":"assistant","content":"answer",
+                "reasoning":"one","reasoning_content":"two"
+            },"finish_reason":"stop"}]
+        });
+        assert!(parse_response(ApiFormat::ChatCompletions, conflicting_aliases).is_err());
     }
 
     #[test]
@@ -3560,12 +4052,56 @@ mod tests {
                 None,
             )
             .unwrap();
+        stream
+            .apply(
+                json!({"id":"chat-1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":null}}),
+                None,
+            )
+            .unwrap();
         stream.mark_done().unwrap();
         let response = stream.finish().unwrap();
         assert_eq!(response.content[0]["text"], "hi there");
         assert_eq!(response.content[1]["input"]["path"], "a");
         assert_eq!(response.content[2]["input"]["pattern"], "*.rs");
-        assert_eq!(response.usage.unwrap().output_tokens, 9);
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 9);
+
+        let mut terminal_merge = StreamDecoder::new(ApiFormat::ChatCompletions).unwrap();
+        terminal_merge
+            .apply(
+                json!({
+                    "id":"chat-terminal-merge",
+                    "choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}],
+                    "usage":{
+                        "prompt_tokens":7,"completion_tokens":null,
+                        "prompt_tokens_details":{"cached_tokens":5}
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        terminal_merge
+            .apply(
+                json!({
+                    "id":"chat-terminal-merge",
+                    "choices":[{
+                        "index":0,"delta":{"role":"assistant","content":""},
+                        "finish_reason":"stop","native_finish_reason":"complete"
+                    }],
+                    "usage":{
+                        "prompt_tokens":null,"completion_tokens":9,
+                        "prompt_tokens_details":null,"completion_tokens_details":null
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        terminal_merge.mark_done().unwrap();
+        let usage = terminal_merge.finish().unwrap().usage.unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_read_input_tokens, 5);
     }
 
     #[test]
@@ -3614,6 +4150,45 @@ mod tests {
             body["messages"][1]["reasoning_details"],
             json!([first, second])
         );
+
+        let mut raw_stream = StreamDecoder::new(ApiFormat::ChatCompletions).unwrap();
+        raw_stream
+            .apply(
+                json!({"id":"chat-raw","choices":[{"index":0,"delta":{
+                    "reasoning":"raw ",
+                    "tool_calls":[{"index":0,"id":"call-raw","function":{
+                        "name":"Read","arguments":"{\"path\":"
+                    }}]
+                },"finish_reason":null}]}),
+                None,
+            )
+            .unwrap();
+        raw_stream
+            .apply(
+                json!({"id":"chat-raw","choices":[{"index":0,"delta":{
+                    "reasoning_content":"state",
+                    "tool_calls":[{"index":0,"function":{"arguments":"\"b.txt\"}"}}]
+                },"finish_reason":"tool_calls"}]}),
+                None,
+            )
+            .unwrap();
+        raw_stream.mark_done().unwrap();
+        let raw_response = raw_stream.finish().unwrap();
+        let raw_body = encode_request(
+            ApiFormat::ChatCompletions,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &[Message::assistant(raw_response.content)],
+                tools: &[],
+                stream: true,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(raw_body["messages"][1]["reasoning"], "raw state");
     }
 
     #[test]
@@ -3914,6 +4489,56 @@ mod tests {
         stream
             .apply(
                 json!({"type":"response.output_item.added","output_index":0,"item":{
+                    "type":"reasoning","id":"rs-parts","status":"in_progress","summary":[]
+                }}),
+                None,
+            )
+            .unwrap();
+        stream
+            .apply(
+                json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"rs-parts","part":{
+                    "type":"reasoning_text","text":""
+                }}),
+                None,
+            )
+            .unwrap();
+        let visible_deltas = std::sync::Mutex::new(Vec::new());
+        let capture = |text: &str| visible_deltas.lock().unwrap().push(text.to_owned());
+        assert!(
+            !stream
+                .apply(
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"item_id":"rs-parts","delta":"hidden"}),
+                    Some(&capture),
+                )
+                .unwrap()
+        );
+        assert!(visible_deltas.lock().unwrap().is_empty());
+        stream
+            .apply(
+                json!({"type":"response.reasoning_text.done","output_index":0,"content_index":0,"item_id":"rs-parts","text":"hidden"}),
+                None,
+            )
+            .unwrap();
+        stream
+            .apply(
+                json!({"type":"response.content_part.done","output_index":0,"content_index":0,"item_id":"rs-parts","part":{
+                    "type":"reasoning_text","text":"hidden"
+                }}),
+                None,
+            )
+            .unwrap();
+        stream
+            .apply(
+                json!({"type":"response.output_item.done","output_index":0,"item":{
+                    "type":"reasoning","id":"rs-parts","status":"completed","summary":[],
+                    "content":[{"type":"reasoning_text","text":"hidden"}]
+                }}),
+                None,
+            )
+            .unwrap();
+        stream
+            .apply(
+                json!({"type":"response.output_item.added","output_index":1,"item":{
                     "type":"message","id":"msg-parts","status":"in_progress",
                     "role":"assistant","content":[]
                 }}),
@@ -3923,7 +4548,7 @@ mod tests {
 
         stream
             .apply(
-                json!({"type":"response.content_part.added","output_index":0,"content_index":1,"item_id":"msg-parts","part":{
+                json!({"type":"response.content_part.added","output_index":1,"content_index":1,"item_id":"msg-parts","part":{
                     "type":"output_text","text":""
                 }}),
                 None,
@@ -3931,13 +4556,13 @@ mod tests {
             .unwrap();
         stream
             .apply(
-                json!({"type":"response.content_part.delta","output_index":0,"content_index":1,"item_id":"msg-parts","delta":" world"}),
+                json!({"type":"response.content_part.delta","output_index":1,"content_index":1,"item_id":"msg-parts","delta":" world"}),
                 None,
             )
             .unwrap();
         stream
             .apply(
-                json!({"type":"response.content_part.done","output_index":0,"content_index":1,"item_id":"msg-parts","part":{
+                json!({"type":"response.content_part.done","output_index":1,"content_index":1,"item_id":"msg-parts","part":{
                     "type":"output_text","text":" world"
                 }}),
                 None,
@@ -3946,7 +4571,7 @@ mod tests {
 
         stream
             .apply(
-                json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"msg-parts","part":{
+                json!({"type":"response.content_part.added","output_index":1,"content_index":0,"item_id":"msg-parts","part":{
                     "type":"output_text","text":""
                 }}),
                 None,
@@ -3954,19 +4579,19 @@ mod tests {
             .unwrap();
         stream
             .apply(
-                json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg-parts","delta":"Hello"}),
+                json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"item_id":"msg-parts","delta":"Hello"}),
                 None,
             )
             .unwrap();
         stream
             .apply(
-                json!({"type":"response.output_text.done","output_index":0,"content_index":0,"item_id":"msg-parts","text":"Hello"}),
+                json!({"type":"response.output_text.done","output_index":1,"content_index":0,"item_id":"msg-parts","text":"Hello"}),
                 None,
             )
             .unwrap();
         stream
             .apply(
-                json!({"type":"response.output_item.done","output_index":0,"item":{
+                json!({"type":"response.output_item.done","output_index":1,"item":{
                     "type":"message","id":"msg-parts","status":"completed","role":"assistant",
                     "content":[
                         {"type":"output_text","text":"Hello"},
@@ -3992,6 +4617,11 @@ mod tests {
                 .iter()
                 .any(|block| block["type"] == "text" && block["text"] == "Hello world")
         );
+        assert!(
+            !serde_json::to_string(&response.content)
+                .unwrap()
+                .contains("hidden")
+        );
     }
 
     #[test]
@@ -4011,6 +4641,27 @@ mod tests {
                     json!({"type":"response.output_item.added","output_index":0,"item":{
                         "type":"message","id":"msg-parts","status":"in_progress",
                         "role":"assistant","content":[]
+                    }}),
+                    None,
+                )
+                .unwrap();
+            stream
+        }
+
+        fn reasoning_stream() -> StreamDecoder {
+            let mut stream = StreamDecoder::new(ApiFormat::Responses).unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.created","response":{
+                        "id":"resp-reasoning","status":"in_progress"
+                    }}),
+                    None,
+                )
+                .unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.output_item.added","output_index":0,"item":{
+                        "type":"reasoning","id":"rs-reasoning","status":"in_progress","summary":[]
                     }}),
                     None,
                 )
@@ -4078,6 +4729,56 @@ mod tests {
                 )
                 .is_err()
         );
+
+        let mut reasoning_on_message = message_stream();
+        assert!(
+            reasoning_on_message
+                .apply(
+                    json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{
+                        "type":"reasoning_text","text":""
+                    }}),
+                    None,
+                )
+                .is_err()
+        );
+
+        let mut output_on_reasoning = reasoning_stream();
+        assert!(
+            output_on_reasoning
+                .apply(
+                    json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{
+                        "type":"output_text","text":""
+                    }}),
+                    None,
+                )
+                .is_err()
+        );
+
+        let mut reasoning_done_order = reasoning_stream();
+        reasoning_done_order
+            .apply(
+                json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{
+                    "type":"reasoning_text","text":"hidden"
+                }}),
+                None,
+            )
+            .unwrap();
+        reasoning_done_order
+            .apply(
+                json!({"type":"response.content_part.done","output_index":0,"content_index":0,"part":{
+                    "type":"reasoning_text","text":"hidden"
+                }}),
+                None,
+            )
+            .unwrap();
+        assert!(
+            reasoning_done_order
+                .apply(
+                    json!({"type":"response.reasoning_text.done","output_index":0,"content_index":0,"text":"hidden"}),
+                    None,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -4112,6 +4813,41 @@ mod tests {
             stream
                 .apply(
                     json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":text}),
+                    None,
+                )
+                .unwrap();
+            stream
+        }
+
+        fn stream_with_reasoning(text: &str) -> StreamDecoder {
+            let mut stream = StreamDecoder::new(ApiFormat::Responses).unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.created","response":{
+                        "id":"resp-reasoning","status":"in_progress"
+                    }}),
+                    None,
+                )
+                .unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.output_item.added","output_index":0,"item":{
+                        "type":"reasoning","id":"rs-reasoning","status":"in_progress","summary":[]
+                    }}),
+                    None,
+                )
+                .unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{
+                        "type":"reasoning_text","text":""
+                    }}),
+                    None,
+                )
+                .unwrap();
+            stream
+                .apply(
+                    json!({"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":text}),
                     None,
                 )
                 .unwrap();
@@ -4168,6 +4904,35 @@ mod tests {
                             {"type":"output_text","text":"hello"},
                             {"type":"output_text","text":" unstreamed"}
                         ]
+                    }}),
+                    None,
+                )
+                .is_err()
+        );
+
+        let mut reasoning_done_conflict = stream_with_reasoning("hidden");
+        assert!(
+            reasoning_done_conflict
+                .apply(
+                    json!({"type":"response.reasoning_text.done","output_index":0,"content_index":0,"text":"different"}),
+                    None,
+                )
+                .is_err()
+        );
+
+        let mut reasoning_item_conflict = stream_with_reasoning("hidden");
+        reasoning_item_conflict
+            .apply(
+                json!({"type":"response.reasoning_text.done","output_index":0,"content_index":0,"text":"hidden"}),
+                None,
+            )
+            .unwrap();
+        assert!(
+            reasoning_item_conflict
+                .apply(
+                    json!({"type":"response.output_item.done","output_index":0,"item":{
+                        "type":"reasoning","id":"rs-reasoning","status":"completed","summary":[],
+                        "content":[{"type":"reasoning_text","text":"different"}]
                     }}),
                     None,
                 )

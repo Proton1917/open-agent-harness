@@ -11,7 +11,7 @@ use open_agent_harness::{
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
     protocol::{ApiFormat, ChatTokensField},
-    query::{QueryEngine, QueryOptions},
+    query::{QueryEngine, QueryEvent, QueryOptions},
     tools::{ToolContext, ToolRegistry},
     types::Message,
 };
@@ -49,6 +49,11 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
         endpoint(address, "/v1/chat/completions", ApiFormat::Auto, true),
         temp.path(),
     );
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emitted_sink = emitted.clone();
+    engine.set_event_sink(Some(Arc::new(move |event| {
+        emitted_sink.lock().unwrap().push(event.clone());
+    })));
 
     let result = engine.run_turn("read fixture".into()).await.unwrap();
     engine.shutdown().await;
@@ -56,6 +61,19 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
 
     assert_eq!(result.text, "chat complete");
     assert!(result.streamed_text);
+    assert!(
+        !serde_json::to_string(&result.new_messages)
+            .unwrap()
+            .contains("raw private state")
+    );
+    let emitted = emitted.lock().unwrap();
+    assert!(emitted.iter().any(|event| matches!(
+        event,
+        QueryEvent::AssistantMessage { content }
+            if content.iter().any(|block| block["type"] == "tool_use")
+    )));
+    assert!(!format!("{emitted:?}").contains("raw private state"));
+    assert!(!format!("{emitted:?}").contains("provider_state"));
     assert_eq!(engine.usage.input_tokens, 11);
     assert_eq!(engine.usage.output_tokens, 7);
     let requests = requests.lock().unwrap();
@@ -88,6 +106,12 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
     assert!(second_messages.iter().any(|message| {
         message["role"] == "assistant" && message["tool_calls"][0]["function"]["name"] == "Read"
     }));
+    let assistant = second_messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant["reasoning"], "raw private state");
+    assert!(assistant.get("reasoning_content").is_none());
     assert!(second_messages.iter().any(|message| {
         message["role"] == "tool"
             && message["tool_call_id"] == "call-read"
@@ -159,6 +183,8 @@ async fn responses_round_trips_stateless_reasoning_and_function_outputs() {
         .find(|item| item["type"] == "reasoning")
         .unwrap();
     assert_eq!(reasoning["encrypted_content"], "opaque-test-state");
+    assert!(reasoning.get("content").is_none());
+    assert!(!requests[1].body.to_string().contains("private analysis"));
     let function_call = second_input
         .iter()
         .find(|item| {
@@ -437,14 +463,23 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
 }
 
 fn chat_tool_stream() -> String {
-    let first = json!({"id":"chat-tool","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
+    let first = json!({"id":"chat-tool","model":"openrouter/router-a","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"raw ","tool_calls":[{
         "index":0,"id":"call-read","type":"function","function":{"name":"Read","arguments":"{\"file_path\":"}
     }]},"finish_reason":null}]});
-    let second = json!({"id":"chat-tool","choices":[{"index":0,"delta":{"tool_calls":[{
+    let second = json!({"id":"chat-tool","model":"actual/provider-b","choices":[{"index":0,"delta":{"reasoning_content":"private state","tool_calls":[{
         "index":0,"function":{"arguments":"\"fixture.txt\"}"}
     }]},"finish_reason":"tool_calls"}]});
-    let usage =
-        json!({"id":"chat-tool","choices":[],"usage":{"prompt_tokens":null,"completion_tokens":3}});
+    let usage = json!({
+        "id":"chat-tool",
+        "model":"actual/provider-c",
+        "choices":[{
+            "index":0,
+            "delta":{"role":"assistant","content":""},
+            "finish_reason":"tool_calls",
+            "native_finish_reason":"tool_use"
+        }],
+        "usage":{"prompt_tokens":null,"completion_tokens":3}
+    });
     format!(
         ": OPENROUTER PROCESSING\r\n\r\n{}{}{}data: [DONE]\n\n",
         chat_event(first),
@@ -455,8 +490,16 @@ fn chat_tool_stream() -> String {
 
 fn chat_text_stream() -> String {
     let delta = json!({"id":"chat-text","choices":[{"index":0,"delta":{"content":"chat complete"},"finish_reason":"stop"}]});
-    let usage =
-        json!({"id":"chat-text","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}});
+    let usage = json!({
+        "id":"chat-text",
+        "choices":[{
+            "index":0,
+            "delta":{"content":"","role":"assistant"},
+            "finish_reason":"stop",
+            "native_finish_reason":"stop"
+        }],
+        "usage":{"prompt_tokens":11,"completion_tokens":4}
+    });
     format!("{}{}data: [DONE]\n\n", chat_event(delta), chat_event(usage))
 }
 
@@ -479,10 +522,20 @@ fn responses_tool_stream() -> String {
     let events = [
         json!({"type":"response.created","response":{"id":"resp-tool","status":"in_progress"}}),
         json!({"type":"response.output_item.added","output_index":0,"item":{
-            "type":"reasoning","id":"rs-test","summary":[],"encrypted_content":"opaque-test-state"
+            "type":"reasoning","id":"rs-test","status":"in_progress","summary":[]
+        }}),
+        json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"rs-test","part":{
+            "type":"reasoning_text","text":""
+        }}),
+        json!({"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"item_id":"rs-test","delta":"private analysis"}),
+        json!({"type":"response.reasoning_text.done","output_index":0,"content_index":0,"item_id":"rs-test","text":"private analysis"}),
+        json!({"type":"response.content_part.done","output_index":0,"content_index":0,"item_id":"rs-test","part":{
+            "type":"reasoning_text","text":"private analysis"
         }}),
         json!({"type":"response.output_item.done","output_index":0,"item":{
-            "type":"reasoning","id":"rs-test","summary":[],"encrypted_content":"opaque-test-state"
+            "type":"reasoning","id":"rs-test","status":"completed","summary":[],
+            "format":"unknown","encrypted_content":"opaque-test-state",
+            "content":[{"type":"reasoning_text","text":"private analysis"}]
         }}),
         json!({"type":"response.output_item.added","output_index":1,"item":{
             "type":"function_call","id":"fc-test","call_id":"call-read","name":"Read","arguments":"","status":"in_progress"
@@ -509,13 +562,28 @@ fn responses_text_stream() -> String {
     let events = [
         json!({"type":"response.created","response":{"id":"resp-text","status":"in_progress"}}),
         json!({"type":"response.output_item.added","output_index":0,"item":{
+            "type":"reasoning","id":"rs-text","status":"in_progress","summary":[]
+        }}),
+        json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"rs-text","part":{
+            "type":"reasoning_text","text":""
+        }}),
+        json!({"type":"response.reasoning.delta","output_index":0,"content_index":0,"item_id":"rs-text","delta":"hidden"}),
+        json!({"type":"response.reasoning.done","output_index":0,"content_index":0,"item_id":"rs-text","text":"hidden"}),
+        json!({"type":"response.content_part.done","output_index":0,"content_index":0,"item_id":"rs-text","part":{
+            "type":"reasoning_text","text":"hidden"
+        }}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{
+            "type":"reasoning","id":"rs-text","status":"completed","summary":[],"format":"unknown",
+            "content":[{"type":"reasoning_text","text":"hidden"}]
+        }}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{
             "type":"message","id":"msg-text","role":"assistant","status":"in_progress","content":[]
         }}),
-        json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{
+        json!({"type":"response.content_part.added","output_index":1,"content_index":0,"part":{
             "type":"output_text","text":""
         }}),
-        json!({"type":"response.content_part.delta","output_index":0,"content_index":0,"delta":"responses complete"}),
-        json!({"type":"response.output_item.done","output_index":0,"item":{
+        json!({"type":"response.content_part.delta","output_index":1,"content_index":0,"delta":"responses complete"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{
             "type":"message","id":"msg-text","role":"assistant","status":"completed",
             "content":[{"type":"output_text","text":"responses complete","annotations":[]}]
         }}),

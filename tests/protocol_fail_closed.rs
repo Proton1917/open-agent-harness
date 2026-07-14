@@ -119,18 +119,20 @@ async fn responses_failed_event_aborts_partial_tool_call_and_redacts_token() {
 
 #[tokio::test]
 async fn chat_stream_rejects_tool_delta_after_finish_reason() {
+    let finished = json!({
+        "id": "chat-event-after-finish",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
     let events = [
-        json!({
-            "id": "chat-event-after-finish",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }),
+        finished.clone(),
         json!({
             "id": "chat-event-after-finish",
             "choices": [{
                 "index": 0,
                 "delta": {"tool_calls": [chat_write_call()]},
-                "finish_reason": null
-            }]
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
         }),
     ];
     let outcome = run_case(
@@ -142,6 +144,59 @@ async fn chat_stream_rejects_tool_delta_after_finish_reason() {
     .await;
 
     assert_rejected_without_tool(&outcome, "Chat tool delta after finish_reason");
+
+    for (label, terminal) in [
+        (
+            "Chat terminal echo wrong empty type",
+            json!({
+                "id":"chat-event-after-finish",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":[]},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1}
+            }),
+        ),
+        (
+            "Chat terminal echo changed raw finish reason",
+            json!({
+                "id":"chat-event-after-finish",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"function_call"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1}
+            }),
+        ),
+        (
+            "Chat terminal echo missing usage",
+            json!({
+                "id":"chat-event-after-finish",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]
+            }),
+        ),
+    ] {
+        let outcome = run_case(
+            ApiFormat::ChatCompletions,
+            true,
+            MockResponse::sse(chat_sse([finished.clone(), terminal])),
+            None,
+        )
+        .await;
+        assert_rejected_without_tool(&outcome, label);
+    }
+
+    let valid_terminal = json!({
+        "id":"chat-event-after-finish",
+        "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1}
+    });
+    let outcome = run_case(
+        ApiFormat::ChatCompletions,
+        true,
+        MockResponse::sse(chat_sse([
+            finished,
+            valid_terminal,
+            json!({"id":"chat-event-after-finish","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}),
+        ])),
+        None,
+    )
+    .await;
+    assert_rejected_without_tool(&outcome, "Chat JSON after terminal usage echo");
 }
 
 async fn assert_chat_json_finish_rejected(finish_reason: Option<&str>) {

@@ -96,16 +96,18 @@ export HARNESS_API_FORMAT='chat-completions'
 export HARNESS_API_KEY='...'
 ```
 
-For OpenRouter Chat Completions, change only the address and path:
+For OpenRouter Chat Completions, configure the endpoint, key, and an explicit model:
 
 ```bash
 export HARNESS_BASE_URL='https://openrouter.ai'
 export HARNESS_API_PATH='/api/v1/chat/completions'
 export HARNESS_API_FORMAT='chat-completions'
-export HARNESS_API_KEY='...'
+export OPENROUTER_API_KEY='...'
+export HARNESS_API_KEY="$OPENROUTER_API_KEY"
+./target/release/open-agent-harness --model openrouter/free --max-tokens 64 --print 'Reply with exactly OPENROUTER_OK.'
 ```
 
-OpenRouter’s Responses endpoint works through `/api/v1/responses` with `HARNESS_API_FORMAT=responses`. Local OpenAI-compatible servers can use the same Chat adapter without a key. Older servers that still require `max_tokens` can set `HARNESS_CHAT_TOKENS_FIELD=max-tokens`; servers that reject streamed usage options can set `HARNESS_INCLUDE_STREAM_USAGE=0`; JSON-only endpoints can set `HARNESS_STREAM=0`.
+OpenRouter’s Responses endpoint works through `/api/v1/responses` with `HARNESS_API_FORMAT=responses`. Always pass a real OpenRouter model/router ID such as `openrouter/free` or another current `author/model-slug`; the harness's provider-neutral `default` model name is not an OpenRouter catalog entry. Local OpenAI-compatible servers can use the same Chat adapter without a key. Older servers that still require `max_tokens` can set `HARNESS_CHAT_TOKENS_FIELD=max-tokens`; servers that reject streamed usage options can set `HARNESS_INCLUDE_STREAM_USAGE=0`; JSON-only endpoints can set `HARNESS_STREAM=0`.
 
 Each adapter emits the protocol it claims, not a vaguely similar JSON shape. A Messages request remains the compact six-field form:
 
@@ -120,7 +122,7 @@ Each adapter emits the protocol it claims, not a vaguely similar JSON shape. A M
 }
 ```
 
-Authentication uses `Authorization: Bearer ...` when a key is present. Every protocol accepts a complete JSON response; every protocol also has its own strict SSE decoder. OpenRouter keepalive comments, both documented Responses event-name families, and usage-only final chunks are accepted. Null usage counters are treated as unknown or zero rather than a reason to crash. A stream that ends before `message_stop`, `[DONE]`, or a completed terminal Responses payload is rejected before any tool can execute; a tool call whose finish reason does not match the protocol is rejected as incomplete. Responses items preserve the IDs and status needed for stateless continuation, and Chat `reasoning_details` are replayed unchanged in their original array order, apart from endpoint-token redaction. Opaque provider state is returned only to the same wire protocol and is never written to the local transcript.
+Authentication uses `Authorization: Bearer ...` when a key is present. Every protocol accepts a complete JSON response; every protocol also has its own strict SSE decoder. OpenRouter keepalive comments, both documented Responses event-name families, usage-only final chunks, and its one-time repeated empty terminal choice carrying usage are accepted. Responses `reasoning_text` item/part events and the documented `response.reasoning.*` alias are identity- and snapshot-validated without exposing private reasoning as answer text; plaintext reasoning content is stripped, and a reasoning item is replayed only when it carries encrypted continuation state. Null usage counters are treated as unknown rather than erasing known counters or crashing. A stream that ends before `message_stop`, `[DONE]`, or a completed terminal Responses payload is rejected before any tool can execute; a tool call whose finish reason does not match the protocol is rejected as incomplete. Responses items preserve the IDs and status needed for stateless continuation. Chat `reasoning_details` keep their original array order and take replay precedence when present; otherwise raw `reasoning` or its `reasoning_content` alias is preserved for tool-call continuation. Opaque provider state is returned only to the same wire protocol and is never written to the local transcript or machine-facing event stream.
 
 A local model, a self-hosted gateway, or any compatible service can be connected at will. The result is a simple fact: whether you live in the eastern or western hemisphere, and whatever a San Francisco compliance department thinks of your passport, this harness behaves the same way. Tools should work like that. Equations do not inspect visas. Compilers do not ask for nationality. A message loop has no right to be the exception.
 
@@ -394,16 +396,18 @@ export HARNESS_API_FORMAT='chat-completions'
 export HARNESS_API_KEY='...'
 ```
 
-OpenRouter Chat Completions 只需更换地址与路径：
+OpenRouter Chat Completions 需要配置 endpoint、key 和显式模型：
 
 ```bash
 export HARNESS_BASE_URL='https://openrouter.ai'
 export HARNESS_API_PATH='/api/v1/chat/completions'
 export HARNESS_API_FORMAT='chat-completions'
-export HARNESS_API_KEY='...'
+export OPENROUTER_API_KEY='...'
+export HARNESS_API_KEY="$OPENROUTER_API_KEY"
+./target/release/open-agent-harness --model openrouter/free --max-tokens 64 --print '只回复 OPENROUTER_OK。'
 ```
 
-OpenRouter Responses 使用 `/api/v1/responses` 和 `HARNESS_API_FORMAT=responses`。本地 OpenAI-compatible server 可复用 Chat adapter，并省略 key；仍要求旧字段 `max_tokens` 的端点可设 `HARNESS_CHAT_TOKENS_FIELD=max-tokens`；不接受 streamed usage option 的端点可设 `HARNESS_INCLUDE_STREAM_USAGE=0`；只返回完整 JSON 的端点可设 `HARNESS_STREAM=0`。
+OpenRouter Responses 使用 `/api/v1/responses` 和 `HARNESS_API_FORMAT=responses`。调用时必须传入真实的 OpenRouter model/router ID，例如 `openrouter/free` 或当前有效的 `author/model-slug`；本 harness 的提供方无关默认名 `default` 并不是 OpenRouter catalog model。本地 OpenAI-compatible server 可复用 Chat adapter，并省略 key；仍要求旧字段 `max_tokens` 的端点可设 `HARNESS_CHAT_TOKENS_FIELD=max-tokens`；不接受 streamed usage option 的端点可设 `HARNESS_INCLUDE_STREAM_USAGE=0`；只返回完整 JSON 的端点可设 `HARNESS_STREAM=0`。
 
 每个 adapter 都输出自己声称的协议，不拿“长得有点像”的 JSON 糊弄。Messages 请求仍保持六个通用字段：
 
@@ -418,7 +422,7 @@ OpenRouter Responses 使用 `/api/v1/responses` 和 `HARNESS_API_FORMAT=response
 }
 ```
 
-存在 key 时认证走 `Authorization: Bearer ...`。三套协议都接受完整 JSON，也各自拥有严格 SSE decoder：OpenRouter keepalive comment、官方文档中的两套 Responses 事件命名以及仅含 usage 的尾块都可正常处理；usage 中的 null 不会再把进程摔死；若流在 `message_stop`、`[DONE]` 或带有 completed payload 的 Responses terminal event 之前断掉，任何工具都不得执行，工具调用与终止原因不匹配也会按未完成处理。Responses item 会保留无状态续接所需的 ID 与 status，Chat `reasoning_details` 除 endpoint token 脱敏外也会保持内容与原数组顺序回放。所有 opaque provider state 只回送给同一种协议，并且绝不写入本地 transcript。
+存在 key 时认证走 `Authorization: Bearer ...`。三套协议都接受完整 JSON，也各自拥有严格 SSE decoder：OpenRouter keepalive comment、官方文档中的两套 Responses 事件命名、仅含 usage 的尾块，以及携带 usage 的一次性“空 terminal choice 重放”都可正常处理。Responses `reasoning_text` item/part 事件及文档中的 `response.reasoning.*` 别名都会做身份与 snapshot 校验；私有 reasoning 不会混入最终回答，明文 content 会被剥离，且 reasoning item 只有携带 encrypted continuation state 时才会回传。usage 中的 null 不会清除已知计数，也不会把进程摔死。若流在 `message_stop`、`[DONE]` 或带有 completed payload 的 Responses terminal event 之前断掉，任何工具都不得执行，工具调用与终止原因不匹配也会按未完成处理。Responses item 会保留无状态续接所需的 ID 与 status；Chat `reasoning_details` 保持原数组顺序并在存在时优先回放，否则 raw `reasoning` 或别名 `reasoning_content` 会为工具调用续接而保留。所有 opaque provider state 只回送给同一种协议，并且绝不写入本地 transcript 或机器可见事件流。
 
 本地模型、自建代理、任何兼容服务，随便接。这意味着一个朴素的事实：无论你身在东半球还是西半球，无论某家旧金山公司的合规部门如何看待你的护照，这个 harness 对你完全一致地工作。工具本该如此——数学公式不查签证，编译器不问国籍，一个消息循环也没有资格例外。
 

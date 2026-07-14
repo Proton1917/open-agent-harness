@@ -874,7 +874,7 @@ impl QueryEngine {
                 }
             }
             self.emit(QueryEvent::AssistantMessage {
-                content: response.content.clone(),
+                content: public_content_blocks(&response.content),
             });
             self.messages
                 .push(Message::assistant(response.content.clone()));
@@ -942,13 +942,14 @@ impl QueryEngine {
                         continue;
                     }
                 }
+                let new_messages = if compacted {
+                    self.messages.clone()
+                } else {
+                    self.messages[start..].to_vec()
+                };
                 return Ok(TurnResult {
                     text: final_text,
-                    new_messages: if compacted {
-                        self.messages.clone()
-                    } else {
-                        self.messages[start..].to_vec()
-                    },
+                    new_messages: public_messages(&new_messages),
                     streamed_text,
                     compacted,
                     structured_output,
@@ -1363,6 +1364,27 @@ impl QueryEngine {
             self.registry.shutdown().await;
         }
     }
+}
+
+fn public_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| Message {
+            role: message.role,
+            content: match message.content.as_array() {
+                Some(blocks) => Value::Array(public_content_blocks(blocks)),
+                None => message.content.clone(),
+            },
+        })
+        .collect()
+}
+
+fn public_content_blocks(content: &[Value]) -> Vec<Value> {
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) != Some("provider_state"))
+        .cloned()
+        .collect()
 }
 
 fn apply_skill_scope(
