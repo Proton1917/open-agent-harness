@@ -1813,6 +1813,25 @@ mod tests {
         );
     }
 
+    fn send_with_bounded_lock_retry(service: &TeamService, from: Uuid, to: Uuid, body: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match service.send(from, to, body) {
+                Ok(_) => return,
+                Err(error)
+                    if error.to_string() == "team project lock acquisition timed out"
+                        && Instant::now() < deadline =>
+                {
+                    // A timeout happens before the state is read or written, so retrying cannot
+                    // duplicate a message. Windows file locks are not fair and one worker may
+                    // otherwise reacquire the lock for all 64 sends before its peer gets a turn.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("team worker send failed: {error:#}"),
+            }
+        }
+    }
+
     #[test]
     #[ignore = "helper process launched by multiprocess team tests"]
     fn multiprocess_worker() {
@@ -1869,9 +1888,13 @@ mod tests {
                 let service = TeamService::open_in(&workspace, &storage, team_id).unwrap();
                 let coordinator = service.coordinator_id();
                 for index in 0..64 {
-                    service
-                        .send(coordinator, member_id, &format!("{label}-{index}"))
-                        .unwrap();
+                    send_with_bounded_lock_retry(
+                        &service,
+                        coordinator,
+                        member_id,
+                        &format!("{label}-{index}"),
+                    );
+                    std::thread::yield_now();
                 }
                 fs::write(outcome, b"ok").unwrap();
             }
