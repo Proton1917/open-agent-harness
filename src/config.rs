@@ -19,6 +19,17 @@ const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_DIRECTORIES: usize = 32;
 const MAX_EXTENSION_PATH_BYTES: usize = 4096;
 const MAX_OUTPUT_STYLE_NAME_BYTES: usize = 128;
+const MAX_MODEL_OPTIONS: usize = 64;
+const MAX_MODEL_ID_BYTES: usize = 512;
+const MAX_MODEL_DISPLAY_BYTES: usize = 256;
+const MAX_MODEL_DESCRIPTION_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub value: String,
+    pub display_name: String,
+    pub description: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutoMemorySettings {
@@ -64,6 +75,77 @@ fn redact_settings_debug(value: &mut Value) {
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
+}
+
+pub(crate) fn validate_model_id(value: &str) -> Result<()> {
+    if value.trim().is_empty()
+        || value != value.trim()
+        || value.len() > MAX_MODEL_ID_BYTES
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!("model id 为空、过长或包含空白/控制字符")
+    }
+    Ok(())
+}
+
+fn validate_model_text(value: &str, field: &str, limit: usize, allow_empty: bool) -> Result<()> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.len() > limit
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("model {field} 为空、过长或包含控制字符")
+    }
+    Ok(())
+}
+
+fn parse_model_option(value: &Value) -> Result<ModelOption> {
+    let (model, display_name, description) = match value {
+        Value::String(model) => (model.as_str(), model.as_str(), ""),
+        Value::Object(object) => {
+            let allowed = ["value", "displayName", "description"];
+            if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+                anyhow::bail!("models option 包含未知字段 {key}")
+            }
+            let model = object
+                .get("value")
+                .and_then(Value::as_str)
+                .context("models option.value 必须是 string")?;
+            let display_name = object
+                .get("displayName")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .context("models option.displayName 必须是 string")
+                })
+                .transpose()?
+                .unwrap_or(model);
+            let description = object
+                .get("description")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .context("models option.description 必须是 string")
+                })
+                .transpose()?
+                .unwrap_or("");
+            (model, display_name, description)
+        }
+        _ => anyhow::bail!("models 只能包含 string 或 object"),
+    };
+    validate_model_id(model)?;
+    validate_model_text(display_name, "displayName", MAX_MODEL_DISPLAY_BYTES, false)?;
+    validate_model_text(
+        description,
+        "description",
+        MAX_MODEL_DESCRIPTION_BYTES,
+        true,
+    )?;
+    Ok(ModelOption {
+        value: model.to_owned(),
+        display_name: display_name.to_owned(),
+        description: description.to_owned(),
+    })
 }
 
 impl Default for Settings {
@@ -122,11 +204,49 @@ impl Settings {
             self.raw = Value::Object(Map::new());
             return;
         };
-        root.retain(|key, _| matches!(key.as_str(), "model" | "permissions" | "sandbox"));
+        root.retain(|key, _| {
+            matches!(key.as_str(), "model" | "models" | "permissions" | "sandbox")
+        });
     }
 
     pub fn model(&self) -> Option<&str> {
         self.raw.get("model").and_then(Value::as_str)
+    }
+
+    /// Return the trusted model picker catalog. Provider-specific aliases are
+    /// configuration data, never compiled into the provider-neutral runtime.
+    /// The current model is always selectable even when it is absent from the
+    /// configured catalog, matching the interactive picker contract.
+    pub fn model_options(&self, current: &str) -> Result<Vec<ModelOption>> {
+        validate_model_id(current)?;
+        let mut options = Vec::new();
+        if let Some(value) = self.raw.get("models") {
+            let values = value.as_array().context("models 必须是 array")?;
+            if values.len() > MAX_MODEL_OPTIONS {
+                anyhow::bail!("models 超过 {MAX_MODEL_OPTIONS} 个限制")
+            }
+            for value in values {
+                let option = parse_model_option(value)?;
+                if options
+                    .iter()
+                    .any(|existing: &ModelOption| existing.value == option.value)
+                {
+                    anyhow::bail!("models 包含重复 model id: {}", option.value)
+                }
+                options.push(option);
+            }
+        }
+        if !options.iter().any(|option| option.value == current) {
+            if options.len() >= MAX_MODEL_OPTIONS {
+                anyhow::bail!("models 已达 {MAX_MODEL_OPTIONS} 个限制，且不包含当前 model id")
+            }
+            options.push(ModelOption {
+                value: current.to_owned(),
+                display_name: current.to_owned(),
+                description: "Current model".to_owned(),
+            });
+        }
+        Ok(options)
     }
 
     /// Returns a statically selected output style from trusted settings.
@@ -735,6 +855,7 @@ mod tests {
         let mut settings = Settings {
             raw: serde_json::json!({
                 "model":"model-id",
+                "models":["model-id", {"value":"other", "displayName":"Other", "description":"Fallback"}],
                 "permissions":{"defaultMode":"dontAsk", "deny":["Bash(rm:*)"]},
                 "sandbox":{"enabled":true, "allowedDomains":["example.com"]},
                 "env":{"SECRET":"must-not-apply"},
@@ -753,13 +874,52 @@ mod tests {
         };
         settings.retain_safe_mode_core();
         let root = settings.raw.as_object().unwrap();
-        assert_eq!(root.len(), 3);
+        assert_eq!(root.len(), 4);
         assert_eq!(settings.model(), Some("model-id"));
+        assert_eq!(settings.model_options("model-id").unwrap().len(), 2);
         assert_eq!(settings.deny_rules(), vec!["Bash(rm:*)"]);
         assert!(root.contains_key("sandbox"));
         assert!(!root.contains_key("env"));
         assert!(!root.contains_key("plugins"));
         assert!(!root.contains_key("mcpServers"));
         assert!(!root.contains_key("workflows"));
+    }
+
+    #[test]
+    fn model_options_are_bounded_validated_and_include_current() {
+        let settings = Settings {
+            raw: serde_json::json!({
+                "models":[
+                    "provider/model-a",
+                    {"value":"provider/model-b", "displayName":"Model B", "description":"Fast"}
+                ]
+            }),
+        };
+        let options = settings.model_options("provider/current").unwrap();
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[1].display_name, "Model B");
+        assert_eq!(options[2].description, "Current model");
+
+        for raw in [
+            serde_json::json!({"models":"not-an-array"}),
+            serde_json::json!({"models":["duplicate", "duplicate"]}),
+            serde_json::json!({"models":[{"value":"ok", "unknown":true}]}),
+            serde_json::json!({"models":["bad model"]}),
+            serde_json::json!({"models":[{"value":"ok", "displayName":"bad\nname"}]}),
+        ] {
+            assert!(Settings { raw }.model_options("current").is_err());
+        }
+
+        let full_catalog = (0..MAX_MODEL_OPTIONS)
+            .map(|index| Value::String(format!("model-{index}")))
+            .collect::<Vec<_>>();
+        let settings = Settings {
+            raw: serde_json::json!({"models":full_catalog}),
+        };
+        assert_eq!(
+            settings.model_options("model-0").unwrap().len(),
+            MAX_MODEL_OPTIONS
+        );
+        assert!(settings.model_options("missing-current").is_err());
     }
 }

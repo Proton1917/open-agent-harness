@@ -61,6 +61,23 @@ is accurate; “complete parity with the proprietary product” is not.
   `AskUserQuestion` answers enter only through the trusted terminal/control
   interaction boundary; the model-facing schema cannot provide them.
 
+### Interactive command surface
+
+- Typing `/` at the beginning of the composer immediately opens the current
+  built-in/custom/Skill command catalog. The normal terminal view shows at most
+  six suggestions centered around the selection; continued input filters by
+  exact name, alias, prefix, description, or bounded fuzzy match.
+- Up/Down and Ctrl-N/Ctrl-P wrap the command selection. Tab completes the
+  selected command without submitting it, Enter accepts it and executes
+  argument-free commands, and Esc dismisses suggestions until the input
+  changes. An exact command followed by one space shows its argument hint.
+- `/model` without arguments opens an independent provider-neutral Select
+  surface. The current model starts focused and is appended when absent; up to
+  ten options are visible, with wrap/page/navigation, numeric selection,
+  Enter confirmation, Esc cancellation, and double Ctrl-C/Ctrl-D exit. The
+  candidate catalog comes only from bounded trusted `models` settings;
+  `/model <id>` remains available for an explicit model outside that catalog.
+
 ### Workspace, session, planning, and teams
 
 - Trusted `--add-dir` roots have independent scope and file history. Nested
@@ -178,6 +195,10 @@ is accurate; “complete parity with the proprietary product” is not.
 - The interactive composer does not accept a concurrent one-off side query
   while another model turn is active. Opt-in prompt suggestions run only after
   a completed print-mode turn and are never auto-executed.
+- The slash palette does not copy private usage ranking or vendor command
+  inventory, and the model picker does not discover a vendor catalog or carry
+  account, entitlement, billing, fast-mode, or proprietary effort behavior.
+  Its options are explicit trusted configuration plus the active model.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
 - `ConfigChange` is intentionally not emitted because this runtime rejects

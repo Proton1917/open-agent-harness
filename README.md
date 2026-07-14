@@ -56,6 +56,8 @@ At its heart, an agent is a loop: the model requests a tool, the harness execute
 
 The interactive CLI is an original Rust implementation of the conversational terminal pattern: scrollback remains ordinary terminal history, while a bordered composer stays at the bottom of each input turn. Its raw-mode frames use explicit CRLF, a single buffered write, and synchronized-output markers where supported; resize resets are atomic and input height is viewport-bounded. Editing is grapheme-aware for CJK, combining marks, flags, and ZWJ emoji, with multi-line navigation, bounded paste, in-session history, and common Ctrl/Option word and line operations. `Shift+Tab` cycles the safe interactive modes without ever entering bypass mode. `Esc Esc` clears the composer. `Ctrl-C` cancels an active model/tool turn transactionally—rolling back its uncommitted messages and newly launched background work—while a double `Ctrl-C` at an empty composer exits. A permission prompt can allow once, deny, interrupt, or remember only the exact normalized action for the current process; deny rules and Plan mode still win. Non-TTY input keeps the plain line protocol, and `--print` retains its exact machine-readable formats.
 
+Typing `/` immediately opens a bounded command palette assembled from built-ins, trusted custom commands, and current user-invocable Skills. Further typing filters the list; Up/Down or Ctrl-N/Ctrl-P wraps selection, Tab completes without executing, Enter accepts (argument-taking Skills wait for arguments), and Esc dismisses the palette until the input changes. At most six centered suggestions are painted in the normal composer. `/model` opens a separate provider-neutral picker: the current model starts focused, up to ten options remain visible, arrows/J/K/Ctrl-N/Ctrl-P and PageUp/PageDown navigate, digits 1–9 select directly, Enter confirms, and Esc keeps the current model. `/model <id>` remains the direct path for a model outside the configured catalog.
+
 The interface follows observable terminal behavior, not copied code or assets. There is no JavaScript renderer hiding behind the binary: input editing, cursor control, event rendering, interruption, and mode state live in `src/terminal.rs`, while engine events come from `src/query.rs`.
 
 ### Endpoint: loyal to no server, aware of no border
@@ -184,6 +186,15 @@ Executable and network integrations are accepted only from `~/.open-agent-harnes
 ```json
 {
   "strictMcpConfig": true,
+  "model": "provider/model-a",
+  "models": [
+    "provider/model-a",
+    {
+      "value": "provider/model-b",
+      "displayName": "Model B",
+      "description": "Configured fallback"
+    }
+  ],
   "plugins": {"directories": ["/absolute/path/to/plugin"]},
   "outputStyle": "runtime:brief",
   "memory": {"enabled": true, "autoExtract": true},
@@ -234,6 +245,8 @@ Executable and network integrations are accepted only from `~/.open-agent-harnes
   }
 }
 ```
+
+`models` is an explicit trusted display catalog, not backend discovery: the harness neither contacts an undeclared model-list endpoint nor hardcodes a vendor's aliases. The active model is appended as `Current model` if absent. Project settings cannot choose the model or populate this catalog.
 
 A command hook receives one JSON object on stdin, including `hook_event_name`, `cwd`, and the event payload. Empty stdout means “continue”; plain text becomes additional context. Exit status `2`, `{"continue":false}`, or `{"decision":"block","reason":"..."}` blocks the operation. A successful JSON response may return `additionalContext`, or `hookSpecificOutput.updatedInput` / `updatedToolOutput`. Other nonzero exits fail closed. Command hooks run outside the workspace by default and receive its path through `HARNESS_WORKSPACE`; `workspaceRelative: true` is the explicit opt-in for workspace-relative execution. An `mcp_tool` action instead names one configured connected server/tool, validates its interpolated input against that tool's schema, and maps its bounded result through the same outcome contract. Async hooks cannot rewrite the in-flight call and are finalized during normal session shutdown.
 
@@ -356,6 +369,8 @@ Agent 的核心就是一个循环：模型请求工具，harness 执行，结果
 
 交互 CLI 是一套原创 Rust 会话终端：历史内容留在正常 scrollback 中，每轮输入使用带上下边框的 composer。raw mode 帧显式使用 CRLF 与单次缓冲写入，支持时启用 synchronized output；resize 原子重置，输入高度受 viewport 约束。编辑按 grapheme 处理 CJK、组合字符、旗帜和 ZWJ emoji，支持多行移动、有界粘贴、会话内历史以及常用 Ctrl/Option 词级与行级操作。`Shift+Tab` 只在安全交互模式之间循环，绝不会顺手进入 bypass；`Esc Esc` 清空输入；模型或工具运行时按 `Ctrl-C` 会事务式取消本轮，回滚尚未提交的消息与本轮新建后台任务；空输入区连续按两次 `Ctrl-C` 才退出。权限提示可选择仅允许一次、拒绝、中断，或只在当前进程记住同一个精确规范化动作；deny 与 Plan mode 始终优先。非 TTY 仍使用朴素行协议，`--print` 的机器可读格式保持不变。
 
+输入第一个 `/` 就会立即打开有界命令面板，来源包括内置命令、可信 custom command 和当前可由用户调用的 Skill；继续输入会过滤，方向键或 Ctrl-N/Ctrl-P 循环选择，Tab 只补全不执行，Enter 接受（需要参数的 Skill 会等待参数），Esc 在输入再次变化前关闭面板。普通 composer 最多显示六条围绕当前选择居中的建议。`/model` 随后进入独立的提供方无关模型选择器：当前模型默认聚焦，最多显示十项；方向键、J/K、Ctrl-N/Ctrl-P、PageUp/PageDown 可导航，数字 1–9 可直接选择，Enter 确认，Esc 保持原模型。目录外模型仍可直接使用 `/model <id>`。
+
 这里复刻的是可观察的终端行为，不是专有代码或资产。二进制背后没有藏着 JavaScript renderer：输入编辑、光标控制、事件渲染、中断和模式状态都在 `src/terminal.rs`，引擎事件来自 `src/query.rs`。
 
 ## Endpoint：不效忠任何服务器，不识别任何国界
@@ -471,6 +486,15 @@ open-agent-harness plugin list
 ```json
 {
   "strictMcpConfig": true,
+  "model": "provider/model-a",
+  "models": [
+    "provider/model-a",
+    {
+      "value": "provider/model-b",
+      "displayName": "Model B",
+      "description": "Configured fallback"
+    }
+  ],
   "plugins": {"directories": ["/absolute/path/to/plugin"]},
   "outputStyle": "runtime:brief",
   "memory": {"enabled": true, "autoExtract": true},
@@ -521,6 +545,8 @@ open-agent-harness plugin list
   }
 }
 ```
+
+`models` 是可信配置中显式提供的显示目录，不是后台自动探测：harness 不会访问未声明的 model-list endpoint，也不会硬编码任何厂商别名。当前模型若不在目录中，会以 `Current model` 自动加入；项目 settings 无权选择模型或填充该目录。
 
 Command hook 会从 stdin 收到一个 JSON object，其中包含 `hook_event_name`、`cwd` 和事件 payload。stdout 为空表示继续；普通文本会成为附加 context。退出码 `2`、`{"continue":false}` 或 `{"decision":"block","reason":"..."}` 会阻止操作。成功的 JSON 响应可以返回 `additionalContext`，或 `hookSpecificOutput.updatedInput` / `updatedToolOutput`；其他非零退出码一律失败关闭。Command hook 默认在 workspace 外执行，通过 `HARNESS_WORKSPACE` 接收路径；`workspaceRelative: true` 才显式选择 workspace 相对执行。`mcp_tool` action 则点名一个已配置且已连接的 server/tool，对插值后 input 做 tool schema 校验，再把有界结果映射到同一 outcome contract。Async hook 不能改写正在执行的调用，并会在正常 session shutdown 时收尾。
 

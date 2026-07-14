@@ -19,7 +19,7 @@ use crossterm::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{permissions::PermissionMode, query::QueryEvent};
+use crate::{config::ModelOption, permissions::PermissionMode, query::QueryEvent};
 
 const EXIT_WINDOW: Duration = Duration::from_millis(1_500);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -270,12 +270,320 @@ pub struct PromptRead {
     pub permission_mode: PermissionMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandSuggestion {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub execute_on_enter: bool,
+}
+
+fn command_matches<'a>(
+    buffer: &str,
+    commands: &'a [SlashCommandSuggestion],
+) -> Vec<&'a SlashCommandSuggestion> {
+    let Some(rest) = buffer.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if buffer.contains('\n') {
+        return Vec::new();
+    }
+    let Some((command_part, arguments)) = rest.split_once(char::is_whitespace) else {
+        return ranked_command_matches(rest, commands);
+    };
+    if !arguments.trim().is_empty()
+        || commands.iter().any(|command| {
+            command.name == command_part
+                || command.aliases.iter().any(|alias| alias == command_part)
+        })
+    {
+        return Vec::new();
+    }
+    ranked_command_matches(command_part, commands)
+}
+
+fn ranked_command_matches<'a>(
+    query: &str,
+    commands: &'a [SlashCommandSuggestion],
+) -> Vec<&'a SlashCommandSuggestion> {
+    let query = query.to_ascii_lowercase();
+    if query.is_empty() {
+        return commands.iter().collect();
+    }
+    let mut matches = commands
+        .iter()
+        .filter_map(|command| {
+            let name = command.name.to_ascii_lowercase();
+            let aliases = command
+                .aliases
+                .iter()
+                .map(|alias| alias.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            let score = if name == query {
+                Some((0, name.len()))
+            } else if aliases.iter().any(|alias| alias == &query) {
+                Some((1, name.len()))
+            } else if name.starts_with(&query) {
+                Some((2, name.len()))
+            } else if aliases.iter().any(|alias| alias.starts_with(&query)) {
+                Some((3, name.len()))
+            } else if name
+                .split([':', '_', '-'])
+                .any(|part| part.starts_with(&query))
+                || name.contains(&query)
+            {
+                Some((4, name.len()))
+            } else if command
+                .description
+                .split_whitespace()
+                .any(|word| word.to_ascii_lowercase().starts_with(&query))
+            {
+                Some((5, name.len()))
+            } else if edit_distance(&name, &query)
+                <= usize::max(1, query.chars().count().saturating_mul(3).div_ceil(10))
+            {
+                Some((6, name.len()))
+            } else {
+                None
+            }?;
+            Some((score, command))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    matches.into_iter().map(|(_, command)| command).collect()
+}
+
+fn command_argument_hint<'a>(
+    buffer: &str,
+    commands: &'a [SlashCommandSuggestion],
+) -> Option<&'a str> {
+    let command = buffer.strip_prefix('/')?.strip_suffix(' ')?;
+    if command.contains(char::is_whitespace) {
+        return None;
+    }
+    commands
+        .iter()
+        .find(|candidate| {
+            candidate.name == command || candidate.aliases.iter().any(|alias| alias == command)
+        })
+        .and_then(|candidate| candidate.argument_hint.as_deref())
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = usize::min(
+                usize::min(current[right_index] + 1, previous[right_index + 1] + 1),
+                previous[right_index] + usize::from(left_character != *right_character),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionChoice {
     Allow,
     AllowForSession,
     Deny,
     Interrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelPickerOutcome {
+    Selected(String),
+    Cancelled,
+    Exit,
+}
+
+#[derive(Debug, Clone)]
+struct ModelPickerState {
+    focused: usize,
+    visible_from: usize,
+    visible_count: usize,
+    option_count: usize,
+}
+
+impl ModelPickerState {
+    fn new(options: &[ModelOption], current: &str) -> Self {
+        let option_count = options.len();
+        let visible_count = option_count.min(10);
+        let focused = options
+            .iter()
+            .position(|option| option.value == current)
+            .unwrap_or(0);
+        let visible_from = if focused < visible_count {
+            0
+        } else {
+            focused + 1 - visible_count
+        };
+        Self {
+            focused,
+            visible_from,
+            visible_count,
+            option_count,
+        }
+    }
+
+    fn next(&mut self) {
+        if self.option_count == 0 {
+            return;
+        }
+        self.focused = (self.focused + 1) % self.option_count;
+        if self.focused == 0 {
+            self.visible_from = 0;
+        } else if self.focused >= self.visible_from + self.visible_count {
+            self.visible_from = self.focused + 1 - self.visible_count;
+        }
+    }
+
+    fn previous(&mut self) {
+        if self.option_count == 0 {
+            return;
+        }
+        if self.focused == 0 {
+            self.focused = self.option_count - 1;
+            self.visible_from = self.option_count.saturating_sub(self.visible_count);
+        } else {
+            self.focused -= 1;
+            if self.focused < self.visible_from {
+                self.visible_from = self.focused;
+            }
+        }
+    }
+
+    fn next_page(&mut self) {
+        if self.option_count == 0 {
+            return;
+        }
+        self.focused = (self.focused + self.visible_count).min(self.option_count - 1);
+        let visible_to = (self.focused + 1).min(self.option_count);
+        self.visible_from = visible_to.saturating_sub(self.visible_count);
+    }
+
+    fn previous_page(&mut self) {
+        self.focused = self.focused.saturating_sub(self.visible_count);
+        self.visible_from = self.focused;
+    }
+}
+
+pub fn select_model(options: &[ModelOption], current: &str) -> Result<ModelPickerOutcome> {
+    if options.is_empty() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(ModelPickerOutcome::Cancelled);
+    }
+    let _raw = RawModeGuard::enter()?;
+    let mut out = io::stdout();
+    let mut state = ModelPickerState::new(options, current);
+    let mut rendered = RenderedPicker::default();
+    let mut exit_pending: Option<(KeyCode, Instant)> = None;
+
+    loop {
+        let exit_hint = exit_pending.as_ref().and_then(|(code, armed)| {
+            (armed.elapsed() <= EXIT_WINDOW).then_some(match code {
+                KeyCode::Char('d') => "Press Ctrl-D again to exit",
+                _ => "Press Ctrl-C again to exit",
+            })
+        });
+        if exit_hint.is_none() {
+            exit_pending = None;
+        }
+        rendered.redraw(&mut out, options, current, &state, exit_hint)?;
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let exit_key = match key {
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => Some(KeyCode::Char('c')),
+                    KeyEvent {
+                        code: KeyCode::Char('d'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => Some(KeyCode::Char('d')),
+                    _ => None,
+                };
+                if let Some(code) = exit_key {
+                    if exit_pending.as_ref().is_some_and(|(pending, armed)| {
+                        *pending == code && armed.elapsed() <= EXIT_WINDOW
+                    }) {
+                        rendered.erase(&mut out)?;
+                        return Ok(ModelPickerOutcome::Exit);
+                    }
+                    exit_pending = Some((code, Instant::now()));
+                    continue;
+                }
+                exit_pending = None;
+                match key {
+                    KeyEvent {
+                        code: KeyCode::Up | KeyCode::Char('k'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Char('p'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => state.previous(),
+                    KeyEvent {
+                        code: KeyCode::Down | KeyCode::Char('j'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Char('n'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } => state.next(),
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => state.previous_page(),
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => state.next_page(),
+                    KeyEvent {
+                        code: KeyCode::Char(digit @ '1'..='9'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } => {
+                        let index = digit.to_digit(10).unwrap_or_default() as usize - 1;
+                        if let Some(option) = options.get(index) {
+                            rendered.erase(&mut out)?;
+                            return Ok(ModelPickerOutcome::Selected(option.value.clone()));
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        let selected = options[state.focused].value.clone();
+                        rendered.erase(&mut out)?;
+                        return Ok(ModelPickerOutcome::Selected(selected));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => {
+                        rendered.erase(&mut out)?;
+                        return Ok(ModelPickerOutcome::Cancelled);
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => rendered.reset_viewport(&mut out)?,
+            _ => {}
+        }
+    }
 }
 
 pub fn request_permission(
@@ -389,6 +697,7 @@ impl InputEditor {
         &mut self,
         initial_mode: PermissionMode,
         mode_locked: bool,
+        commands: &[SlashCommandSuggestion],
     ) -> Result<Option<PromptRead>> {
         let _raw = RawModeGuard::enter()?;
         let mut out = io::stdout();
@@ -402,11 +711,39 @@ impl InputEditor {
         let mut last_escape: Option<Instant> = None;
         let mut hint = String::new();
         let mut kill_buffer = String::new();
+        let mut selected_suggestion = 0usize;
+        let mut dismissed_suggestions_for: Option<String> = None;
 
         loop {
-            rendered.redraw(&mut out, &buffer, cursor_byte, mode, &hint)?;
+            let suggestions = if dismissed_suggestions_for.as_deref() == Some(buffer.as_str()) {
+                Vec::new()
+            } else {
+                command_matches(&buffer, commands)
+            };
+            if suggestions.is_empty() {
+                selected_suggestion = 0;
+            } else {
+                selected_suggestion = selected_suggestion.min(suggestions.len() - 1);
+            }
+            let argument_hint = command_argument_hint(&buffer, commands);
+            rendered.redraw(
+                &mut out,
+                InputRenderState {
+                    buffer: &buffer,
+                    cursor_byte,
+                    mode,
+                    hint: &hint,
+                    suggestions: &suggestions,
+                    selected_suggestion,
+                    argument_hint,
+                },
+            )?;
 
             let event = event::read()?;
+            let previous_buffer = buffer.clone();
+            let previous_selected_name = suggestions
+                .get(selected_suggestion)
+                .map(|suggestion| suggestion.name.clone());
             match event {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -425,6 +762,50 @@ impl InputEditor {
                     }
                     match key {
                         KeyEvent {
+                            code: KeyCode::Up,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !suggestions.is_empty() => {
+                            selected_suggestion = if selected_suggestion == 0 {
+                                suggestions.len() - 1
+                            } else {
+                                selected_suggestion - 1
+                            };
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('n'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !suggestions.is_empty() => {
+                            selected_suggestion = (selected_suggestion + 1) % suggestions.len();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if !suggestions.is_empty() => {
+                            let suggestion = suggestions[selected_suggestion];
+                            buffer = format!("/{} ", suggestion.name);
+                            cursor_byte = buffer.len();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } if !suggestions.is_empty() => {
+                            dismissed_suggestions_for = Some(buffer.clone());
+                            hint = "Suggestions dismissed".to_owned();
+                            last_escape = None;
+                        }
+                        KeyEvent {
                             code: KeyCode::Enter,
                             modifiers,
                             ..
@@ -440,16 +821,26 @@ impl InputEditor {
                             code: KeyCode::Enter,
                             ..
                         } => {
-                            rendered.erase(&mut out)?;
-                            let text = buffer.trim_end().to_owned();
-                            if !text.trim().is_empty() {
-                                self.push_history(text.clone());
-                                print_committed_prompt(&mut out, &text)?;
+                            let execute_suggestion = if suggestions.is_empty() {
+                                false
+                            } else {
+                                let suggestion = suggestions[selected_suggestion];
+                                buffer = format!("/{} ", suggestion.name);
+                                cursor_byte = buffer.len();
+                                suggestion.execute_on_enter
+                            };
+                            if suggestions.is_empty() || execute_suggestion {
+                                rendered.erase(&mut out)?;
+                                let text = buffer.trim_end().to_owned();
+                                if !text.trim().is_empty() {
+                                    self.push_history(text.clone());
+                                    print_committed_prompt(&mut out, &text)?;
+                                }
+                                return Ok(Some(PromptRead {
+                                    text,
+                                    permission_mode: mode,
+                                }));
                             }
-                            return Ok(Some(PromptRead {
-                                text,
-                                permission_mode: mode,
-                            }));
                         }
                         KeyEvent {
                             code: KeyCode::BackTab,
@@ -745,6 +1136,18 @@ impl InputEditor {
                 Event::Resize(_, _) => rendered.reset_viewport(&mut out)?,
                 _ => {}
             }
+            if buffer != previous_buffer {
+                dismissed_suggestions_for = None;
+                let updated_suggestions = command_matches(&buffer, commands);
+                selected_suggestion = previous_selected_name
+                    .as_deref()
+                    .and_then(|name| {
+                        updated_suggestions
+                            .iter()
+                            .position(|suggestion| suggestion.name == name)
+                    })
+                    .unwrap_or(0);
+            }
         }
     }
 
@@ -766,22 +1169,25 @@ struct RenderedInput {
     cursor_row: u16,
 }
 
+struct InputRenderState<'a> {
+    buffer: &'a str,
+    cursor_byte: usize,
+    mode: PermissionMode,
+    hint: &'a str,
+    suggestions: &'a [&'a SlashCommandSuggestion],
+    selected_suggestion: usize,
+    argument_hint: Option<&'a str>,
+}
+
 impl RenderedInput {
-    fn redraw(
-        &mut self,
-        out: &mut impl Write,
-        buffer: &str,
-        cursor_byte: usize,
-        mode: PermissionMode,
-        hint: &str,
-    ) -> Result<()> {
+    fn redraw(&mut self, out: &mut impl Write, state: InputRenderState<'_>) -> Result<()> {
         let mut frame = Vec::new();
         let synchronized = synchronized_output_supported();
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_START);
         }
         self.clear(&mut frame)?;
-        self.draw(&mut frame, buffer, cursor_byte, mode, hint)?;
+        self.draw(&mut frame, state)?;
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_END);
         }
@@ -840,14 +1246,16 @@ impl RenderedInput {
         Ok(())
     }
 
-    fn draw(
-        &mut self,
-        out: &mut impl Write,
-        buffer: &str,
-        cursor_byte: usize,
-        mode: PermissionMode,
-        hint: &str,
-    ) -> Result<()> {
+    fn draw(&mut self, out: &mut impl Write, state: InputRenderState<'_>) -> Result<()> {
+        let InputRenderState {
+            buffer,
+            cursor_byte,
+            mode,
+            hint,
+            suggestions,
+            selected_suggestion,
+            argument_hint,
+        } = state;
         let (width, height) = terminal::size()
             .map(|(width, height)| (usize::from(width).max(4), usize::from(height).max(4)))
             .unwrap_or((80, 24));
@@ -861,7 +1269,9 @@ impl RenderedInput {
         let active_column = buffer[active_start..cursor_byte].graphemes(true).count();
         let mut rendered_cursor_column = active_column;
         let color = std::env::var_os("NO_COLOR").is_none();
-        let visible_limit = MAX_VISIBLE_INPUT_LINES.min(height.saturating_sub(4).max(1));
+        let suggestion_limit = suggestions.len().min(6);
+        let visible_limit =
+            MAX_VISIBLE_INPUT_LINES.min(height.saturating_sub(4 + suggestion_limit).max(1));
         let visible_start = if lines.len() <= visible_limit {
             0
         } else {
@@ -927,25 +1337,73 @@ impl RenderedInput {
             } else {
                 format!("  {hint} · line {}/{}", active_line + 1, lines.len())
             }
-        } else if hint.is_empty() {
+        } else if !hint.is_empty() {
+            format!("  {hint}")
+        } else if let Some(argument_hint) = argument_hint {
+            format!("  {argument_hint}")
+        } else {
             format!(
                 "  {} · Shift+Tab mode · Shift+Enter/Ctrl+J newline · / commands",
                 mode_label(mode)
             )
-        } else {
-            format!("  {hint}")
         };
-        queue!(
-            out,
-            Print(visible_line(&footer, width.saturating_sub(1))),
-            Print(RAW_LINE_END)
-        )?;
+        let rendered_suggestions = if suggestions.is_empty() {
+            queue!(
+                out,
+                Print(visible_line(&footer, width.saturating_sub(1))),
+                Print(RAW_LINE_END)
+            )?;
+            0usize
+        } else {
+            let count = suggestion_limit.min(height.saturating_sub(3).max(1));
+            let start = selected_suggestion
+                .saturating_sub(count / 2)
+                .min(suggestions.len().saturating_sub(count));
+            let end = (start + count).min(suggestions.len());
+            let name_width = suggestions
+                .iter()
+                .map(|command| command.name.len() + 1)
+                .max()
+                .unwrap_or_default()
+                .saturating_add(5)
+                .min(width.saturating_mul(2) / 5);
+            for (index, command) in suggestions.iter().enumerate().take(end).skip(start) {
+                let selected = index == selected_suggestion;
+                if color && selected {
+                    queue!(out, SetForegroundColor(Color::Cyan))?;
+                }
+                let name =
+                    visible_line(&format!("/{}", command.name), name_width.saturating_sub(2));
+                let padded = format!(
+                    "{name}{}",
+                    " ".repeat(name_width.saturating_sub(UnicodeWidthStr::width(name.as_str())))
+                );
+                let description_width = width.saturating_sub(name_width + 3);
+                let description = visible_line(&command.description, description_width);
+                queue!(
+                    out,
+                    Print(if selected { "› " } else { "  " }),
+                    Print(padded),
+                    Print(description),
+                    Print(RAW_LINE_END)
+                )?;
+                if color && selected {
+                    queue!(out, ResetColor)?;
+                }
+            }
+            end.saturating_sub(start)
+        };
         if color {
             queue!(out, ResetColor)?;
         }
 
-        self.rows = u16::try_from(visible_end.saturating_sub(visible_start).saturating_add(3))
-            .unwrap_or(u16::MAX);
+        self.rows = u16::try_from(
+            visible_end
+                .saturating_sub(visible_start)
+                .saturating_add(2)
+                .saturating_add(rendered_suggestions.max(1)),
+        )
+        .unwrap_or(u16::MAX);
         self.cursor_row =
             u16::try_from(active_line.saturating_sub(visible_start).saturating_add(1))
                 .unwrap_or(u16::MAX);
@@ -956,6 +1414,210 @@ impl RenderedInput {
             cursor::MoveToColumn(
                 u16::try_from(rendered_cursor_column.saturating_add(2)).unwrap_or(u16::MAX)
             )
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RenderedPicker {
+    rows: u16,
+    cursor_row: u16,
+}
+
+impl RenderedPicker {
+    fn redraw(
+        &mut self,
+        out: &mut impl Write,
+        options: &[ModelOption],
+        current: &str,
+        state: &ModelPickerState,
+        exit_hint: Option<&str>,
+    ) -> Result<()> {
+        let mut frame = Vec::new();
+        let synchronized = synchronized_output_supported();
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_START);
+        }
+        self.clear(&mut frame)?;
+        self.draw(&mut frame, options, current, state, exit_hint)?;
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_END);
+        }
+        out.write_all(&frame)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    fn erase(&mut self, out: &mut impl Write) -> Result<()> {
+        let mut frame = Vec::new();
+        let synchronized = synchronized_output_supported();
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_START);
+        }
+        self.clear(&mut frame)?;
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_END);
+        }
+        out.write_all(&frame)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    fn reset_viewport(&mut self, out: &mut impl Write) -> Result<()> {
+        let mut frame = Vec::new();
+        let synchronized = synchronized_output_supported();
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_START);
+        }
+        queue!(frame, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        if synchronized {
+            frame.extend_from_slice(SYNC_OUTPUT_END);
+        }
+        out.write_all(&frame)?;
+        out.flush()?;
+        *self = Self::default();
+        Ok(())
+    }
+
+    fn clear(&mut self, out: &mut impl Write) -> Result<()> {
+        if self.rows == 0 {
+            return Ok(());
+        }
+        let below = self.rows.saturating_sub(self.cursor_row + 1);
+        if below > 0 {
+            queue!(out, cursor::MoveDown(below))?;
+        }
+        queue!(
+            out,
+            cursor::MoveDown(1),
+            cursor::MoveUp(self.rows),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        *self = Self::default();
+        Ok(())
+    }
+
+    fn draw(
+        &mut self,
+        out: &mut impl Write,
+        options: &[ModelOption],
+        current: &str,
+        state: &ModelPickerState,
+        exit_hint: Option<&str>,
+    ) -> Result<()> {
+        let width = terminal::size()
+            .map(|(width, _)| usize::from(width).max(20))
+            .unwrap_or(80);
+        let color = std::env::var_os("NO_COLOR").is_none();
+        if color {
+            queue!(
+                out,
+                SetForegroundColor(Color::Cyan),
+                SetAttribute(Attribute::Bold)
+            )?;
+        }
+        queue!(out, Print("  Select model"))?;
+        if color {
+            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
+        queue!(
+            out,
+            Print(RAW_LINE_END),
+            Print(visible_line(
+                "  Switch between models configured for this backend. Use /model <id> for another model.",
+                width.saturating_sub(1),
+            )),
+            Print(RAW_LINE_END),
+            Print(RAW_LINE_END)
+        )?;
+
+        let visible_to = (state.visible_from + state.visible_count).min(options.len());
+        let index_width = options.len().to_string().len();
+        for (index, option) in options
+            .iter()
+            .enumerate()
+            .take(visible_to)
+            .skip(state.visible_from)
+        {
+            let focused = index == state.focused;
+            let scroll_marker = if focused {
+                "›"
+            } else if index == state.visible_from && state.visible_from > 0 {
+                "↑"
+            } else if index + 1 == visible_to && visible_to < options.len() {
+                "↓"
+            } else {
+                " "
+            };
+            if color && focused {
+                queue!(out, SetForegroundColor(Color::Cyan))?;
+            }
+            let selected = if option.value == current { " ✓" } else { "" };
+            let prefix = format!(
+                "  {scroll_marker} {:>index_width$}. {}{selected}",
+                index + 1,
+                option.display_name
+            );
+            let description = if option.description.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", option.description)
+            };
+            let line = if description.is_empty() {
+                prefix
+            } else {
+                format!("{prefix}{description}")
+            };
+            queue!(
+                out,
+                Print(visible_line(&line, width.saturating_sub(1))),
+                Print(RAW_LINE_END)
+            )?;
+            if color && focused {
+                queue!(out, ResetColor)?;
+            }
+        }
+
+        let hidden = options.len().saturating_sub(state.visible_count);
+        if hidden > 0 {
+            if color {
+                queue!(out, SetForegroundColor(Color::DarkGrey))?;
+            }
+            queue!(
+                out,
+                Print(format!("    and {hidden} more…")),
+                Print(RAW_LINE_END)
+            )?;
+            if color {
+                queue!(out, ResetColor)?;
+            }
+        }
+        queue!(out, Print(RAW_LINE_END))?;
+        if color {
+            queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        }
+        queue!(
+            out,
+            Print(visible_line(
+                &format!("  {}", exit_hint.unwrap_or("Enter confirm · Esc exit")),
+                width.saturating_sub(1),
+            )),
+            Print(RAW_LINE_END)
+        )?;
+        if color {
+            queue!(out, ResetColor)?;
+        }
+
+        let hidden_row = usize::from(hidden > 0);
+        self.rows = u16::try_from(5 + state.visible_count + hidden_row).unwrap_or(u16::MAX);
+        self.cursor_row =
+            u16::try_from(3 + state.focused.saturating_sub(state.visible_from)).unwrap_or(u16::MAX);
+        queue!(
+            out,
+            cursor::MoveUp(self.rows.saturating_sub(self.cursor_row)),
+            cursor::MoveToColumn(2)
         )?;
         Ok(())
     }
@@ -1483,6 +2145,72 @@ mod tests {
         assert_eq!(visible_around_cursor("a界b", 2, 4), ("a界b".into(), 3));
     }
 
+    fn test_commands() -> Vec<SlashCommandSuggestion> {
+        vec![
+            SlashCommandSuggestion {
+                name: "clear".into(),
+                aliases: Vec::new(),
+                description: "Clear conversation".into(),
+                argument_hint: None,
+                execute_on_enter: true,
+            },
+            SlashCommandSuggestion {
+                name: "exit".into(),
+                aliases: vec!["quit".into()],
+                description: "Exit session".into(),
+                argument_hint: None,
+                execute_on_enter: true,
+            },
+            SlashCommandSuggestion {
+                name: "model".into(),
+                aliases: Vec::new(),
+                description: "Set model".into(),
+                argument_hint: Some("[model]".into()),
+                execute_on_enter: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn slash_command_suggestions_filter_alias_and_arguments() {
+        let commands = test_commands();
+        assert_eq!(
+            command_matches("/", &commands)
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["clear", "exit", "model"]
+        );
+        assert_eq!(command_matches("/mo", &commands)[0].name, "model");
+        assert_eq!(command_matches("/modle", &commands)[0].name, "model");
+        assert_eq!(command_matches("/quit", &commands)[0].name, "exit");
+        assert!(command_matches("/model ", &commands).is_empty());
+        assert!(command_matches("/model custom", &commands).is_empty());
+        assert_eq!(command_argument_hint("/model ", &commands), Some("[model]"));
+    }
+
+    #[test]
+    fn model_picker_focuses_current_and_wraps_like_select() {
+        let options = (0..12)
+            .map(|index| ModelOption {
+                value: format!("model-{index}"),
+                display_name: format!("Model {index}"),
+                description: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut state = ModelPickerState::new(&options, "model-11");
+        assert_eq!(state.focused, 11);
+        assert_eq!(state.visible_from, 2);
+        state.next();
+        assert_eq!((state.focused, state.visible_from), (0, 0));
+        state.previous();
+        assert_eq!((state.focused, state.visible_from), (11, 2));
+        state.previous_page();
+        assert_eq!((state.focused, state.visible_from), (1, 1));
+        state.next_page();
+        assert_eq!((state.focused, state.visible_from), (11, 2));
+    }
+
     #[test]
     fn raw_mode_frames_use_carriage_return_line_feeds() {
         fn assert_no_bare_line_feeds(output: &[u8]) {
@@ -1502,13 +2230,41 @@ mod tests {
         rendered
             .draw(
                 &mut frame,
-                "first line\nsecond line",
-                "first line\nsecond".len(),
-                PermissionMode::Default,
-                "",
+                InputRenderState {
+                    buffer: "first line\nsecond line",
+                    cursor_byte: "first line\nsecond".len(),
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    argument_hint: None,
+                },
             )
             .unwrap();
         assert_no_bare_line_feeds(&frame);
+
+        let commands = test_commands();
+        let suggestions = command_matches("/", &commands);
+        let mut suggestion_frame = Vec::new();
+        let mut suggestion_rendered = RenderedInput::default();
+        suggestion_rendered
+            .draw(
+                &mut suggestion_frame,
+                InputRenderState {
+                    buffer: "/",
+                    cursor_byte: 1,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &suggestions,
+                    selected_suggestion: 0,
+                    argument_hint: None,
+                },
+            )
+            .unwrap();
+        assert_no_bare_line_feeds(&suggestion_frame);
+        let suggestion_text = String::from_utf8_lossy(&suggestion_frame);
+        assert!(suggestion_text.contains("/clear"));
+        assert!(suggestion_text.contains("Clear conversation"));
 
         let mut committed = Vec::new();
         print_committed_prompt(&mut committed, "first line\nsecond line").unwrap();
@@ -1523,10 +2279,15 @@ mod tests {
         tall_rendered
             .draw(
                 &mut tall_frame,
-                &tall_input,
-                tall_input.len(),
-                PermissionMode::Default,
-                "",
+                InputRenderState {
+                    buffer: &tall_input,
+                    cursor_byte: tall_input.len(),
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    argument_hint: None,
+                },
             )
             .unwrap();
         assert!(tall_rendered.rows <= u16::try_from(MAX_VISIBLE_INPUT_LINES + 3).unwrap());
@@ -1538,11 +2299,33 @@ mod tests {
         let mut rendered = RenderedInput::default();
         let mut output = Vec::new();
         rendered
-            .draw(&mut output, "abc", 3, PermissionMode::Default, "")
+            .draw(
+                &mut output,
+                InputRenderState {
+                    buffer: "abc",
+                    cursor_byte: 3,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    argument_hint: None,
+                },
+            )
             .unwrap();
         rendered.clear(&mut output).unwrap();
         rendered
-            .draw(&mut output, "ab", 2, PermissionMode::Default, "")
+            .draw(
+                &mut output,
+                InputRenderState {
+                    buffer: "ab",
+                    cursor_byte: 2,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    argument_hint: None,
+                },
+            )
             .unwrap();
 
         let screen_width = terminal::size()

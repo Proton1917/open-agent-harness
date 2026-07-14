@@ -79,6 +79,69 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
 }
 
 #[test]
+fn slash_palette_and_model_picker_follow_interactive_command_flow() {
+    let settings = r#"{"models":[{"value":"model-a","displayName":"Model A","description":"Primary"},{"value":"model-b","displayName":"Model B","description":"Fallback"}]}"#;
+    let (mut child, mut terminal) =
+        spawn_terminal_with_args(&[], &["--model", "model-b", "--settings", settings]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"/").unwrap();
+    let palette = read_until(&mut terminal, "/clear", Duration::from_secs(3));
+    assert!(palette.contains("/clear"));
+    assert_no_bare_line_feeds(palette.as_bytes());
+    terminal.write_all(b"\x0e").unwrap();
+    let next = read_until(&mut terminal, "› /compact", Duration::from_secs(3));
+    assert!(next.contains("› /compact"));
+    terminal.write_all(b"\x10").unwrap();
+    let previous = read_until(&mut terminal, "› /clear", Duration::from_secs(3));
+    assert!(previous.contains("› /clear"));
+
+    terminal.write_all(b"mo").unwrap();
+    let filtered = read_until(&mut terminal, "/model", Duration::from_secs(3));
+    assert!(filtered.contains("Set the model for this session"));
+    terminal.write_all(b"\t").unwrap();
+    let completed = read_until(&mut terminal, "[model]", Duration::from_secs(3));
+    assert!(completed.contains("/model"));
+    terminal.write_all(b"\x7f\r").unwrap();
+    let picker = read_until(&mut terminal, "Select model", Duration::from_secs(3));
+    assert!(picker.contains("Model A"));
+    assert!(picker.contains("Model B"));
+    assert!(picker.contains("Enter confirm"));
+
+    terminal.write_all(b"\x1b[A\r").unwrap();
+    let selected = read_until(
+        &mut terminal,
+        "Set model to model-a",
+        Duration::from_secs(3),
+    );
+    assert_no_bare_line_feeds(selected.as_bytes());
+
+    terminal.write_all(b"/model current\r").unwrap();
+    let current = read_until(
+        &mut terminal,
+        "Current model: model-a",
+        Duration::from_secs(3),
+    );
+    assert!(current.contains("Current model: model-a"));
+
+    terminal.write_all(b"/").unwrap();
+    let _ = read_until(&mut terminal, "/clear", Duration::from_secs(3));
+    terminal.write_all(b"\x1b").unwrap();
+    let dismissed = read_until(
+        &mut terminal,
+        "Suggestions dismissed",
+        Duration::from_secs(3),
+    );
+    assert!(dismissed.contains("Suggestions dismissed"));
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
 fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -167,6 +230,10 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
 }
 
 fn spawn_terminal(extra_env: &[&str]) -> (Child, File) {
+    spawn_terminal_with_args(extra_env, &[])
+}
+
+fn spawn_terminal_with_args(extra_env: &[&str], extra_args: &[&str]) -> (Child, File) {
     let mut master = -1;
     let mut slave = -1;
     let size = libc::winsize {
@@ -193,6 +260,7 @@ fn spawn_terminal(extra_env: &[&str]) -> (Child, File) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"));
     command
         .args(["--bare", "--no-session-persistence"])
+        .args(extra_args)
         .env("NO_COLOR", "1")
         .env_remove("HARNESS_API_KEY")
         .env_remove("HARNESS_AUTH_TOKEN")

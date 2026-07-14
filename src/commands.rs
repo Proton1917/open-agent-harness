@@ -4,7 +4,12 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::{config::Settings, prompt::init_prompt, query::QueryEngine, skills::SkillCatalog};
+use crate::{
+    config::{Settings, validate_model_id},
+    prompt::init_prompt,
+    query::QueryEngine,
+    skills::SkillCatalog,
+};
 
 const MAX_CUSTOM_COMMANDS: usize = 128;
 const MAX_COMMAND_NAME_BYTES: usize = 64;
@@ -28,6 +33,11 @@ const RESERVED_COMMANDS: &[&str] = &[
 
 const DEFAULT_LOOP_MINUTES: u64 = 10;
 const MAX_LOOP_MINUTES: u64 = 30 * 24 * 60;
+const MODEL_HELP_ARGS: &[&str] = &["help", "-h", "--help"];
+const MODEL_INFO_ARGS: &[&str] = &[
+    "list", "show", "display", "current", "view", "get", "check", "describe", "print", "version",
+    "about", "status", "?",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopRequest {
@@ -204,6 +214,7 @@ pub enum CommandOutcome {
     Handled,
     Cleared,
     Exit,
+    SelectModel,
     Submit(String),
     NotCommand,
 }
@@ -212,7 +223,9 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
     if !input.starts_with('/') {
         return CommandOutcome::NotCommand;
     }
-    let (command, argument) = input.split_once(' ').unwrap_or((input, ""));
+    let split = input.find(char::is_whitespace).unwrap_or(input.len());
+    let command = &input[..split];
+    let argument = input[split..].trim();
     match command {
         "/exit" | "/quit" => CommandOutcome::Exit,
         "/clear" => {
@@ -220,15 +233,28 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             println!("Conversation cleared.");
             CommandOutcome::Cleared
         }
-        "/model" if argument.trim().is_empty() => {
-            println!("{}", engine.model);
+        "/model" if argument.is_empty() => CommandOutcome::SelectModel,
+        "/model" if MODEL_INFO_ARGS.contains(&argument) => {
+            println!("Current model: {}", engine.model);
             CommandOutcome::Handled
         }
-        "/model" => {
-            engine.set_model(argument.trim().to_owned());
-            println!("Model: {}", engine.model);
+        "/model" if MODEL_HELP_ARGS.contains(&argument) => {
+            println!(
+                "Run /model to open the model selection menu, or /model [modelName] to set the model."
+            );
             CommandOutcome::Handled
         }
+        "/model" => match validate_model_id(argument) {
+            Ok(()) => {
+                engine.set_model(argument.to_owned());
+                println!("Set model to {}", engine.model);
+                CommandOutcome::Handled
+            }
+            Err(error) => {
+                eprintln!("Model unchanged: {error:#}");
+                CommandOutcome::Handled
+            }
+        },
         "/cost" => {
             println!(
                 "input={} output={} cache_create={} cache_read={}",

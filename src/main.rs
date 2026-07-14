@@ -20,7 +20,7 @@ use open_agent_harness::{
     auto_memory::{AutoMemory, AutoMemoryExtractor},
     cli::{Cli, HarnessCommand, InputFormat, OutputFormat},
     commands::{self, CommandOutcome, CustomCommandCatalog},
-    config::{DEFAULT_MODEL, EndpointConfig, Settings, endpoint_config},
+    config::{DEFAULT_MODEL, EndpointConfig, ModelOption, Settings, endpoint_config},
     control::{ControlHandle, ControlSession, InboundMessage},
     file_history::FileHistory,
     hooks::{HookExecutionEvent, HookObserver, HookRunner},
@@ -35,7 +35,9 @@ use open_agent_harness::{
     query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
     session::{SessionStateRoot, SessionStore},
     structured_output::StructuredOutputTool,
-    terminal::{ConversationUi, InputEditor},
+    terminal::{
+        ConversationUi, InputEditor, ModelPickerOutcome, SlashCommandSuggestion, select_model,
+    },
     tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
     web_tools::configure_web,
     worktree::configure_worktree,
@@ -129,6 +131,7 @@ async fn run(
         .clone()
         .or_else(|| settings.model().map(ToOwned::to_owned))
         .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+    let model_options = settings.model_options(&model)?;
     let mode = if cli.dangerously_skip_permissions {
         PermissionMode::BypassPermissions
     } else {
@@ -431,6 +434,7 @@ async fn run(
         plugin_count,
         output_style: &output_style,
         available_output_styles: &available_output_styles,
+        model_options: &model_options,
     };
     let engine_setup = (|| -> Result<()> {
         engine.install_custom_agents(agents.custom_agents)?;
@@ -595,8 +599,17 @@ async fn run(
                         prompt
                     }
                     None if enhanced_terminal => {
+                        // Workspace discovery can add user-invocable Skills while a session is
+                        // running. Rebuild the command palette at the prompt boundary so `/`
+                        // always reflects the current command catalog.
+                        let slash_commands =
+                            available_command_suggestions(&command_context, &custom_commands);
                         let Some(read) = editor
-                            .read(engine.permission_mode(), engine.permission_mode_locked())?
+                            .read(
+                                engine.permission_mode(),
+                                engine.permission_mode_locked(),
+                                &slash_commands,
+                            )?
                         else {
                             break;
                         };
@@ -709,6 +722,33 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::Handled => continue,
+                CommandOutcome::SelectModel => {
+                    if !enhanced_terminal {
+                        eprintln!(
+                            "Model selection menu requires an interactive terminal; use /model <id>."
+                        );
+                        continue;
+                    }
+                    let mut options = model_options.clone();
+                    if !options.iter().any(|option| option.value == engine.model) {
+                        options.push(ModelOption {
+                            value: engine.model.clone(),
+                            display_name: engine.model.clone(),
+                            description: "Current model".to_owned(),
+                        });
+                    }
+                    match select_model(&options, &engine.model)? {
+                        ModelPickerOutcome::Selected(model) => {
+                            engine.set_model(model);
+                            println!("Set model to {}", engine.model);
+                        }
+                        ModelPickerOutcome::Cancelled => {
+                            println!("Kept model as {}", engine.model);
+                        }
+                        ModelPickerOutcome::Exit => break,
+                    }
+                    continue;
+                }
                 CommandOutcome::Submit(prompt) => prompt,
                 CommandOutcome::NotCommand => input,
             };
@@ -1619,6 +1659,7 @@ struct SessionMetadata<'a> {
     plugin_count: usize,
     output_style: &'a str,
     available_output_styles: &'a [String],
+    model_options: &'a [ModelOption],
 }
 
 fn handle_control_request(
@@ -1638,7 +1679,11 @@ fn handle_control_request(
             "session_id":store.id,
             "commands":available_command_names(metadata.command_context, metadata.commands),
             "agents":metadata.custom_agents,
-            "models":[{"value":engine.model, "displayName":engine.model}],
+            "models":metadata.model_options.iter().map(|option| json!({
+                "value":option.value,
+                "displayName":option.display_name,
+                "description":option.description,
+            })).collect::<Vec<_>>(),
             "tools":engine.registered_tool_names(),
             "output_style":metadata.output_style,
             "available_output_styles":metadata.available_output_styles,
@@ -1750,6 +1795,83 @@ fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalo
     names.sort();
     names.dedup();
     names
+}
+
+fn available_command_suggestions(
+    context: &ToolContext,
+    commands: &CustomCommandCatalog,
+) -> Vec<SlashCommandSuggestion> {
+    let mut suggestions = [
+        ("clear", &[][..], "Clear conversation history", None),
+        (
+            "compact",
+            &[][..],
+            "Compact conversation context",
+            Some("[instructions]"),
+        ),
+        ("context", &[][..], "Show context usage", None),
+        ("cost", &[][..], "Show token usage", None),
+        ("exit", &["quit"][..], "Exit the session", None),
+        ("help", &[][..], "Show available commands", None),
+        ("init", &[][..], "Create or improve AGENTS.md", None),
+        (
+            "loop",
+            &[][..],
+            "Schedule a recurring prompt",
+            Some("[interval] <prompt>"),
+        ),
+        (
+            "model",
+            &[][..],
+            "Set the model for this session",
+            Some("[model]"),
+        ),
+        (
+            "permissions",
+            &[][..],
+            "Show the current permission mode",
+            None,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(name, aliases, description, argument_hint)| SlashCommandSuggestion {
+            name: name.to_owned(),
+            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+            description: description.to_owned(),
+            argument_hint: argument_hint.map(ToOwned::to_owned),
+            execute_on_enter: true,
+        },
+    )
+    .collect::<Vec<_>>();
+
+    let mut used = suggestions
+        .iter()
+        .map(|suggestion| suggestion.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (name, definition) in commands.iter() {
+        if used.insert(name.clone()) {
+            suggestions.push(SlashCommandSuggestion {
+                name: name.clone(),
+                aliases: Vec::new(),
+                description: definition.description.clone(),
+                argument_hint: Some("[arguments]".to_owned()),
+                execute_on_enter: true,
+            });
+        }
+    }
+    for (name, skill) in context.skill_catalog().iter() {
+        if skill.user_invocable && used.insert(name.clone()) {
+            suggestions.push(SlashCommandSuggestion {
+                name: name.clone(),
+                aliases: Vec::new(),
+                description: skill.description.clone(),
+                argument_hint: skill.argument_hint.clone(),
+                execute_on_enter: skill.argument_names.is_empty(),
+            });
+        }
+    }
+    suggestions
 }
 
 fn permission_mode_name(mode: PermissionMode) -> &'static str {
