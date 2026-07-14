@@ -54,7 +54,7 @@ At its heart, an agent is a loop: the model requests a tool, the harness execute
 
 ### A terminal that behaves like an agent, not a teletype
 
-The interactive CLI is an original Rust implementation of the conversational terminal pattern: scrollback remains ordinary terminal history, while a bordered composer stays at the bottom of each input turn. It provides editable Unicode input, bounded paste, in-session history, multi-line prompts, a compact startup card, live request state, streamed responses, concise tool-call/result rows, and permission-mode feedback. `Shift+Tab` cycles the safe interactive modes without ever entering bypass mode. `Esc Esc` clears the composer. `Ctrl-C` cancels an active model/tool turn transactionally—rolling back its uncommitted messages and newly launched background work—while a double `Ctrl-C` at an empty composer exits. Non-TTY input keeps the plain line protocol, and `--print` retains its exact machine-readable formats.
+The interactive CLI is an original Rust implementation of the conversational terminal pattern: scrollback remains ordinary terminal history, while a bordered composer stays at the bottom of each input turn. Its raw-mode frames use explicit CRLF, a single buffered write, and synchronized-output markers where supported; resize resets are atomic and input height is viewport-bounded. Editing is grapheme-aware for CJK, combining marks, flags, and ZWJ emoji, with multi-line navigation, bounded paste, in-session history, and common Ctrl/Option word and line operations. `Shift+Tab` cycles the safe interactive modes without ever entering bypass mode. `Esc Esc` clears the composer. `Ctrl-C` cancels an active model/tool turn transactionally—rolling back its uncommitted messages and newly launched background work—while a double `Ctrl-C` at an empty composer exits. A permission prompt can allow once, deny, interrupt, or remember only the exact normalized action for the current process; deny rules and Plan mode still win. Non-TTY input keeps the plain line protocol, and `--print` retains its exact machine-readable formats.
 
 The interface follows observable terminal behavior, not copied code or assets. There is no JavaScript renderer hiding behind the binary: input editing, cursor control, event rendering, interruption, and mode state live in `src/terminal.rs`, while engine events come from `src/query.rs`.
 
@@ -354,7 +354,7 @@ Agent 的核心就是一个循环：模型请求工具，harness 执行，结果
 
 ## 像 agent，而不是电传打字机的终端
 
-交互 CLI 是一套原创 Rust 会话终端：历史内容留在正常 scrollback 中，每轮输入使用带上下边框的 composer。它支持 Unicode 编辑、有界粘贴、会话内历史、多行 prompt、紧凑启动卡片、实时请求状态、流式回答、简洁的工具调用/结果行和权限模式反馈。`Shift+Tab` 只在安全交互模式之间循环，绝不会顺手进入 bypass；`Esc Esc` 清空输入；模型或工具运行时按 `Ctrl-C` 会事务式取消本轮，回滚尚未提交的消息与本轮新建后台任务；空输入区连续按两次 `Ctrl-C` 才退出。非 TTY 仍使用朴素行协议，`--print` 的机器可读格式保持不变。
+交互 CLI 是一套原创 Rust 会话终端：历史内容留在正常 scrollback 中，每轮输入使用带上下边框的 composer。raw mode 帧显式使用 CRLF 与单次缓冲写入，支持时启用 synchronized output；resize 原子重置，输入高度受 viewport 约束。编辑按 grapheme 处理 CJK、组合字符、旗帜和 ZWJ emoji，支持多行移动、有界粘贴、会话内历史以及常用 Ctrl/Option 词级与行级操作。`Shift+Tab` 只在安全交互模式之间循环，绝不会顺手进入 bypass；`Esc Esc` 清空输入；模型或工具运行时按 `Ctrl-C` 会事务式取消本轮，回滚尚未提交的消息与本轮新建后台任务；空输入区连续按两次 `Ctrl-C` 才退出。权限提示可选择仅允许一次、拒绝、中断，或只在当前进程记住同一个精确规范化动作；deny 与 Plan mode 始终优先。非 TTY 仍使用朴素行协议，`--print` 的机器可读格式保持不变。
 
 这里复刻的是可观察的终端行为，不是专有代码或资产。二进制背后没有藏着 JavaScript renderer：输入编辑、光标控制、事件渲染、中断和模式状态都在 `src/terminal.rs`，引擎事件来自 `src/query.rs`。
 

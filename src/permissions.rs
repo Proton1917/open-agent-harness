@@ -62,6 +62,7 @@ pub struct PermissionManager {
     pub interactive: bool,
     allow: Vec<String>,
     deny: Vec<String>,
+    session_grants: Arc<RwLock<Vec<SessionGrant>>>,
     session_mode: Arc<RwLock<Option<PermissionMode>>>,
     workspace_deny: Arc<RwLock<Vec<String>>>,
     prompt_handler: Arc<RwLock<Option<PermissionPromptHandler>>>,
@@ -97,6 +98,12 @@ pub struct PermissionTarget {
     pub candidates: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionGrant {
+    invocation_tool: String,
+    targets: Vec<PermissionTarget>,
+}
+
 impl PermissionTarget {
     pub fn new(tool: impl Into<String>, candidates: Vec<String>) -> Self {
         Self {
@@ -118,6 +125,7 @@ impl PermissionManager {
             interactive,
             allow,
             deny,
+            session_grants: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(RwLock::new(None)),
             workspace_deny: Arc::new(RwLock::new(Vec::new())),
             prompt_handler: Arc::new(RwLock::new(None)),
@@ -154,6 +162,7 @@ impl PermissionManager {
             interactive: self.interactive,
             allow: self.allow.clone(),
             deny: self.deny.clone(),
+            session_grants: Arc::clone(&self.session_grants),
             session_mode: Arc::clone(&self.session_mode),
             workspace_deny: Arc::new(RwLock::new(self.workspace_deny_rules())),
             prompt_handler: Arc::clone(&self.prompt_handler),
@@ -309,6 +318,9 @@ impl PermissionManager {
         if invocation_matches_rules(&self.allow, tool, summary, targets, RuleBehavior::Allow) {
             return Ok(PermissionDecision::Allow);
         }
+        if self.invocation_matches_session_grant(tool, targets) {
+            return Ok(PermissionDecision::Allow);
+        }
         match mode {
             PermissionMode::BypassPermissions => Ok(PermissionDecision::Allow),
             PermissionMode::Plan => unreachable!("plan mode returned before allow-rule handling"),
@@ -338,12 +350,110 @@ impl PermissionManager {
                     return handler(&request);
                 }
                 if self.interactive {
-                    prompt(tool, summary)
+                    let session_available = session_grant_is_bounded(tool, targets);
+                    match prompt(tool, summary, session_available)? {
+                        crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
+                        crate::terminal::PermissionChoice::AllowForSession => {
+                            if !session_available {
+                                return Ok(PermissionDecision::Deny);
+                            }
+                            self.add_session_grant(tool, targets)?;
+                            // A project deny may have been hot-refreshed while the
+                            // user was deciding. Re-run the deny/plan boundary
+                            // before honoring the new exact grant.
+                            if self.invocation_blocked_by_deny_or_plan(
+                                tool,
+                                summary,
+                                read_only,
+                                outside_workspace,
+                                targets,
+                            ) {
+                                Ok(PermissionDecision::Deny)
+                            } else {
+                                Ok(PermissionDecision::Allow)
+                            }
+                        }
+                        crate::terminal::PermissionChoice::Deny => Ok(PermissionDecision::Deny),
+                        crate::terminal::PermissionChoice::Interrupt => {
+                            Ok(PermissionDecision::Interrupt)
+                        }
+                    }
                 } else {
                     Ok(PermissionDecision::Deny)
                 }
             }
         }
+    }
+
+    fn invocation_matches_session_grant(
+        &self,
+        invocation_tool: &str,
+        targets: &[PermissionTarget],
+    ) -> bool {
+        self.session_grants
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|grant| {
+                grant.invocation_tool == invocation_tool
+                    && grant.targets.len() == targets.len()
+                    && targets.iter().all(|target| {
+                        grant.targets.iter().any(|granted| {
+                            granted.tool == target.tool
+                                && target
+                                    .candidates
+                                    .iter()
+                                    .any(|candidate| granted.candidates.contains(candidate))
+                        })
+                    })
+                    && grant.targets.iter().all(|granted| {
+                        targets.iter().any(|target| {
+                            target.tool == granted.tool
+                                && granted
+                                    .candidates
+                                    .iter()
+                                    .any(|candidate| target.candidates.contains(candidate))
+                        })
+                    })
+            })
+    }
+
+    fn add_session_grant(&self, invocation_tool: &str, targets: &[PermissionTarget]) -> Result<()> {
+        if !session_grant_is_bounded(invocation_tool, targets) {
+            bail!("session permission grant 超出精确授权上限")
+        }
+        let grant = SessionGrant {
+            invocation_tool: invocation_tool.to_owned(),
+            targets: targets.to_vec(),
+        };
+        let mut grants = self
+            .session_grants
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if grants.len() >= 256 && !grants.contains(&grant) {
+            bail!("session permission grant 达到 256 条上限")
+        }
+        if !grants.contains(&grant) {
+            grants.push(grant);
+        }
+        Ok(())
+    }
+
+    fn invocation_blocked_by_deny_or_plan(
+        &self,
+        tool: &str,
+        summary: &str,
+        read_only: bool,
+        outside_workspace: bool,
+        targets: &[PermissionTarget],
+    ) -> bool {
+        let workspace_deny = self
+            .workspace_deny
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        invocation_matches_rules(&self.deny, tool, summary, targets, RuleBehavior::Deny)
+            || invocation_matches_rules(&workspace_deny, tool, summary, targets, RuleBehavior::Deny)
+            || self.effective_mode() == PermissionMode::Plan && (outside_workspace || !read_only)
     }
 
     pub fn permits_updated_invocation(
@@ -2206,12 +2316,32 @@ fn is_duration(value: &str) -> bool {
         })
 }
 
-fn prompt(tool: &str, summary: &str) -> Result<PermissionDecision> {
-    match crate::terminal::request_permission(tool, summary)? {
-        crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
-        crate::terminal::PermissionChoice::Deny => Ok(PermissionDecision::Deny),
-        crate::terminal::PermissionChoice::Interrupt => Ok(PermissionDecision::Interrupt),
-    }
+fn session_grant_is_bounded(invocation_tool: &str, targets: &[PermissionTarget]) -> bool {
+    !invocation_tool.is_empty()
+        && invocation_tool.len() <= 128
+        && !invocation_tool.contains(['\0', '\r', '\n'])
+        && !targets.is_empty()
+        && targets.len() <= 16
+        && targets.iter().all(|target| {
+            !target.tool.is_empty()
+                && target.tool.len() <= 128
+                && !target.tool.contains(['\0', '\r', '\n'])
+                && !target.candidates.is_empty()
+                && target.candidates.len() <= 16
+                && target.candidates.iter().all(|candidate| {
+                    !candidate.is_empty()
+                        && candidate.len() <= 512
+                        && !candidate.contains(['\0', '\r', '\n'])
+                })
+        })
+}
+
+fn prompt(
+    tool: &str,
+    summary: &str,
+    session_available: bool,
+) -> Result<crate::terminal::PermissionChoice> {
+    crate::terminal::request_permission(tool, summary, session_available)
 }
 
 #[cfg(test)]
@@ -2780,6 +2910,116 @@ mod tests {
                 .unwrap(),
             PermissionDecision::Deny,
             "a wildcard skill allow must not override Plan mode"
+        );
+    }
+
+    #[test]
+    fn exact_session_grants_are_shared_but_never_override_deny_or_plan() {
+        let manager =
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new());
+        let targets = vec![PermissionTarget::new(
+            "Bash",
+            vec!["cargo test --lib".to_owned()],
+        )];
+        manager.add_session_grant("Bash", &targets).unwrap();
+        assert_eq!(
+            manager
+                .decide_invocation_with_targets(
+                    "Bash",
+                    &Value::Null,
+                    "tool-1",
+                    "cargo test --lib",
+                    false,
+                    false,
+                    false,
+                    &targets,
+                )
+                .unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            manager
+                .decide("Bash", "cargo test --all-targets", false, false, false,)
+                .unwrap(),
+            PermissionDecision::Deny,
+            "an exact session grant must not widen to similar commands"
+        );
+
+        let fork = manager.fork_for_context();
+        assert_eq!(
+            fork.decide_invocation_with_targets(
+                "Bash",
+                &Value::Null,
+                "tool-2",
+                "cargo test --lib",
+                false,
+                false,
+                false,
+                &targets,
+            )
+            .unwrap(),
+            PermissionDecision::Allow,
+            "session grants must be shared by context forks"
+        );
+        fork.set_workspace_deny(vec!["Bash(cargo test --lib)".to_owned()]);
+        assert_eq!(
+            fork.decide_invocation_with_targets(
+                "Bash",
+                &Value::Null,
+                "tool-3",
+                "cargo test --lib",
+                false,
+                false,
+                false,
+                &targets,
+            )
+            .unwrap(),
+            PermissionDecision::Deny,
+            "project deny must override a session grant"
+        );
+
+        let plan = PermissionManager::new(PermissionMode::Plan, false, Vec::new(), Vec::new());
+        plan.add_session_grant("Bash", &targets).unwrap();
+        assert_eq!(
+            plan.decide_invocation_with_targets(
+                "Bash",
+                &Value::Null,
+                "tool-4",
+                "cargo test --lib",
+                false,
+                false,
+                false,
+                &targets,
+            )
+            .unwrap(),
+            PermissionDecision::Deny,
+            "plan mode must override a session grant"
+        );
+
+        let compound =
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new());
+        let compound_targets = vec![
+            PermissionTarget::new("Bash", vec!["cat report.txt".to_owned()]),
+            PermissionTarget::new("Read", vec!["report.txt".to_owned()]),
+        ];
+        compound
+            .add_session_grant("Bash", &compound_targets)
+            .unwrap();
+        assert_eq!(
+            compound
+                .decide_invocation_with_targets(
+                    "Bash",
+                    &Value::Null,
+                    "tool-5",
+                    "cat report.txt",
+                    false,
+                    false,
+                    false,
+                    &compound_targets[..1],
+                )
+                .unwrap(),
+            PermissionDecision::Deny,
+            "a future invocation must match the complete normalized target set"
         );
     }
 }

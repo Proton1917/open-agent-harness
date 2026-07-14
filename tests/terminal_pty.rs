@@ -4,7 +4,10 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     net::TcpListener,
-    os::{fd::FromRawFd, unix::process::CommandExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::process::CommandExt,
+    },
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -16,6 +19,25 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     let mut output = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
     assert!(output.contains("open-agent-harness"));
     assert!(output.contains("default"));
+
+    terminal.write_all(b"XYZ").unwrap();
+    output.push_str(&read_until(&mut terminal, "XYZ", Duration::from_secs(3)));
+    terminal.write_all(b"\x7f").unwrap();
+    let redraw = read_until(&mut terminal, "XY", Duration::from_secs(3));
+    assert_no_bare_line_feeds(redraw.as_bytes());
+    output.push_str(&redraw);
+
+    set_terminal_size(&terminal, 40, 8);
+    let resized = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    assert!(resized.contains("\x1b[2J"));
+    assert_no_bare_line_feeds(resized.as_bytes());
+    output.push_str(&resized);
+    set_terminal_size(&terminal, 100, 30);
+    output.push_str(&read_until(
+        &mut terminal,
+        "Shift+Tab mode",
+        Duration::from_secs(3),
+    ));
 
     terminal.write_all(b"\x1b[Z").unwrap();
     output.push_str(&read_until(
@@ -85,6 +107,53 @@ fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
     ));
     assert!(output.contains("Interrupted"));
     assert_eq!(output.matches("Permission required").count(), 1);
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
+fn exact_session_permission_is_reused_without_a_second_prompt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for response in [
+            single_tool_stream("session-tool-1", "printf session-grant-ok"),
+            single_tool_stream("session-tool-2", "printf session-grant-ok"),
+            text_stream("SESSION_GRANT_OK"),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    terminal.write_all(b"repeat exact action\r").unwrap();
+    let mut output = read_until(&mut terminal, "Permission required", Duration::from_secs(5));
+    terminal.write_all(b"s").unwrap();
+    output.push_str(&read_until(
+        &mut terminal,
+        "SESSION_GRANT_OK",
+        Duration::from_secs(10),
+    ));
+    assert_eq!(output.matches("Permission required").count(), 1);
+    assert!(output.contains("Allowed exact action for this session"));
+
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
         &mut terminal,
@@ -193,6 +262,29 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
     panic!("terminal child did not exit")
 }
 
+fn assert_no_bare_line_feeds(output: &[u8]) {
+    for (index, byte) in output.iter().enumerate() {
+        if *byte == b'\n' {
+            assert!(
+                index > 0 && output[index - 1] == b'\r',
+                "raw-mode PTY output contained a bare line feed: {:?}",
+                String::from_utf8_lossy(output)
+            );
+        }
+    }
+}
+
+fn set_terminal_size(terminal: &File, columns: u16, rows: u16) {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+    assert_eq!(result, 0, "{}", io::Error::last_os_error());
+}
+
 fn tool_use_stream() -> String {
     [
         serde_json::json!({"type":"message_start","message":{
@@ -205,6 +297,38 @@ fn tool_use_stream() -> String {
         serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"printf second-command-must-not-run\"}"}}),
         serde_json::json!({"type":"content_block_stop","index":1}),
         serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(|value| format!("data: {value}\n\n"))
+    .collect()
+}
+
+fn single_tool_stream(id: &str, command: &str) -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":format!("message-{id}"),"content":[],"usage":{}
+        }}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"Bash","input":{}}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":serde_json::json!({"command":command}).to_string()}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(|value| format!("data: {value}\n\n"))
+    .collect()
+}
+
+fn text_stream(text: &str) -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"session-final","content":[],"usage":{}
+        }}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()

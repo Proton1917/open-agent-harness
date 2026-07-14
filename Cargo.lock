@@ -1412,6 +1412,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",

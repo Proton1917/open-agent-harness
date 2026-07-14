@@ -45,6 +45,10 @@ is accurate; “complete parity with the proprietary product” is not.
   still win, explicit allows and intrinsically safe reads may proceed, and an
   operation that would require a question is denied instead of silently
   upgrading authority.
+- Interactive permission prompts may retain an exact normalized invocation for
+  the current process. The grant is bounded, shared across context forks, never
+  persisted or widened to a prefix, and remains subordinate to live project
+  deny rules and Plan mode.
 - Delegated-agent cancellation and timeout enter the ordinary query transaction
   instead of dropping its future from outside. This preserves no-persistence
   hot-refresh rollback before descendant/background cleanup.
