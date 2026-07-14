@@ -69,7 +69,7 @@ impl Tool for GlobTool {
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(include_entry)
+            .filter_entry(|entry| include_entry(entry) && !context.read_path_denied(entry.path()))
         {
             visited += 1;
             if visited > MAX_VISITED_ENTRIES || started.elapsed() > MAX_SEARCH_TIME {

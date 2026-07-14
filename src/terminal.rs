@@ -114,6 +114,8 @@ impl ConversationUi {
                 let _ = styled_status(&mut out, self.color, &label);
                 state.status_open = true;
             }
+            QueryEvent::AssistantMessage { .. } => {}
+            QueryEvent::CheckpointCreated { .. } => {}
             QueryEvent::ToolStarted { name, summary, .. } => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
@@ -940,7 +942,9 @@ fn next_mode(mode: PermissionMode) -> PermissionMode {
     match mode {
         PermissionMode::Default => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
-        PermissionMode::Plan | PermissionMode::BypassPermissions => PermissionMode::Default,
+        PermissionMode::Plan | PermissionMode::BypassPermissions | PermissionMode::DontAsk => {
+            PermissionMode::Default
+        }
     }
 }
 
@@ -950,6 +954,7 @@ fn mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::AcceptEdits => "accept edits",
         PermissionMode::Plan => "plan",
         PermissionMode::BypassPermissions => "bypass permissions",
+        PermissionMode::DontAsk => "don't ask",
     }
 }
 
@@ -973,6 +978,8 @@ mod tests {
         );
         assert_eq!(next_mode(PermissionMode::AcceptEdits), PermissionMode::Plan);
         assert_eq!(next_mode(PermissionMode::Plan), PermissionMode::Default);
+        assert_eq!(next_mode(PermissionMode::DontAsk), PermissionMode::Default);
+        assert_eq!(mode_label(PermissionMode::DontAsk), "don't ask");
     }
 
     #[test]

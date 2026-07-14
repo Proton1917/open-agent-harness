@@ -116,6 +116,8 @@ impl Tool for NotebookEditTool {
         if updated.len() > MAX_EDITABLE_FILE_BYTES {
             bail!("更新后的 notebook 超过 {MAX_EDITABLE_FILE_BYTES} 字节限制")
         }
+        context.track_before_edit(&path)?;
+        context.expect_after_edit(&path, updated.as_bytes())?;
         atomic_write(&path, &updated)?;
         context.remember_read(path, updated, false).await?;
         Ok(ToolOutput::success(result))

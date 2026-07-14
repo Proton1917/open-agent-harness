@@ -65,6 +65,8 @@ impl Tool for WriteTool {
                 .with_context(|| format!("无法读取现有文件 {}", path.display()))?;
             context.verify_fresh_full_read(&path, &current).await?;
         }
+        context.track_before_edit(&path)?;
+        context.expect_after_edit(&path, input.content.as_bytes())?;
         atomic_write(&path, &input.content)?;
         context
             .remember_read(path.clone(), input.content, false)

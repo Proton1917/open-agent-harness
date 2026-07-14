@@ -191,6 +191,19 @@ impl Tool for TaskCreateTool {
             validate_metadata(metadata)?;
         }
         let id = store.next_id.max(1).to_string();
+        let hook_outcome = context
+            .hooks()
+            .run(
+                "TaskCreated",
+                Some(&id),
+                json!({
+                    "task_id":&id,
+                    "task_subject":input.subject.trim(),
+                    "task_description":input.description.trim(),
+                }),
+                &context.cwd(),
+            )
+            .await?;
         store.next_id = store
             .next_id
             .max(1)
@@ -208,10 +221,17 @@ impl Tool for TaskCreateTool {
             metadata: input.metadata.unwrap_or_default(),
         });
         save_store(context, &store)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Task #{id} created successfully: {}",
             input.subject.trim()
-        )))
+        ));
+        if !hook_outcome.additional_context.is_empty() {
+            output.append_context(
+                "TaskCreated hook context",
+                &hook_outcome.additional_context.join("\n"),
+            );
+        }
+        Ok(output)
     }
 }
 
@@ -412,6 +432,30 @@ impl Tool for TaskUpdateTool {
             return Ok(ToolOutput::error("Task not found"));
         };
 
+        let completion_hook = if input.status.as_deref() == Some("completed")
+            && store.tasks[position].status != "completed"
+        {
+            let task = &store.tasks[position];
+            Some(
+                context
+                    .hooks()
+                    .run(
+                        "TaskCompleted",
+                        Some(&task.id),
+                        json!({
+                            "task_id":&task.id,
+                            "task_subject":&task.subject,
+                            "task_description":&task.description,
+                            "owner":&task.owner,
+                        }),
+                        &context.cwd(),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         if input.status.as_deref() == Some("deleted") {
             store.tasks.remove(position);
             for task in &mut store.tasks {
@@ -488,7 +532,7 @@ impl Tool for TaskUpdateTool {
         updated.sort_unstable();
         updated.dedup();
         save_store(context, &store)?;
-        Ok(ToolOutput::success(format!(
+        let mut output = ToolOutput::success(format!(
             "Updated task #{}: {}",
             input.task_id,
             if updated.is_empty() {
@@ -496,7 +540,16 @@ impl Tool for TaskUpdateTool {
             } else {
                 updated.join(", ")
             }
-        )))
+        ));
+        if let Some(outcome) = completion_hook {
+            if !outcome.additional_context.is_empty() {
+                output.append_context(
+                    "TaskCompleted hook context",
+                    &outcome.additional_context.join("\n"),
+                );
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -622,4 +675,72 @@ fn validate_metadata(metadata: &Map<String, Value>) -> Result<()> {
         bail!("metadata 超过 {MAX_METADATA_BYTES} 字节限制")
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        config::Settings,
+        hooks::HookRunner,
+        permissions::{PermissionManager, PermissionMode},
+    };
+
+    fn context_with_hooks(workspace: &std::path::Path, hooks: Value) -> ToolContext {
+        let mut context = ToolContext::new(
+            workspace.to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_task_store_path(workspace.join("tasks.json"));
+        context.set_hooks(Arc::new(
+            HookRunner::from_settings(&Settings {
+                raw: json!({"hooks":hooks}),
+            })
+            .unwrap(),
+        ));
+        context
+    }
+
+    #[tokio::test]
+    async fn task_hooks_add_context_and_block_completion_before_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context_with_hooks(
+            temp.path(),
+            json!({
+                "TaskCreated":[{"matcher":"*", "hooks":[{
+                    "type":"command",
+                    "command":"printf '%s' '{\"additionalContext\":\"created-context\"}'"
+                }]}],
+                "TaskCompleted":[{"matcher":"*", "hooks":[{
+                    "type":"command", "command":"printf blocked >&2; exit 2"
+                }]}]
+            }),
+        );
+        let created = TaskCreateTool
+            .execute(
+                &context,
+                json!({"subject":"audit", "description":"verify parity"}),
+            )
+            .await
+            .unwrap();
+        assert!(created.content.contains("created-context"));
+
+        let blocked = TaskUpdateTool
+            .execute(&context, json!({"taskId":"1", "status":"completed"}))
+            .await
+            .unwrap_err();
+        assert!(blocked.to_string().contains("blocked"));
+        let task = TaskGetTool
+            .execute(&context, json!({"taskId":"1"}))
+            .await
+            .unwrap();
+        assert!(task.content.contains("Status: pending"));
+    }
 }

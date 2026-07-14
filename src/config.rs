@@ -11,10 +11,21 @@ use serde_json::{Map, Value};
 use crate::{
     permissions::PermissionMode,
     protocol::{ApiFormat, ChatTokensField},
+    sandbox::SandboxRuntime,
 };
 
 pub const DEFAULT_MODEL: &str = "default";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+const MAX_PLUGIN_DIRECTORIES: usize = 32;
+const MAX_EXTENSION_PATH_BYTES: usize = 4096;
+const MAX_OUTPUT_STYLE_NAME_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoMemorySettings {
+    pub enabled: bool,
+    pub auto_extract: bool,
+    pub path: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 pub struct Settings {
@@ -93,11 +104,46 @@ impl Settings {
             merge_json(&mut merged, value);
         }
 
+        if !bare {
+            append_installed_plugin_directories(
+                &mut merged,
+                crate::plugin_manager::installed_plugin_directories_default()?,
+            )?;
+        }
+
         Ok(Self { raw: merged })
+    }
+
+    /// Remove every runtime customization while retaining only the policy surface needed by
+    /// built-in tools. This is intentionally applied after all settings layers merge so an
+    /// explicit `--settings` file cannot re-enable an extension in safe mode.
+    pub fn retain_safe_mode_core(&mut self) {
+        let Some(root) = self.raw.as_object_mut() else {
+            self.raw = Value::Object(Map::new());
+            return;
+        };
+        root.retain(|key, _| matches!(key.as_str(), "model" | "permissions" | "sandbox"));
     }
 
     pub fn model(&self) -> Option<&str> {
         self.raw.get("model").and_then(Value::as_str)
+    }
+
+    /// Returns a statically selected output style from trusted settings.
+    /// Project settings cannot contribute this key because their merge surface
+    /// is restricted to permission deny rules.
+    pub fn output_style(&self) -> Result<Option<&str>> {
+        let Some(value) = self.raw.get("outputStyle") else {
+            return Ok(None);
+        };
+        let name = value.as_str().context("outputStyle 必须是 string")?;
+        if name.is_empty()
+            || name.len() > MAX_OUTPUT_STYLE_NAME_BYTES
+            || name.contains(['\0', '\n', '\r'])
+        {
+            anyhow::bail!("outputStyle 为空、过长或包含控制字符")
+        }
+        Ok(Some(name))
     }
 
     pub fn permission_mode(&self) -> Option<PermissionMode> {
@@ -114,6 +160,98 @@ impl Settings {
 
     pub fn deny_rules(&self) -> Vec<String> {
         string_array_at(&self.raw, &["permissions", "deny"])
+    }
+
+    /// Build the command sandbox exclusively from the already merged trusted settings.
+    /// Project settings cannot contribute this key because `merge_project_json` only
+    /// appends permission deny rules.
+    pub fn sandbox_runtime(&self) -> Result<SandboxRuntime> {
+        SandboxRuntime::from_settings(&self.raw)
+    }
+
+    /// Returns explicitly trusted local plugin directories. Project settings
+    /// cannot contribute this key because project merging retains deny rules only.
+    pub fn plugin_directories(&self) -> Result<Vec<PathBuf>> {
+        let Some(plugins) = self.raw.get("plugins") else {
+            return Ok(Vec::new());
+        };
+        let plugins = plugins.as_object().context("plugins 必须是 object")?;
+        if let Some(key) = plugins.keys().find(|key| key.as_str() != "directories") {
+            anyhow::bail!("plugins 包含未知字段 {key}")
+        }
+        let Some(directories) = plugins.get("directories") else {
+            return Ok(Vec::new());
+        };
+        let directories = directories
+            .as_array()
+            .context("plugins.directories 必须是 array")?;
+        if directories.len() > MAX_PLUGIN_DIRECTORIES {
+            anyhow::bail!("plugin 目录超过 {MAX_PLUGIN_DIRECTORIES} 个限制")
+        }
+        directories
+            .iter()
+            .map(|value| {
+                let value = value
+                    .as_str()
+                    .context("plugins.directories 只能包含 string")?;
+                if value.trim().is_empty()
+                    || value.len() > MAX_EXTENSION_PATH_BYTES
+                    || value.contains('\0')
+                {
+                    anyhow::bail!("plugin 目录路径为空、过长或包含 NUL")
+                }
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    anyhow::bail!("plugin 目录必须使用绝对路径")
+                }
+                Ok(path)
+            })
+            .collect()
+    }
+
+    /// Auto-memory is opt-in and can only be enabled by trusted settings.
+    pub fn auto_memory_settings(&self) -> Result<AutoMemorySettings> {
+        let Some(memory) = self.raw.get("memory") else {
+            return Ok(AutoMemorySettings::default());
+        };
+        let memory = memory.as_object().context("memory 必须是 object")?;
+        if let Some(key) = memory
+            .keys()
+            .find(|key| !matches!(key.as_str(), "enabled" | "autoExtract" | "path"))
+        {
+            anyhow::bail!("memory 包含未知字段 {key}")
+        }
+        let enabled = memory
+            .get("enabled")
+            .map(|value| value.as_bool().context("memory.enabled 必须是 boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        let auto_extract = memory
+            .get("autoExtract")
+            .map(|value| value.as_bool().context("memory.autoExtract 必须是 boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        if auto_extract && !enabled {
+            anyhow::bail!("memory.autoExtract=true 要求 memory.enabled=true")
+        }
+        let path = memory
+            .get("path")
+            .map(|value| {
+                let value = value.as_str().context("memory.path 必须是 string")?;
+                if value.trim().is_empty()
+                    || value.len() > MAX_EXTENSION_PATH_BYTES
+                    || value.contains('\0')
+                {
+                    anyhow::bail!("memory.path 为空、过长或包含 NUL")
+                }
+                Ok(PathBuf::from(value))
+            })
+            .transpose()?;
+        Ok(AutoMemorySettings {
+            enabled,
+            auto_extract,
+            path,
+        })
     }
 
     /// # Safety
@@ -217,6 +355,40 @@ fn merge_json(target: &mut Value, incoming: Value) {
         }
         (target, incoming) => *target = incoming,
     }
+}
+
+fn append_installed_plugin_directories(
+    target: &mut Value,
+    directories: Vec<PathBuf>,
+) -> Result<()> {
+    if directories.is_empty() {
+        return Ok(());
+    }
+    let root = target
+        .as_object_mut()
+        .context("trusted settings 顶层必须是 object")?;
+    let plugins = root
+        .entry("plugins")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .context("settings.plugins 必须是 object")?;
+    let configured = plugins
+        .entry("directories")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .context("settings.plugins.directories 必须是 array")?;
+    for directory in directories {
+        let directory = directory
+            .to_str()
+            .context("installed plugin path 不是有效 UTF-8")?;
+        if !configured
+            .iter()
+            .any(|value| value.as_str() == Some(directory))
+        {
+            configured.push(Value::String(directory.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 pub fn endpoint_config() -> Result<EndpointConfig> {
@@ -380,9 +552,46 @@ mod tests {
     }
 
     #[test]
+    fn trusted_settings_recognize_dont_ask_mode() {
+        let settings = Settings {
+            raw: serde_json::json!({"permissions":{"defaultMode":"dontAsk"}}),
+        };
+        assert_eq!(settings.permission_mode(), Some(PermissionMode::DontAsk));
+    }
+
+    #[test]
+    fn installed_plugin_directories_are_appended_as_trusted_user_state() {
+        let mut settings = serde_json::json!({
+            "plugins":{"directories":["/trusted/explicit"]}
+        });
+        append_installed_plugin_directories(
+            &mut settings,
+            vec![
+                PathBuf::from("/trusted/explicit"),
+                PathBuf::from("/trusted/installed"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            settings["plugins"]["directories"],
+            serde_json::json!(["/trusted/explicit", "/trusted/installed"])
+        );
+
+        let mut malformed = serde_json::json!({"plugins":{"directories":"not-an-array"}});
+        assert!(
+            append_installed_plugin_directories(
+                &mut malformed,
+                vec![PathBuf::from("/trusted/installed")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn project_settings_cannot_redirect_or_elevate() {
         let mut trusted = serde_json::json!({
             "env": {"HARNESS_BASE_URL": "https://trusted.invalid"},
+            "sandbox": {"enabled": false, "failIfUnavailable": true},
             "permissions": {
                 "defaultMode": "default",
                 "allow": ["Read"],
@@ -399,7 +608,13 @@ mod tests {
                     "allow": ["Bash(*)"],
                     "deny": ["Write(secrets/**)"]
                 },
-                "model": "project-model"
+                "sandbox": {"enabled": true, "failIfUnavailable": false},
+                "model": "project-model",
+                "commands": {"unsafe":"run this"},
+                "plugins": {"directories":["/tmp/untrusted"]},
+                "memory": {"enabled":true},
+                "mcpServers": {"untrusted":{"url":"https://untrusted.invalid/mcp"}},
+                "hooks": {"PreToolUse":[]}
             }),
         )
         .unwrap();
@@ -408,12 +623,19 @@ mod tests {
             "https://trusted.invalid"
         );
         assert_eq!(trusted["permissions"]["defaultMode"], "default");
+        assert_eq!(trusted["sandbox"]["enabled"], false);
+        assert_eq!(trusted["sandbox"]["failIfUnavailable"], true);
         assert_eq!(trusted["permissions"]["allow"], serde_json::json!(["Read"]));
         assert_eq!(
             trusted["permissions"]["deny"],
             serde_json::json!(["Bash(git push *)", "Write(secrets/**)"])
         );
         assert_eq!(trusted["model"], "trusted-model");
+        assert!(trusted.get("commands").is_none());
+        assert!(trusted.get("plugins").is_none());
+        assert!(trusted.get("memory").is_none());
+        assert!(trusted.get("mcpServers").is_none());
+        assert!(trusted.get("hooks").is_none());
     }
 
     #[test]
@@ -455,5 +677,83 @@ mod tests {
         let mut merged = serde_json::json!({});
         let error = merge_project_file_if_present(&mut merged, &link).unwrap_err();
         assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn trusted_extension_settings_are_typed_and_bounded() {
+        let settings = Settings {
+            raw: serde_json::json!({
+                "plugins":{"directories":["/tmp/one", "/tmp/two"]},
+                "memory":{"enabled":true, "autoExtract":true, "path":"memory-root"},
+                "outputStyle":"runtime:brief"
+            }),
+        };
+        assert_eq!(settings.plugin_directories().unwrap().len(), 2);
+        assert_eq!(settings.output_style().unwrap(), Some("runtime:brief"));
+        assert_eq!(
+            settings.auto_memory_settings().unwrap(),
+            AutoMemorySettings {
+                enabled: true,
+                auto_extract: true,
+                path: Some(PathBuf::from("memory-root"))
+            }
+        );
+        let invalid = Settings {
+            raw: serde_json::json!({"plugins":{"directories":[], "install":true}}),
+        };
+        assert!(invalid.plugin_directories().is_err());
+        let relative = Settings {
+            raw: serde_json::json!({"plugins":{"directories":["relative/plugin"]}}),
+        };
+        assert!(relative.plugin_directories().is_err());
+        let extraction_without_memory = Settings {
+            raw: serde_json::json!({"memory":{"autoExtract":true}}),
+        };
+        assert!(extraction_without_memory.auto_memory_settings().is_err());
+        let invalid_extraction = Settings {
+            raw: serde_json::json!({"memory":{"enabled":true,"autoExtract":"yes"}}),
+        };
+        assert!(invalid_extraction.auto_memory_settings().is_err());
+        for raw in [
+            serde_json::json!({"outputStyle":false}),
+            serde_json::json!({"outputStyle":""}),
+            serde_json::json!({"outputStyle":"bad\nname"}),
+            serde_json::json!({"outputStyle":"x".repeat(MAX_OUTPUT_STYLE_NAME_BYTES + 1)}),
+        ] {
+            assert!(Settings { raw }.output_style().is_err());
+        }
+    }
+
+    #[test]
+    fn safe_mode_retains_only_model_permissions_and_sandbox_policy() {
+        let mut settings = Settings {
+            raw: serde_json::json!({
+                "model":"model-id",
+                "permissions":{"defaultMode":"dontAsk", "deny":["Bash(rm:*)"]},
+                "sandbox":{"enabled":true, "allowedDomains":["example.com"]},
+                "env":{"SECRET":"must-not-apply"},
+                "plugins":{"directories":["/tmp/plugin"]},
+                "commands":{"custom":"ignored"},
+                "agents":{"definitions":{}},
+                "hooks":{"PreToolUse":[]},
+                "mcpServers":{"server":{"command":"ignored"}},
+                "lspServers":{"rust":{"command":"ignored"}},
+                "outputStyle":"custom",
+                "memory":{"enabled":true},
+                "web":{"search":{"endpoint":"https://example.invalid"}},
+                "worktree":{"enabled":true},
+                "workflows":{"build":{}}
+            }),
+        };
+        settings.retain_safe_mode_core();
+        let root = settings.raw.as_object().unwrap();
+        assert_eq!(root.len(), 3);
+        assert_eq!(settings.model(), Some("model-id"));
+        assert_eq!(settings.deny_rules(), vec!["Bash(rm:*)"]);
+        assert!(root.contains_key("sandbox"));
+        assert!(!root.contains_key("env"));
+        assert!(!root.contains_key("plugins"));
+        assert!(!root.contains_key("mcpServers"));
+        assert!(!root.contains_key("workflows"));
     }
 }

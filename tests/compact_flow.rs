@@ -164,6 +164,198 @@ async fn query_auto_compacts_before_normal_model_round() {
     assert_eq!(engine.compaction_count, 1);
 }
 
+#[tokio::test]
+async fn endpoint_size_rejection_compacts_once_and_truncates_a_rejected_summary() {
+    const CURRENT_PROMPT: &str = "reactive-current-prompt";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_slice(&read_http_body(&mut stream)).unwrap();
+            let serialized = request.to_string();
+            match index {
+                0 => {
+                    assert!(serialized.contains(CURRENT_PROMPT));
+                    assert!(!serialized.contains("Context for Continuing Work"));
+                    write_json_error(
+                        &mut stream,
+                        400,
+                        r#"{"error":{"type":"context_length_exceeded","message":"limit"}}"#,
+                    );
+                }
+                1 => {
+                    assert!(serialized.contains("Context for Continuing Work"));
+                    assert!(!serialized.contains("earlier conversation truncated"));
+                    write_json_error(
+                        &mut stream,
+                        413,
+                        r#"{"error":{"message":"request too large"}}"#,
+                    );
+                }
+                2 => {
+                    assert!(serialized.contains("Context for Continuing Work"));
+                    assert!(serialized.contains("earlier conversation truncated"));
+                    write_sse_response(&mut stream, &summary_stream());
+                }
+                3 => {
+                    assert!(serialized.contains("Current work preserved"));
+                    assert!(serialized.contains(CURRENT_PROMPT));
+                    write_sse_response(&mut stream, &final_stream());
+                }
+                _ => unreachable!(),
+            }
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1000,
+            system: "test system".into(),
+            messages: vec![
+                Message::user_text("old request one"),
+                Message::assistant(vec![
+                    serde_json::json!({"type":"text","text":"old answer one"}),
+                ]),
+                Message::user_text("old request two"),
+                Message::assistant(vec![
+                    serde_json::json!({"type":"text","text":"old answer two"}),
+                ]),
+            ],
+            debug: false,
+            text_delta_sink: None,
+            compact_config: Some(CompactConfig {
+                enabled: true,
+                auto_enabled: false,
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        },
+    );
+
+    let result = engine.run_turn(CURRENT_PROMPT.into()).await.unwrap();
+    server.join().unwrap();
+    assert!(result.compacted);
+    assert_eq!(result.text, "continued");
+    assert_eq!(engine.compaction_count, 1);
+}
+
+#[tokio::test]
+async fn repeated_size_rejection_does_not_spiral_and_restores_turn_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_slice(&read_http_body(&mut stream)).unwrap();
+            if index == 1 {
+                assert!(request.to_string().contains("Context for Continuing Work"));
+                write_sse_response(&mut stream, &summary_stream());
+            } else {
+                write_json_error(
+                    &mut stream,
+                    413,
+                    r#"{"error":{"message":"payload too large"}}"#,
+                );
+            }
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let original = vec![
+        Message::user_text("old request"),
+        Message::assistant(vec![serde_json::json!({"type":"text","text":"old answer"})]),
+    ];
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1000,
+            system: "test system".into(),
+            messages: original.clone(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: Some(CompactConfig {
+                enabled: true,
+                auto_enabled: false,
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        },
+    );
+
+    let error = engine.run_turn("still too large".into()).await.unwrap_err();
+    server.join().unwrap();
+    assert!(error.to_string().contains("Model endpoint 413"));
+    assert_eq!(engine.messages, original);
+    assert_eq!(engine.compaction_count, 0);
+}
+
+fn write_json_error(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
+fn write_sse_response(stream: &mut std::net::TcpStream, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
 fn summary_stream() -> String {
     [
         serde_json::json!({"type":"message_start","message":{

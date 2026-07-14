@@ -7,7 +7,7 @@ use serde_json::json;
 use tempfile::tempdir;
 
 fn context(root: &std::path::Path) -> ToolContext {
-    ToolContext::new(
+    let context = ToolContext::new(
         root.to_owned(),
         PermissionManager::new(
             PermissionMode::BypassPermissions,
@@ -15,7 +15,11 @@ fn context(root: &std::path::Path) -> ToolContext {
             Vec::new(),
             Vec::new(),
         ),
-    )
+    );
+    context
+        .set_task_capture_root(root.join(".test-task-captures"))
+        .unwrap();
+    context
 }
 
 #[cfg(unix)]
@@ -148,6 +152,112 @@ async fn glob_and_grep_return_real_matches() {
         .await;
     assert!(!grep.is_error, "{}", grep.content);
     assert!(grep.content.contains("migrated_marker"));
+}
+
+#[tokio::test]
+async fn read_deny_rules_filter_glob_and_grep_results() {
+    let temp = tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("secret")).unwrap();
+    std::fs::create_dir(temp.path().join("public")).unwrap();
+    std::fs::write(temp.path().join("secret/token.txt"), "needle secret\n").unwrap();
+    std::fs::write(temp.path().join("public/readme.txt"), "needle public\n").unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            vec!["Read(secret/**)".into()],
+        ),
+    );
+    let registry = ToolRegistry::default();
+
+    let glob = registry
+        .execute(&context, "Glob", json!({"pattern":"**/*.txt"}))
+        .await;
+    assert!(!glob.is_error, "{}", glob.content);
+    assert!(glob.content.contains("public/readme.txt"));
+    assert!(!glob.content.contains("secret/token.txt"));
+
+    let grep = registry
+        .execute(
+            &context,
+            "Grep",
+            json!({"pattern":"needle","output_mode":"content"}),
+        )
+        .await;
+    assert!(!grep.is_error, "{}", grep.content);
+    assert!(grep.content.contains("public/readme.txt"));
+    assert!(!grep.content.contains("secret/token.txt"));
+
+    for path in [
+        "./secret/../secret/token.txt".to_owned(),
+        temp.path()
+            .join("secret/token.txt")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        let direct = registry
+            .execute(&context, "Read", json!({"file_path":path}))
+            .await;
+        assert!(direct.is_error);
+        assert!(!direct.content.contains("needle secret"));
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            temp.path().join("secret/token.txt"),
+            temp.path().join("token-alias.txt"),
+        )
+        .unwrap();
+        let alias = registry
+            .execute(&context, "Read", json!({"file_path":"token-alias.txt"}))
+            .await;
+        assert!(alias.is_error);
+        assert!(!alias.content.contains("needle secret"));
+    }
+}
+
+#[tokio::test]
+async fn unc_and_windows_device_namespace_paths_fail_before_filesystem_access() {
+    let temp = tempdir().unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+    for path in [
+        r"\\server\share\secret.txt",
+        "//server/share/secret.txt",
+        r"\\?\C:\secret.txt",
+        "//./C:/secret.txt",
+        r"\??\C:\secret.txt",
+        r"\Device\Mup\server\share\secret.txt",
+        r"\GLOBAL??\C:\secret.txt",
+    ] {
+        let output = registry
+            .execute(&context, "Read", json!({"file_path":path}))
+            .await;
+        assert!(output.is_error, "path unexpectedly accepted: {path}");
+        assert!(
+            output.content.contains("UNC") || output.content.contains("device namespace"),
+            "unexpected preflight error for {path}: {}",
+            output.content
+        );
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn reserved_windows_device_names_are_rejected() {
+    let temp = tempdir().unwrap();
+    let output = ToolRegistry::default()
+        .execute(
+            &context(temp.path()),
+            "Read",
+            json!({"file_path":"NUL.txt"}),
+        )
+        .await;
+    assert!(output.is_error);
+    assert!(output.content.contains("保留设备"));
 }
 
 #[tokio::test]
@@ -540,8 +650,9 @@ async fn bash_large_output_is_bounded_and_retained_privately() {
     let command = "for /L %i in (1,1,10000) do @echo 0123456789";
     #[cfg(not(windows))]
     let command = "yes 0123456789 | head -c 100000";
+    let context = context(temp.path());
     let output = ToolRegistry::default()
-        .execute(&context(temp.path()), "Bash", json!({"command":command}))
+        .execute(&context, "Bash", json!({"command":command}))
         .await;
     assert!(!output.is_error, "{}", output.content);
     assert!(output.content.len() < 32_000);
@@ -551,10 +662,7 @@ async fn bash_large_output_is_bounded_and_retained_privately() {
         .split_once(marker)
         .and_then(|(_, tail)| tail.split_once(" (").map(|(path, _)| path))
         .expect("large output path");
-    assert!(retained.starts_with("~/"));
-    let retained = dirs::home_dir()
-        .unwrap()
-        .join(retained.trim_start_matches("~/"));
+    let retained = temp.path().join(retained);
     let metadata = std::fs::metadata(&retained).unwrap();
     assert!((100_000..=8 * 1024 * 1024).contains(&metadata.len()));
     #[cfg(unix)]
@@ -563,6 +671,73 @@ async fn bash_large_output_is_bounded_and_retained_privately() {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
     std::fs::remove_file(retained).unwrap();
+}
+
+#[tokio::test]
+async fn workflow_large_step_output_does_not_leave_an_unreachable_capture() {
+    let temp = tempdir().unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+    let marker = format!("workflow-capture-{}", uuid::Uuid::new_v4());
+    let task_directory = temp.path().join(".test-task-captures");
+    let before = std::fs::read_dir(&task_directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<std::collections::HashSet<_>>();
+    #[cfg(windows)]
+    let command = format!("for /L %i in (1,1,10000) do @echo {marker}");
+    #[cfg(not(windows))]
+    let command = format!("yes {marker} | head -c 100000");
+
+    let launched = registry
+        .execute(
+            &context,
+            "RunWorkflow",
+            json!({
+                "name":"large-output",
+                "steps":[{"id":"emit", "command":command}]
+            }),
+        )
+        .await;
+    assert!(!launched.is_error, "{}", launched.content);
+    let task_id = launched
+        .content
+        .lines()
+        .find_map(|line| line.strip_prefix("task_id="))
+        .expect("workflow task id");
+    let output = registry
+        .execute(
+            &context,
+            "TaskOutput",
+            json!({"task_id":task_id, "block":true, "timeout":10_000}),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(!output.content.contains("Full captured output:"));
+
+    let leaked = std::fs::read_dir(&task_directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| !before.contains(path))
+        .filter(|path| {
+            std::fs::read(path).ok().is_some_and(|bytes| {
+                bytes
+                    .windows(marker.len())
+                    .any(|part| part == marker.as_bytes())
+            })
+        })
+        .collect::<Vec<_>>();
+    for path in &leaked {
+        let _ = std::fs::remove_file(path);
+    }
+    assert!(
+        leaked.is_empty(),
+        "workflow left an unreachable foreground capture: {leaked:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -589,6 +764,38 @@ async fn bash_timeout_terminates_descendant_processes() {
     assert!(
         wait_for_process_exit(pid).await,
         "descendant process {pid} survived timeout"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_bash_reaps_detached_descendants_after_shell_exit() {
+    let temp = tempdir().unwrap();
+    let output = ToolRegistry::default()
+        .execute(
+            &context(temp.path()),
+            "Bash",
+            json!({
+                "command":"sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > detached.pid'"
+            }),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    let pid = std::fs::read_to_string(temp.path().join("detached.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let exited = wait_for_process_exit(pid).await;
+    if !exited {
+        // SAFETY: this PID came from the test-owned child process.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        exited,
+        "detached foreground descendant process {pid} survived normal shell exit"
     );
 }
 

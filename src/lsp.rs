@@ -9,12 +9,18 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+    time::timeout,
+};
 use url::Url;
 
 use crate::{
     config::Settings,
+    process::SecretEnvScrubber,
     rpc::{RpcFraming, RpcServerRequestHandler, StdioRpcClient, StdioRpcConfig},
+    session::sanitize_transport_text,
     tools::{Tool, ToolContext, ToolOutput, ToolService, object_schema},
 };
 
@@ -32,7 +38,11 @@ const MAX_DIAGNOSTICS_PER_FILE: usize = 10;
 const MAX_DIAGNOSTICS_PER_RESULT: usize = 30;
 const MAX_OPEN_DOCUMENTS_PER_SERVER: usize = 512;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 4096;
+const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 256;
 const MAX_URI_BYTES: usize = 16 * 1024;
+const OUTSIDE_WORKSPACE_URI: &str = "[outside-workspace-uri]";
+const OUTSIDE_WORKSPACE_PATH: &str = "[outside-workspace-path]";
+const DIAGNOSTIC_WAIT: Duration = Duration::from_millis(250);
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 const MIN_REQUEST_TIMEOUT_MS: u64 = 1_000;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
@@ -82,6 +92,7 @@ struct ServerConfig {
     request_timeout: Duration,
     max_restarts: u8,
     diagnostics: bool,
+    secret_env_scrubber: SecretEnvScrubber,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +106,7 @@ struct LspClient {
     rpc: Arc<StdioRpcClient>,
     documents: Arc<Mutex<HashMap<String, DocumentState>>>,
     diagnostics: Arc<Mutex<DiagnosticStore>>,
+    diagnostic_notify: Arc<Notify>,
     event_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -109,6 +121,7 @@ struct LspManager {
     extensions: HashMap<String, String>,
     clients: Mutex<HashMap<String, Arc<LspClient>>>,
     diagnostics: Arc<Mutex<DiagnosticStore>>,
+    diagnostic_notify: Arc<Notify>,
     debug: bool,
 }
 
@@ -129,6 +142,7 @@ pub fn configure_lsp(
         extensions,
         clients: Mutex::new(HashMap::new()),
         diagnostics: Arc::new(Mutex::new(DiagnosticStore::default())),
+        diagnostic_notify: Arc::new(Notify::new()),
         debug,
     });
     let tool: Arc<dyn Tool> = Arc::new(LspTool {
@@ -152,6 +166,7 @@ fn parse_server_configs(
     let raw_servers = raw_servers
         .as_object()
         .context("lspServers 必须是 JSON object")?;
+    let secret_env_scrubber = SecretEnvScrubber::from_settings(settings)?;
     if raw_servers.len() > MAX_SERVERS {
         bail!("lspServers 超过 {MAX_SERVERS} 个限制")
     }
@@ -195,6 +210,7 @@ fn parse_server_configs(
                 request_timeout: Duration::from_millis(timeout_ms),
                 max_restarts: raw.max_restarts.min(MAX_RESTARTS),
                 diagnostics: raw.diagnostics,
+                secret_env_scrubber: secret_env_scrubber.clone(),
             },
         );
     }
@@ -280,6 +296,7 @@ impl LspClient {
         config: ServerConfig,
         workspace: &Path,
         diagnostics: Arc<Mutex<DiagnosticStore>>,
+        diagnostic_notify: Arc<Notify>,
     ) -> Result<Arc<Self>> {
         let root_uri = file_uri(workspace)?;
         let workspace_folders = json!([{"uri": root_uri, "name": workspace.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")}]);
@@ -304,16 +321,19 @@ impl LspClient {
             _ => None,
         });
         let rpc = Arc::new(
-            StdioRpcClient::spawn(StdioRpcConfig {
-                label: format!("LSP/{}", config.name),
-                command: config.command.clone(),
-                args: config.args.clone(),
-                env: config.env.clone(),
-                cwd: config.cwd.clone(),
-                framing: RpcFraming::ContentLength,
-                request_timeout: config.request_timeout,
-                server_request_handler: Some(handler),
-            })
+            StdioRpcClient::spawn_with_secret_env_scrubber(
+                StdioRpcConfig {
+                    label: format!("LSP/{}", config.name),
+                    command: config.command.clone(),
+                    args: config.args.clone(),
+                    env: config.env.clone(),
+                    cwd: config.cwd.clone(),
+                    framing: RpcFraming::ContentLength,
+                    request_timeout: config.request_timeout,
+                    server_request_handler: Some(handler),
+                },
+                config.secret_env_scrubber.clone(),
+            )
             .await?,
         );
         rpc.request(
@@ -328,7 +348,8 @@ impl LspClient {
                     "workspace": {"symbol": {}, "workspaceFolders": true, "configuration": true},
                     "textDocument": {
                         "definition": {}, "references": {}, "hover": {}, "documentSymbol": {},
-                        "implementation": {}, "callHierarchy": {},
+                        "implementation": {}, "callHierarchy": {}, "rename": {},
+                        "diagnostic": {},
                         "synchronization": {"didSave": true, "dynamicRegistration": false}
                     }
                 }
@@ -351,6 +372,7 @@ impl LspClient {
             rpc,
             documents: Arc::clone(&documents),
             diagnostics: Arc::clone(&diagnostics),
+            diagnostic_notify,
             event_task: Mutex::new(None),
         });
         let mut events = client.rpc.subscribe();
@@ -440,17 +462,20 @@ impl LspClient {
         if uri.len() > MAX_URI_BYTES {
             return;
         }
-        if let Some(version) = params.get("version").and_then(Value::as_i64) {
-            let stale = self
-                .documents
-                .lock()
-                .await
-                .get(uri)
-                .is_some_and(|current| version < current.version);
-            if stale {
-                return;
-            }
+        let documents = self.documents.lock().await;
+        let Some(document) = documents.get(uri) else {
+            // A language server is not allowed to inject diagnostics for files the
+            // harness did not explicitly open for this client.
+            return;
+        };
+        if params
+            .get("version")
+            .and_then(Value::as_i64)
+            .is_some_and(|version| version < document.version)
+        {
+            return;
         }
+        drop(documents);
         let diagnostics = params
             .get("diagnostics")
             .and_then(Value::as_array)
@@ -468,6 +493,8 @@ impl LspClient {
         } else {
             store.by_uri.insert(uri.to_owned(), diagnostics);
         }
+        drop(store);
+        self.diagnostic_notify.notify_waiters();
     }
 
     async fn shutdown(&self) {
@@ -499,16 +526,49 @@ impl LspManager {
             .get(&name)
             .cloned()
             .with_context(|| format!("LSP server config 消失: {name}"))?;
-        let client =
-            LspClient::connect(config, &self.workspace, Arc::clone(&self.diagnostics)).await?;
+        let client = LspClient::connect(
+            config,
+            &self.workspace,
+            Arc::clone(&self.diagnostics),
+            Arc::clone(&self.diagnostic_notify),
+        )
+        .await?;
         clients.insert(name.clone(), Arc::clone(&client));
         Ok(Some((name, client)))
     }
 
-    async fn restart(&self, name: &str) {
-        if let Some(client) = self.clients.lock().await.remove(name) {
+    async fn restart(&self, name: &str) -> bool {
+        let client = { self.clients.lock().await.remove(name) };
+        if let Some(client) = client {
+            let uris = client
+                .documents
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut diagnostics = self.diagnostics.lock().await;
+            for uri in uris {
+                diagnostics.by_uri.remove(&uri);
+            }
+            drop(diagnostics);
             client.shutdown().await;
+            true
+        } else {
+            false
         }
+    }
+
+    async fn take_diagnostics_for_uri(&self, uri: &str) -> Value {
+        for attempt in 0..2 {
+            if let Some(diagnostics) = self.diagnostics.lock().await.by_uri.remove(uri) {
+                return Value::Array(diagnostics);
+            }
+            if attempt == 0 {
+                let _ = timeout(DIAGNOSTIC_WAIT, self.diagnostic_notify.notified()).await;
+            }
+        }
+        Value::Array(Vec::new())
     }
 
     async fn take_diagnostics(&self) -> Value {
@@ -555,6 +615,7 @@ struct LspInput {
     line: Option<u64>,
     character: Option<u64>,
     query: Option<String>,
+    new_name: Option<String>,
 }
 
 struct LspTool {
@@ -568,7 +629,7 @@ impl Tool for LspTool {
     }
 
     fn description(&self) -> &str {
-        "Queries user-configured local language servers for definitions, references, hover, symbols, implementations, and call hierarchy."
+        "Queries user-configured local language servers for navigation, symbols, diagnostics, rename previews, and controlled restart. Rename returns a WorkspaceEdit preview and never applies it."
     }
 
     fn input_schema(&self) -> Value {
@@ -577,19 +638,20 @@ impl Tool for LspTool {
                 "operation": {"type": "string", "enum": [
                     "goToDefinition", "findReferences", "hover", "documentSymbol",
                     "workspaceSymbol", "goToImplementation", "prepareCallHierarchy",
-                    "incomingCalls", "outgoingCalls"
+                    "incomingCalls", "outgoingCalls", "diagnostics", "rename", "restart"
                 ]},
                 "filePath": {"type": "string", "minLength": 1, "maxLength": 16384},
                 "line": {"type": "integer", "minimum": 1},
                 "character": {"type": "integer", "minimum": 1},
-                "query": {"type": "string", "maxLength": 4096}
+                "query": {"type": "string", "maxLength": 4096},
+                "newName": {"type": "string", "minLength": 1, "maxLength": 1024}
             }),
             &["operation", "filePath"],
         )
     }
 
-    fn read_only(&self, _: &Value) -> bool {
-        true
+    fn read_only(&self, input: &Value) -> bool {
+        input.get("operation").and_then(Value::as_str) != Some("restart")
     }
 
     fn path_fields(&self) -> &'static [&'static str] {
@@ -635,6 +697,19 @@ impl Tool for LspTool {
                 extension_of(&path)?
             )));
         };
+        if input.operation == "restart" {
+            let restarted = self.manager.restart(&config.name).await;
+            let output = sanitize_lsp_value(
+                json!({
+                "operation": "restart",
+                "filePath": input.file_path,
+                "server": config.name,
+                "restarted": restarted
+                }),
+                &self.manager.workspace,
+            );
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&output)?));
+        }
         let mut last_error = None;
         for attempt in 0..=config.max_restarts {
             let Some((name, client)) = self.manager.client_for_path(&path).await? else {
@@ -642,18 +717,33 @@ impl Tool for LspTool {
             };
             let result = async {
                 client.sync_document(&path, &text).await?;
+                if input.operation == "diagnostics" {
+                    return Ok(self
+                        .manager
+                        .take_diagnostics_for_uri(&file_uri(&path)?)
+                        .await);
+                }
                 execute_operation(&client, &path, &input).await
             }
             .await;
             match result {
                 Ok(result) => {
+                    let result = if input.operation == "rename" {
+                        json!({"workspaceEdit": result, "applied": false})
+                    } else {
+                        result
+                    };
                     let diagnostics = self.manager.take_diagnostics().await;
-                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&json!({
-                        "operation": input.operation,
-                        "filePath": input.file_path,
-                        "result": result,
-                        "diagnostics": diagnostics,
-                    }))?));
+                    let output = sanitize_lsp_value(
+                        json!({
+                            "operation": input.operation,
+                            "filePath": input.file_path,
+                            "result": result,
+                            "diagnostics": diagnostics,
+                        }),
+                        &self.manager.workspace,
+                    );
+                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&output)?));
                 }
                 Err(error) if attempt < config.max_restarts => {
                     if self.manager.debug {
@@ -697,6 +787,23 @@ async fn execute_operation(client: &LspClient, path: &Path, input: &LspInput) ->
             "workspace/symbol",
             json!({"query": input.query.as_deref().unwrap_or("")}),
         ),
+        "rename" => {
+            let new_name = input
+                .new_name
+                .as_deref()
+                .context("rename operation 需要 newName")?;
+            if new_name.len() > 1024 || new_name.chars().any(|character| character.is_control()) {
+                bail!("rename newName 过长或包含控制字符")
+            }
+            (
+                "textDocument/rename",
+                json!({
+                    "textDocument": text_document,
+                    "position": position(input)?,
+                    "newName": new_name
+                }),
+            )
+        }
         "goToImplementation" => (
             "textDocument/implementation",
             json!({"textDocument": text_document, "position": position(input)?}),
@@ -709,7 +816,7 @@ async fn execute_operation(client: &LspClient, path: &Path, input: &LspInput) ->
     };
     let result = client.rpc.request(method, Some(params)).await?;
     if !matches!(input.operation.as_str(), "incomingCalls" | "outgoingCalls") {
-        return Ok(sanitize_lsp_value(result));
+        return Ok(result);
     }
     let Some(item) = result.as_array().and_then(|items| items.first()).cloned() else {
         return Ok(Value::Array(Vec::new()));
@@ -723,7 +830,6 @@ async fn execute_operation(client: &LspClient, path: &Path, input: &LspInput) ->
         .rpc
         .request(method, Some(json!({"item": item})))
         .await
-        .map(sanitize_lsp_value)
 }
 
 fn position(input: &LspInput) -> Result<Value> {
@@ -762,35 +868,165 @@ fn validate_diagnostic(value: &Value) -> Option<Value> {
     if message.is_empty() || message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
         return None;
     }
-    let range = object.get("range")?;
-    if !range.is_object() {
-        return None;
-    }
+    let range = sanitize_range(object.get("range")?)?;
     let mut cleaned = json!({"message": message, "range": range});
-    for field in ["severity", "code", "source", "tags", "relatedInformation"] {
-        if let Some(value) = object.get(field) {
-            cleaned[field] = value.clone();
-        }
+    if let Some(severity) = object
+        .get("severity")
+        .and_then(Value::as_u64)
+        .filter(|severity| (1..=4).contains(severity))
+    {
+        cleaned["severity"] = json!(severity);
+    }
+    if let Some(code) = object.get("code").filter(|code| {
+        code.is_number()
+            || code
+                .as_str()
+                .is_some_and(|code| code.len() <= MAX_DIAGNOSTIC_METADATA_BYTES)
+    }) {
+        cleaned["code"] = code.clone();
+    }
+    if let Some(source) = object
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|source| source.len() <= MAX_DIAGNOSTIC_METADATA_BYTES)
+    {
+        cleaned["source"] = Value::String(source.to_owned());
+    }
+    if let Some(tags) = object.get("tags").and_then(Value::as_array) {
+        cleaned["tags"] = Value::Array(
+            tags.iter()
+                .filter_map(Value::as_u64)
+                .filter(|tag| matches!(tag, 1 | 2))
+                .take(8)
+                .map(Value::from)
+                .collect(),
+        );
     }
     Some(cleaned)
 }
 
-fn sanitize_lsp_value(mut value: Value) -> Value {
-    match &mut value {
+fn sanitize_range(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let position = |name: &str| {
+        let value = object.get(name)?.as_object()?;
+        let line = value.get("line")?.as_u64()?;
+        let character = value.get("character")?.as_u64()?;
+        (line <= u64::from(u32::MAX) && character <= u64::from(u32::MAX))
+            .then(|| json!({"line": line, "character": character}))
+    };
+    Some(json!({"start": position("start")?, "end": position("end")?}))
+}
+
+fn sanitize_lsp_value(value: Value, workspace: &Path) -> Value {
+    match value {
         Value::Object(object) => {
-            object.remove("data");
-            for child in object.values_mut() {
-                *child = sanitize_lsp_value(child.take());
+            let mut sanitized = serde_json::Map::new();
+            for (key, child) in object {
+                if key == "data" {
+                    continue;
+                }
+                let base_key = sanitize_lsp_string(&key, workspace);
+                let mut output_key = base_key.clone();
+                let mut collision = 2_usize;
+                while sanitized.contains_key(&output_key) {
+                    output_key = format!("{base_key}#{collision}");
+                    collision += 1;
+                }
+                let child = if matches!(key.as_str(), "line" | "character") {
+                    child
+                        .as_u64()
+                        .map(|value| Value::from(value.saturating_add(1)))
+                        .unwrap_or(child)
+                } else {
+                    child
+                };
+                sanitized.insert(output_key, sanitize_lsp_value(child, workspace));
             }
+            Value::Object(sanitized)
         }
-        Value::Array(values) => {
-            for child in values {
-                *child = sanitize_lsp_value(child.take());
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|child| sanitize_lsp_value(child, workspace))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(sanitize_lsp_string(&text, workspace)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value,
     }
-    value
+}
+
+fn sanitize_lsp_string(value: &str, workspace: &Path) -> String {
+    if value.starts_with("file://") {
+        return sanitize_file_uri(value, workspace);
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return sanitize_absolute_lsp_path(path, workspace);
+    }
+
+    let mut sanitized = replace_embedded_file_uris(value, workspace);
+    if let Some(workspace) = workspace.to_str() {
+        sanitized = sanitized.replace(workspace, ".");
+    }
+    sanitize_transport_text(&sanitized, workspace)
+}
+
+fn sanitize_file_uri(value: &str, workspace: &Path) -> String {
+    let Ok(uri) = Url::parse(value) else {
+        return OUTSIDE_WORKSPACE_URI.to_owned();
+    };
+    if uri.scheme() != "file" {
+        return sanitize_transport_text(value, workspace);
+    }
+    let Ok(path) = uri.to_file_path() else {
+        return OUTSIDE_WORKSPACE_URI.to_owned();
+    };
+    workspace_relative_path(&path, workspace).unwrap_or_else(|| OUTSIDE_WORKSPACE_URI.to_owned())
+}
+
+fn sanitize_absolute_lsp_path(path: &Path, workspace: &Path) -> String {
+    workspace_relative_path(path, workspace).unwrap_or_else(|| OUTSIDE_WORKSPACE_PATH.to_owned())
+}
+
+fn workspace_relative_path(path: &Path, workspace: &Path) -> Option<String> {
+    let relative = path.strip_prefix(workspace).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    if relative.as_os_str().is_empty() {
+        Some(".".to_owned())
+    } else {
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+fn replace_embedded_file_uris(value: &str, workspace: &Path) -> String {
+    let mut remaining = value;
+    let mut output = String::with_capacity(value.len());
+    while let Some(start) = remaining.find("file://") {
+        output.push_str(&remaining[..start]);
+        let candidate = &remaining[start..];
+        let end = candidate
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+                    )
+            })
+            .unwrap_or(candidate.len());
+        output.push_str(&sanitize_file_uri(&candidate[..end], workspace));
+        remaining = &candidate[end..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 const fn default_true() -> bool {
@@ -823,18 +1059,63 @@ mod tests {
         let valid = json!({
             "message": "problem",
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
-            "data": {"hidden": true}
+            "data": {"hidden": true},
+            "source": "x".repeat(MAX_DIAGNOSTIC_METADATA_BYTES + 1),
+            "relatedInformation": [{"message": "unbounded metadata is dropped"}]
         });
         let cleaned = validate_diagnostic(&valid).unwrap();
         assert!(cleaned.get("data").is_none());
+        assert!(cleaned.get("source").is_none());
+        assert!(cleaned.get("relatedInformation").is_none());
         assert_eq!(cleaned["message"], "problem");
+    }
+
+    #[test]
+    fn lsp_paths_are_workspace_relative_or_explicitly_redacted() {
+        let workspace = tempfile::tempdir().unwrap();
+        let inside = workspace.path().join("src/main.rs");
+        let inside_uri = file_uri(&inside).unwrap();
+        let outside = std::env::temp_dir().join("outside-private.rs");
+        let outside_uri = file_uri(&outside).unwrap();
+        let value = json!({
+            "uri": inside_uri,
+            "absolute": inside,
+            "outsideUri": outside_uri,
+            "outsidePath": outside,
+            "changes": {
+                file_uri(&workspace.path().join("src/lib.rs")).unwrap(): [],
+                "file:///definitely/outside.rs": []
+            },
+            "hover": format!("defined at {} and file:///definitely/outside.rs", workspace.path().display()),
+            "data": {"private": true}
+        });
+        let sanitized = sanitize_lsp_value(value, workspace.path());
+        let encoded = serde_json::to_string(&sanitized).unwrap();
+        assert_eq!(sanitized["uri"], "src/main.rs");
+        assert_eq!(sanitized["absolute"], "src/main.rs");
+        assert_eq!(sanitized["outsideUri"], OUTSIDE_WORKSPACE_URI);
+        assert_eq!(sanitized["outsidePath"], OUTSIDE_WORKSPACE_PATH);
+        assert!(sanitized["changes"].get("src/lib.rs").is_some());
+        assert!(sanitized["changes"].get(OUTSIDE_WORKSPACE_URI).is_some());
+        assert!(sanitized.get("data").is_none());
+        assert!(!encoded.contains("file://"));
+        assert!(!encoded.contains(workspace.path().to_string_lossy().as_ref()));
+        let position = sanitize_lsp_value(
+            json!({"range":{"start":{"line":0,"character":0},"end":{"line":4,"character":8}}}),
+            workspace.path(),
+        );
+        assert_eq!(position["range"]["start"]["line"], 1);
+        assert_eq!(position["range"]["start"]["character"], 1);
+        assert_eq!(position["range"]["end"]["line"], 5);
+        assert_eq!(position["range"]["end"]["character"], 9);
     }
 
     #[tokio::test]
     async fn configured_server_handles_definition_request() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("mock_lsp.rs");
-        let binary = temp
+        let workspace = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let source = server.path().join("mock_lsp.rs");
+        let binary = server
             .path()
             .join(format!("mock_lsp{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(
@@ -844,6 +1125,22 @@ fn send(value: &str) {
     let mut stdout = io::stdout().lock();
     write!(stdout, "Content-Length: {}\r\n\r\n{}", value.len(), value).unwrap();
     stdout.flush().unwrap();
+}
+fn request_id(body: &str) -> &str {
+    let rest = body.split("\"id\":").nth(1).unwrap();
+    let end = rest.find([',', '}']).unwrap();
+    &rest[..end]
+}
+fn string_field<'a>(body: &'a str, name: &str) -> &'a str {
+    let marker = format!("\"{}\":\"", name);
+    let rest = body.split(&marker).nth(1).unwrap();
+    &rest[..rest.find('"').unwrap()]
+}
+fn reply(body: &str, result: &str) {
+    send(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
+        request_id(body), result
+    ));
 }
 fn main() {
     let stdin = io::stdin();
@@ -863,13 +1160,27 @@ fn main() {
         input.read_exact(&mut body).unwrap();
         let body = String::from_utf8(body).unwrap();
         if body.contains("\"method\":\"initialize\"") {
-            send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"1\"}}}");
+            reply(&body, "{\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"1\"}}");
+        } else if body.contains("\"method\":\"textDocument/didOpen\"") {
+            let uri = string_field(&body, "uri");
+            send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///not-opened-private.txt\",\"diagnostics\":[{\"message\":\"injected diagnostic\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}}");
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{}\",\"version\":1,\"diagnostics\":[{{\"message\":\"mock warning\",\"severity\":2,\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}]}}}}", uri));
         } else if body.contains("\"method\":\"textDocument/definition\"") {
-            send("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"uri\":\"file:///mock.txt\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}");
+            let uri = string_field(&body, "uri");
+            if body.contains("\"line\":0") && body.contains("\"character\":0") {
+                reply(&body, &format!("[{{\"uri\":\"{}\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}]", uri));
+            } else {
+                reply(&body, "null");
+            }
         } else if body.contains("\"method\":\"textDocument/documentSymbol\"") {
-            send("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":[{\"name\":\"Demo\",\"kind\":12,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}");
+            reply(&body, "[{\"name\":\"Demo\",\"kind\":12,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]");
+        } else if body.contains("\"method\":\"workspace/symbol\"") {
+            reply(&body, "[{\"name\":\"WorkspaceDemo\",\"kind\":12,\"location\":{\"uri\":\"file:///mock.txt\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}}]");
+        } else if body.contains("\"method\":\"textDocument/rename\"") {
+            let uri = string_field(&body, "uri");
+            reply(&body, &format!("{{\"changes\":{{\"{}\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"newText\":\"Renamed\"}}]}}}}", uri));
         } else if body.contains("\"method\":\"shutdown\"") {
-            send("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}");
+            reply(&body, "null");
         } else if body.contains("\"method\":\"exit\"") {
             return;
         }
@@ -886,7 +1197,7 @@ fn main() {
             .status()
             .unwrap();
         assert!(status.success());
-        let file = temp.path().join("sample.txt");
+        let file = workspace.path().join("sample.txt");
         std::fs::write(&file, "hello").unwrap();
         let settings = Settings {
             raw: json!({"lspServers": {"mock": {
@@ -895,7 +1206,7 @@ fn main() {
                 "maxRestarts": 1
             }}}),
         };
-        let integration = configure_lsp(&settings, temp.path(), false)
+        let integration = configure_lsp(&settings, workspace.path(), false)
             .unwrap()
             .unwrap();
         let registry = ToolRegistry::with_services(
@@ -905,7 +1216,7 @@ fn main() {
         )
         .unwrap();
         let context = ToolContext::new(
-            temp.path().to_owned(),
+            workspace.path().to_owned(),
             PermissionManager::new(
                 PermissionMode::BypassPermissions,
                 false,
@@ -917,6 +1228,19 @@ fn main() {
             .execute(&context, "ToolSearch", json!({"query": "select:LSP"}))
             .await;
         assert!(!selected.is_error, "{}", selected.content);
+        let diagnostics = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({
+                    "operation": "diagnostics",
+                    "filePath": file
+                }),
+            )
+            .await;
+        assert!(!diagnostics.is_error, "{}", diagnostics.content);
+        assert!(diagnostics.content.contains("mock warning"));
+        assert!(!diagnostics.content.contains("injected diagnostic"));
         let output = registry
             .execute(
                 &context,
@@ -930,7 +1254,16 @@ fn main() {
             )
             .await;
         assert!(!output.is_error, "{}", output.content);
-        assert!(output.content.contains("file:///mock.txt"));
+        assert!(output.content.contains("sample.txt"));
+        assert!(!output.content.contains("file://"));
+        assert!(
+            !output
+                .content
+                .contains(workspace.path().to_string_lossy().as_ref())
+        );
+        let output_json: Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(output_json["result"][0]["range"]["start"]["line"], 1);
+        assert_eq!(output_json["result"][0]["range"]["start"]["character"], 1);
         let symbols = registry
             .execute(
                 &context,
@@ -943,6 +1276,64 @@ fn main() {
             .await;
         assert!(!symbols.is_error, "{}", symbols.content);
         assert!(symbols.content.contains("Demo"));
+        let workspace_symbols = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({
+                    "operation": "workspaceSymbol",
+                    "filePath": file,
+                    "query": "Workspace"
+                }),
+            )
+            .await;
+        assert!(!workspace_symbols.is_error, "{}", workspace_symbols.content);
+        assert!(workspace_symbols.content.contains("WorkspaceDemo"));
+        assert!(workspace_symbols.content.contains(OUTSIDE_WORKSPACE_URI));
+        assert!(!workspace_symbols.content.contains("file://"));
+        let rename = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({
+                    "operation": "rename",
+                    "filePath": file,
+                    "line": 1,
+                    "character": 1,
+                    "newName": "Renamed"
+                }),
+            )
+            .await;
+        assert!(!rename.is_error, "{}", rename.content);
+        assert!(rename.content.contains("newText"));
+        assert!(rename.content.contains("sample.txt"));
+        assert!(!rename.content.contains("file://"));
+        assert!(rename.content.contains("\"applied\": false"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+        let restarted = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({"operation": "restart", "filePath": file}),
+            )
+            .await;
+        assert!(!restarted.is_error, "{}", restarted.content);
+        assert!(restarted.content.contains("\"restarted\": true"));
+        let after_restart = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({
+                    "operation": "goToDefinition",
+                    "filePath": file,
+                    "line": 1,
+                    "character": 1
+                }),
+            )
+            .await;
+        assert!(!after_restart.is_error, "{}", after_restart.content);
+        assert!(after_restart.content.contains("sample.txt"));
+        assert!(!after_restart.content.contains("file://"));
         registry.shutdown().await;
     }
 }

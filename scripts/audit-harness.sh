@@ -162,15 +162,49 @@ fi
 if [[ -n "$reference_git" ]]; then
   reference_root="$(dirname "$reference_git")"
   if [[ -n "$(git -C "$reference_root" status --short)" ]]; then
-    echo 'reference_clean=false' >&2
+    echo 'reference_nested_git_clean=false' >&2
     exit 1
   fi
+  echo 'reference_nested_git_clean=true'
+else
+  echo 'reference_nested_git=not_present'
 fi
-echo 'reference_clean=true'
 
-if rg -n 'https?://' "$root/src" \
+reference_archive_name="${removed_terms[0]}-code-2.1.207-reverse-engineering-20260712.tar.zst"
+reference_archive="$root/reference/$reference_archive_name"
+reference_checksum="$reference_archive.sha256"
+if [[ -e "$reference_archive" || -e "$reference_checksum" ]]; then
+  if [[ ! -f "$reference_archive" || ! -f "$reference_checksum" ]]; then
+    echo 'reference_archive_checksum=incomplete_pair' >&2
+    exit 1
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    if ! (cd "$root/reference" && shasum -a 256 -c "$reference_archive_name.sha256"); then
+      echo 'reference_archive_checksum_valid=false' >&2
+      exit 1
+    fi
+  elif command -v sha256sum >/dev/null 2>&1; then
+    if ! (cd "$root/reference" && sha256sum -c "$reference_archive_name.sha256"); then
+      echo 'reference_archive_checksum_valid=false' >&2
+      exit 1
+    fi
+  else
+    echo 'reference_archive_checksum_tool_missing=true' >&2
+    exit 1
+  fi
+  echo 'reference_archive_checksum_valid=true'
+else
+  echo 'reference_archive_checksum=not_present'
+fi
+
+# Flag only URL literals that begin with a concrete hostname/IP. Bare scheme
+# checks (for example `starts_with("https://")`) and runtime-composed hosts are
+# configuration logic, not embedded endpoints.
+if rg -n -e 'https?://[[:alnum:]]' -e 'https?://\[' "$root/src" \
   | rg -v \
     -e 'http://127\.0\.0\.1(:[0-9]+)?' \
+    -e 'https?://[^[:space:]\"]*@127\.0\.0\.1(:[0-9]+)?' \
+    -e 'http://\[::1\](:[0-9]+)?' \
     -e 'http://\{address\}' \
     -e 'https?://[^[:space:]\"]*\.invalid'; then
   echo 'hardcoded_remote_endpoint_free=false' >&2

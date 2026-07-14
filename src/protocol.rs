@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::ValueEnum;
 use serde_json::{Map, Value, json};
 
@@ -9,6 +10,8 @@ use crate::types::{Message, ModelResponse, Role, Usage};
 const MAX_STREAM_EVENTS: usize = 100_000;
 const MAX_CONTENT_BLOCKS: usize = 4_096;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MEDIA_RAW_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MEDIA_BASE64_BYTES: usize = MAX_MEDIA_RAW_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ApiFormat {
@@ -66,19 +69,158 @@ pub struct RequestParts<'a> {
 }
 
 pub fn encode_request(format: ApiFormat, request: RequestParts<'_>) -> Result<Value> {
+    validate_request_user_messages(request.messages)?;
     match format {
-        ApiFormat::Messages => Ok(json!({
-            "model": request.model,
-            "max_tokens": request.max_tokens,
-            "system": request.system,
-            "messages": messages_without_provider_state(request.messages),
-            "tools": request.tools,
-            "stream": request.stream,
-        })),
+        ApiFormat::Messages => encode_messages_request(request),
         ApiFormat::ChatCompletions => encode_chat_request(request),
         ApiFormat::Responses => encode_responses_request(request),
         ApiFormat::Auto => bail!("API format 必须在编码请求前完成解析"),
     }
+}
+
+/// Validates rich content supplied directly by a user or SDK client. Internal
+/// tool-result/provider-state blocks are deliberately not accepted here.
+pub(crate) fn validate_direct_user_content(content: &Value) -> Result<()> {
+    match content {
+        Value::String(text) => {
+            if text.trim().is_empty() {
+                bail!("user message text 不能为空")
+            }
+            Ok(())
+        }
+        Value::Array(blocks) => {
+            if blocks.is_empty() {
+                bail!("user message content 不能为空")
+            }
+            if blocks.len() > MAX_CONTENT_BLOCKS {
+                bail!("user message content 超过 {MAX_CONTENT_BLOCKS} 个 block 限制")
+            }
+            for (index, block) in blocks.iter().enumerate() {
+                validate_direct_user_block(block, index)?;
+            }
+            Ok(())
+        }
+        _ => bail!("user message content 必须是 string 或 content block array"),
+    }
+}
+
+fn validate_direct_user_block(block: &Value, index: usize) -> Result<()> {
+    let object = block
+        .as_object()
+        .with_context(|| format!("user content block {index} 必须是 object"))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .with_context(|| format!("user content block {index} 缺少 string type"))?;
+    match kind {
+        "text" => {
+            validate_exact_fields(object, &["type", "text"], &["type", "text"], index)?;
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .with_context(|| format!("user text block {index}.text 必须是 string"))?;
+            if text.trim().is_empty() {
+                bail!("user text block {index}.text 不能为空")
+            }
+        }
+        "image" => {
+            validate_exact_fields(object, &["type", "source"], &["type", "source"], index)?;
+            validate_direct_media_source(object, index)?;
+            let _ = media_source(block)?;
+        }
+        "document" => {
+            validate_exact_fields(
+                object,
+                &["type", "source", "title"],
+                &["type", "source"],
+                index,
+            )?;
+            if let Some(title) = object.get("title") {
+                let title = title
+                    .as_str()
+                    .with_context(|| format!("user document block {index}.title 必须是 string"))?;
+                if title.is_empty() || title.len() > 255 || title.chars().any(char::is_control) {
+                    bail!("user document block {index}.title 为空、过长或包含控制字符")
+                }
+            }
+            validate_direct_media_source(object, index)?;
+            let _ = media_source(block)?;
+        }
+        other => {
+            bail!("user content block {index} type {other:?} 不受支持；只允许 text/image/document")
+        }
+    }
+    Ok(())
+}
+
+fn validate_direct_media_source(object: &Map<String, Value>, index: usize) -> Result<()> {
+    let source = object
+        .get("source")
+        .and_then(Value::as_object)
+        .with_context(|| format!("user media block {index}.source 必须是 object"))?;
+    validate_exact_fields(
+        source,
+        &["type", "media_type", "data"],
+        &["type", "media_type", "data"],
+        index,
+    )
+}
+
+fn validate_exact_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    required: &[&str],
+    index: usize,
+) -> Result<()> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        bail!("user content block {index} 包含未知字段 {field:?}")
+    }
+    if let Some(field) = required.iter().find(|field| !object.contains_key(**field)) {
+        bail!("user content block {index} 缺少字段 {field:?}")
+    }
+    Ok(())
+}
+
+fn validate_request_user_messages(messages: &[Message]) -> Result<()> {
+    for message in messages {
+        if message.role != Role::User {
+            continue;
+        }
+        let Some(blocks) = message.content.as_array() else {
+            validate_direct_user_content(&message.content)?;
+            continue;
+        };
+        let contains_tool_result = blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"));
+        if contains_tool_result {
+            if blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) != Some("tool_result"))
+            {
+                bail!("tool_result message 不能混入 direct user content block")
+            }
+            validate_outbound_media_blocks(blocks)?;
+        } else {
+            validate_direct_user_content(&message.content)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_messages_request(request: RequestParts<'_>) -> Result<Value> {
+    let messages = messages_without_provider_state(request.messages)?;
+    Ok(json!({
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "system": request.system,
+        "messages": messages,
+        "tools": request.tools,
+        "stream": request.stream,
+    }))
 }
 
 pub fn parse_response(format: ApiFormat, value: Value) -> Result<ModelResponse> {
@@ -226,7 +368,7 @@ fn encode_responses_request(request: RequestParts<'_>) -> Result<Value> {
     Ok(Value::Object(body))
 }
 
-fn messages_without_provider_state(messages: &[Message]) -> Vec<Message> {
+fn messages_without_provider_state(messages: &[Message]) -> Result<Vec<Message>> {
     messages
         .iter()
         .filter_map(|message| {
@@ -247,7 +389,26 @@ fn messages_without_provider_state(messages: &[Message]) -> Vec<Message> {
                 content,
             })
         })
+        .map(|message| {
+            if let Some(blocks) = message.content.as_array() {
+                validate_outbound_media_blocks(blocks)?;
+            }
+            Ok(message)
+        })
         .collect()
+}
+
+fn validate_outbound_media_blocks(blocks: &[Value]) -> Result<()> {
+    if blocks.len() > MAX_CONTENT_BLOCKS {
+        bail!("消息请求 content block 超过 {MAX_CONTENT_BLOCKS} 个限制")
+    }
+    for block in blocks {
+        let _ = media_source(block)?;
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            validate_outbound_media_blocks(tool_result_model_blocks(block))?;
+        }
+    }
+    Ok(())
 }
 
 fn function_tools(tools: &[Value]) -> Result<Vec<Value>> {
@@ -329,10 +490,27 @@ fn append_chat_user_message(output: &mut Vec<Value>, content: &Value) -> Result<
     let blocks = content
         .as_array()
         .context("user message content 必须是 string 或 array")?;
+    if blocks.len() > MAX_CONTENT_BLOCKS {
+        bail!("user message content 超过 {MAX_CONTENT_BLOCKS} 个限制")
+    }
     let mut text = String::new();
+    let mut content_parts = Vec::new();
+    let mut has_media = false;
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("text") => {
+                let block_text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                text.push_str(block_text);
+                if !block_text.is_empty() {
+                    content_parts.push(json!({"type":"text", "text":block_text}));
+                }
+            }
+            Some("image" | "document") => {
+                if let Some(part) = chat_media_part(block)? {
+                    content_parts.push(part);
+                    has_media = true;
+                }
+            }
             Some("tool_result") => {
                 let call_id = block
                     .get("tool_use_id")
@@ -344,12 +522,19 @@ fn append_chat_user_message(output: &mut Vec<Value>, content: &Value) -> Result<
                     "tool_call_id":call_id,
                     "content":result,
                 }));
+                let tool_media = chat_tool_result_media(block)?;
+                has_media |= !tool_media.is_empty();
+                content_parts.extend(tool_media);
             }
             _ => {}
         }
     }
-    if !text.is_empty() {
-        output.push(json!({"role":"user","content":text}));
+    if !has_media {
+        if !text.is_empty() {
+            output.push(json!({"role":"user","content":text}));
+        }
+    } else {
+        output.push(json!({"role":"user","content":content_parts}));
     }
     Ok(())
 }
@@ -449,7 +634,11 @@ fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
             .content
             .as_array()
             .context("message content 必须是 string 或 array")?;
+        if blocks.len() > MAX_CONTENT_BLOCKS {
+            bail!("message content 超过 {MAX_CONTENT_BLOCKS} 个限制")
+        }
         let mut text = String::new();
+        let mut direct_user_content = Vec::new();
         let mut replayed_calls = HashSet::new();
         let mut replayed_text = VecDeque::new();
         for block in blocks {
@@ -463,6 +652,12 @@ fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
                         replayed_text.pop_front();
                     } else {
                         text.push_str(block_text);
+                    }
+                }
+                Some("image" | "document") if message.role == Role::User => {
+                    append_response_input_text(&mut direct_user_content, &mut text);
+                    if let Some(part) = responses_media_part(block)? {
+                        direct_user_content.push(part);
                     }
                 }
                 Some("tool_use") if message.role == Role::Assistant => {
@@ -495,12 +690,7 @@ fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
                     }));
                 }
                 Some("tool_result") if message.role == Role::User => {
-                    flush_response_text(
-                        &mut output,
-                        &mut text,
-                        message.role,
-                        &mut fallback_message_index,
-                    );
+                    flush_response_user_content(&mut output, &mut text, &mut direct_user_content);
                     let call_id = block
                         .get("tool_use_id")
                         .and_then(Value::as_str)
@@ -510,6 +700,14 @@ fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
                         "call_id":call_id,
                         "output":tool_result_text(block),
                     }));
+                    let media = responses_tool_result_media(block)?;
+                    if !media.is_empty() {
+                        output.push(json!({
+                            "type":"message",
+                            "role":"user",
+                            "content":media,
+                        }));
+                    }
                 }
                 Some("provider_state") if message.role == Role::Assistant => {
                     flush_response_text(
@@ -540,12 +738,16 @@ fn responses_input(messages: &[Message]) -> Result<Vec<Value>> {
                 _ => {}
             }
         }
-        flush_response_text(
-            &mut output,
-            &mut text,
-            message.role,
-            &mut fallback_message_index,
-        );
+        if message.role == Role::User {
+            flush_response_user_content(&mut output, &mut text, &mut direct_user_content);
+        } else {
+            flush_response_text(
+                &mut output,
+                &mut text,
+                message.role,
+                &mut fallback_message_index,
+            );
+        }
     }
     Ok(output)
 }
@@ -581,6 +783,37 @@ fn flush_response_text(
     }
 }
 
+fn append_response_input_text(content: &mut Vec<Value>, text: &mut String) {
+    if !text.is_empty() {
+        content.push(json!({"type":"input_text", "text":text.as_str()}));
+        text.clear();
+    }
+}
+
+fn flush_response_user_content(
+    output: &mut Vec<Value>,
+    text: &mut String,
+    content: &mut Vec<Value>,
+) {
+    if content.is_empty() {
+        if !text.is_empty() {
+            output.push(json!({
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text", "text":text.as_str()}],
+            }));
+            text.clear();
+        }
+        return;
+    }
+    append_response_input_text(content, text);
+    output.push(json!({
+        "type":"message",
+        "role":"user",
+        "content":std::mem::take(content),
+    }));
+}
+
 fn response_message_item(role: Role, text: &str, fallback_message_index: &mut usize) -> Value {
     match role {
         Role::User => json!({
@@ -604,7 +837,22 @@ fn response_message_item(role: Role, text: &str, fallback_message_index: &mut us
 
 fn tool_result_text(block: &Value) -> String {
     let content = block.get("content").unwrap_or(&Value::Null);
-    let text = value_as_text(content);
+    let text = match content {
+        Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                "[Tool returned non-text model content]".to_owned()
+            } else {
+                text
+            }
+        }
+        _ => value_as_text(content),
+    };
     if block
         .get("is_error")
         .and_then(Value::as_bool)
@@ -614,6 +862,125 @@ fn tool_result_text(block: &Value) -> String {
     } else {
         text
     }
+}
+
+fn tool_result_model_blocks(block: &Value) -> &[Value] {
+    block
+        .get("content")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn media_source(block: &Value) -> Result<Option<(&str, &str)>> {
+    let Some(kind @ ("image" | "document")) = block.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let source = block
+        .get("source")
+        .and_then(Value::as_object)
+        .context("model media block 缺少 source object")?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        bail!("model media source 只支持 base64")
+    }
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .context("model media source 缺少 media_type")?;
+    let allowed = match kind {
+        "image" => matches!(
+            media_type,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ),
+        "document" => media_type == "application/pdf",
+        _ => false,
+    };
+    if !allowed {
+        bail!("不支持的 model media type: {media_type}")
+    }
+    let data = source
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty())
+        .context("model media source 缺少 base64 data")?;
+    if data.len() > MAX_MEDIA_BASE64_BYTES {
+        bail!("model media base64 data 超过 {MAX_MEDIA_BASE64_BYTES} 字节限制")
+    }
+    let decoded = BASE64
+        .decode(data)
+        .context("model media source 包含无效 base64 data")?;
+    if decoded.len() > MAX_MEDIA_RAW_BYTES {
+        bail!("model media 解码后超过 {MAX_MEDIA_RAW_BYTES} 字节限制")
+    }
+    Ok(Some((media_type, data)))
+}
+
+fn media_title(block: &Value) -> &str {
+    block
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty() && title.len() <= 255)
+        .unwrap_or("document.pdf")
+}
+
+fn chat_media_part(block: &Value) -> Result<Option<Value>> {
+    let Some((media_type, data)) = media_source(block)? else {
+        return Ok(None);
+    };
+    if block["type"] == "image" {
+        Ok(Some(json!({
+            "type":"image_url",
+            "image_url":{"url":format!("data:{media_type};base64,{data}")},
+        })))
+    } else {
+        Ok(Some(json!({
+            "type":"file",
+            "file":{
+                "filename":media_title(block),
+                "file_data":format!("data:{media_type};base64,{data}"),
+            },
+        })))
+    }
+}
+
+fn responses_media_part(block: &Value) -> Result<Option<Value>> {
+    let Some((media_type, data)) = media_source(block)? else {
+        return Ok(None);
+    };
+    if block["type"] == "image" {
+        Ok(Some(json!({
+            "type":"input_image",
+            "image_url":format!("data:{media_type};base64,{data}"),
+        })))
+    } else {
+        Ok(Some(json!({
+            "type":"input_file",
+            "filename":media_title(block),
+            "file_data":format!("data:{media_type};base64,{data}"),
+        })))
+    }
+}
+
+fn chat_tool_result_media(block: &Value) -> Result<Vec<Value>> {
+    tool_result_model_blocks(block)
+        .iter()
+        .filter_map(|content| match chat_media_part(content) {
+            Ok(Some(part)) => Some(Ok(part)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn responses_tool_result_media(block: &Value) -> Result<Vec<Value>> {
+    tool_result_model_blocks(block)
+        .iter()
+        .filter_map(|content| match responses_media_part(content) {
+            Ok(Some(part)) => Some(Ok(part)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn value_as_text(value: &Value) -> String {
@@ -4178,5 +4545,313 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("max_output_tokens"));
+    }
+
+    fn media_conversation() -> Vec<Message> {
+        vec![
+            Message::user_text("inspect media"),
+            Message::assistant(vec![json!({
+                "type":"tool_use", "id":"media-1", "name":"Read", "input":{"file_path":"a.png"}
+            })]),
+            Message::tool_results(vec![json!({
+                "type":"tool_result", "tool_use_id":"media-1", "is_error":false,
+                "content":[
+                    {"type":"text", "text":"Read media preview"},
+                    {"type":"image", "source":{
+                        "type":"base64", "media_type":"image/png", "data":"aW1hZ2U="
+                    }},
+                    {"type":"document", "title":"notes.pdf", "source":{
+                        "type":"base64", "media_type":"application/pdf", "data":"cGRm"
+                    }}
+                ]
+            })]),
+        ]
+    }
+
+    fn direct_user_media_conversation() -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: json!([
+                {"type":"text", "text":"inspect image"},
+                {"type":"image", "source":{
+                    "type":"base64", "media_type":"image/png", "data":"aW1hZ2U="
+                }},
+                {"type":"text", "text":"then read document"},
+                {"type":"document", "title":"notes.pdf", "source":{
+                    "type":"base64", "media_type":"application/pdf", "data":"cGRm"
+                }}
+            ]),
+        }]
+    }
+
+    #[test]
+    fn messages_keeps_media_inside_the_paired_tool_result() {
+        let body = encode_request(
+            ApiFormat::Messages,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &media_conversation(),
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap();
+        let result = &body["messages"][2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][2]["type"], "document");
+    }
+
+    #[test]
+    fn chat_and_responses_emit_native_media_parts_without_base64_in_tool_text() {
+        let chat = encode_request(
+            ApiFormat::ChatCompletions,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &media_conversation(),
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap();
+        let chat_messages = chat["messages"].as_array().unwrap();
+        let tool = chat_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["content"], "Read media preview");
+        assert!(!tool["content"].as_str().unwrap().contains("aW1hZ2U="));
+        let user_media = chat_messages
+            .iter()
+            .find(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_array()
+                        .is_some_and(|parts| !parts.is_empty())
+            })
+            .unwrap();
+        assert_eq!(user_media["content"][0]["type"], "image_url");
+        assert_eq!(user_media["content"][1]["type"], "file");
+
+        let responses = encode_request(
+            ApiFormat::Responses,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &media_conversation(),
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap();
+        let input = responses["input"].as_array().unwrap();
+        let tool = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(tool["output"], "Read media preview");
+        let media = input
+            .iter()
+            .find(|item| item["type"] == "message" && item["content"][0]["type"] == "input_image")
+            .unwrap();
+        assert_eq!(media["content"][1]["type"], "input_file");
+        assert_eq!(media["content"][1]["filename"], "notes.pdf");
+    }
+
+    #[test]
+    fn chat_emits_native_parts_for_direct_user_image_and_document() {
+        let chat = encode_request(
+            ApiFormat::ChatCompletions,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &direct_user_media_conversation(),
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap();
+
+        let content = chat["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type":"text", "text":"inspect image"}));
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"text", "text":"then read document"})
+        );
+        assert_eq!(content[3]["type"], "file");
+        assert_eq!(content[3]["file"]["filename"], "notes.pdf");
+        assert_eq!(
+            content[3]["file"]["file_data"],
+            "data:application/pdf;base64,cGRm"
+        );
+    }
+
+    #[test]
+    fn responses_emits_native_parts_for_direct_user_image_and_document() {
+        let responses = encode_request(
+            ApiFormat::Responses,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &direct_user_media_conversation(),
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap();
+
+        let content = responses["input"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            json!({"type":"input_text", "text":"inspect image"})
+        );
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
+        assert_eq!(
+            content[2],
+            json!({"type":"input_text", "text":"then read document"})
+        );
+        assert_eq!(content[3]["type"], "input_file");
+        assert_eq!(content[3]["filename"], "notes.pdf");
+        assert_eq!(content[3]["file_data"], "data:application/pdf;base64,cGRm");
+    }
+
+    #[test]
+    fn direct_user_media_is_validated_in_every_adapter() {
+        for (source, expected) in [
+            (
+                json!({"type":"base64", "media_type":"image/svg+xml", "data":"PHN2Zy8+"}),
+                "image/svg+xml",
+            ),
+            (
+                json!({"type":"base64", "media_type":"image/png", "data":"not-base64"}),
+                "无效 base64",
+            ),
+        ] {
+            let messages = vec![Message {
+                role: Role::User,
+                content: json!([{"type":"image", "source":source}]),
+            }];
+            for format in [
+                ApiFormat::Messages,
+                ApiFormat::ChatCompletions,
+                ApiFormat::Responses,
+            ] {
+                let error = encode_request(
+                    format,
+                    RequestParts {
+                        model: "model",
+                        max_tokens: 10,
+                        system: "system",
+                        messages: &messages,
+                        tools: &tools(),
+                        stream: false,
+                        chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                        include_stream_usage: false,
+                    },
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_user_block_schema_is_rejected_consistently_by_every_adapter() {
+        for content in [
+            json!([{"type":"tool_use", "id":"injected", "name":"Read", "input":{}}]),
+            json!([{"type":"text", "text":"hello", "unexpected":true}]),
+            json!([{"type":"image", "source":{
+                "type":"base64", "media_type":"image/png", "data":"aW1hZ2U=", "extra":true
+            }}]),
+        ] {
+            let messages = vec![Message {
+                role: Role::User,
+                content,
+            }];
+            for format in [
+                ApiFormat::Messages,
+                ApiFormat::ChatCompletions,
+                ApiFormat::Responses,
+            ] {
+                assert!(
+                    encode_request(
+                        format,
+                        RequestParts {
+                            model: "model",
+                            max_tokens: 10,
+                            system: "system",
+                            messages: &messages,
+                            tools: &tools(),
+                            stream: false,
+                            chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                            include_stream_usage: false,
+                        }
+                    )
+                    .is_err(),
+                    "{format:?} accepted malformed direct user content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_sized_pdf_media_fits_every_adapter_budget() {
+        let data = BASE64.encode(vec![b'p'; 5 * 1024 * 1024]);
+        let messages = vec![
+            Message::assistant(vec![json!({
+                "type":"tool_use", "id":"pdf-1", "name":"Read",
+                "input":{"file_path":"large.pdf"}
+            })]),
+            Message::tool_results(vec![json!({
+                "type":"tool_result", "tool_use_id":"pdf-1", "is_error":false,
+                "content":[{"type":"document", "title":"large.pdf", "source":{
+                    "type":"base64", "media_type":"application/pdf", "data":data
+                }}]
+            })]),
+        ];
+        for format in [
+            ApiFormat::Messages,
+            ApiFormat::ChatCompletions,
+            ApiFormat::Responses,
+        ] {
+            let request = encode_request(
+                format,
+                RequestParts {
+                    model: "model",
+                    max_tokens: 10,
+                    system: "system",
+                    messages: &messages,
+                    tools: &tools(),
+                    stream: false,
+                    chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                    include_stream_usage: false,
+                },
+            )
+            .unwrap();
+            assert!(serde_json::to_vec(&request).unwrap().len() < 16 * 1024 * 1024);
+        }
     }
 }

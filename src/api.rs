@@ -33,6 +33,94 @@ pub struct MessageResult {
     pub streamed_text: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Model endpoint {status}: {message}")]
+pub struct ModelEndpointError {
+    status: u16,
+    code: Option<String>,
+    kind: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}失败 ({category})")]
+struct OpaqueTransportError {
+    operation: &'static str,
+    category: &'static str,
+}
+
+fn opaque_transport_error(operation: &'static str, error: &reqwest::Error) -> anyhow::Error {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_builder() {
+        "builder"
+    } else {
+        "transport"
+    };
+    OpaqueTransportError {
+        operation,
+        category,
+    }
+    .into()
+}
+
+impl ModelEndpointError {
+    fn is_size_rejection(&self) -> bool {
+        if self.status == StatusCode::PAYLOAD_TOO_LARGE.as_u16() {
+            return true;
+        }
+        // Some streaming APIs acknowledge the HTTP request with 200 and then
+        // report a structured terminal error event. Only exact classifiers or
+        // size-specific wording below can make that synthetic status retryable.
+        if !matches!(self.status, 200 | 400 | 422) {
+            return false;
+        }
+
+        let classified = self
+            .code
+            .iter()
+            .chain(self.kind.iter())
+            .map(|value| normalize_error_classifier(value))
+            .any(|value| {
+                matches!(
+                    value.as_str(),
+                    "context_length_exceeded"
+                        | "context_window_exceeded"
+                        | "model_context_window_exceeded"
+                        | "maximum_context_length_exceeded"
+                        | "input_too_long"
+                        | "prompt_too_long"
+                        | "request_too_large"
+                        | "payload_too_large"
+                        | "too_many_tokens"
+                        | "media_too_large"
+                        | "image_too_large"
+                        | "pdf_too_large"
+                )
+            });
+        classified || size_rejection_message(&self.message)
+    }
+}
+
+/// Returns true only for endpoint rejections that a bounded history/media
+/// compaction retry can plausibly repair. Transport failures and generic 4xx
+/// responses deliberately remain non-retryable here.
+pub fn is_size_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ModelEndpointError>()
+        .is_some_and(ModelEndpointError::is_size_rejection)
+}
+
 impl ModelClient {
     pub fn new(endpoint: EndpointConfig) -> Result<Self> {
         let messages_url = build_messages_url(&endpoint)?;
@@ -92,7 +180,7 @@ impl ModelClient {
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    last_error = Some(anyhow::anyhow!(error));
+                    last_error = Some(opaque_transport_error("API 请求", &error));
                     if attempt < 3 {
                         sleep(Duration::from_secs(1 << attempt)).await;
                         continue;
@@ -173,7 +261,7 @@ async fn parse_sse(
     let mut decoder = StreamDecoder::new(api_format)?;
     let mut streamed_text = false;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("读取 SSE chunk 失败")?;
+        let chunk = chunk.map_err(|error| opaque_transport_error("读取 SSE chunk", &error))?;
         received = received
             .checked_add(chunk.len())
             .context("SSE 响应大小溢出")?;
@@ -233,7 +321,35 @@ fn decode_sse_frame(
         )
     })?;
     redact_value(&mut event, secret);
+    if let Some(error) = stream_size_rejection(&event) {
+        return Err(error.into());
+    }
     decoder.apply(event, on_text_delta)
+}
+
+fn stream_size_rejection(event: &Value) -> Option<ModelEndpointError> {
+    let error = event
+        .get("error")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            event
+                .pointer("/response/error")
+                .filter(|value| !value.is_null())
+        })?;
+    let get = |field: &str| {
+        error
+            .get(field)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let message = get("message").or_else(|| error.as_str().map(ToOwned::to_owned))?;
+    let candidate = ModelEndpointError {
+        status: StatusCode::OK.as_u16(),
+        code: get("code"),
+        kind: get("type"),
+        message,
+    };
+    candidate.is_size_rejection().then_some(candidate)
 }
 
 #[derive(Default)]
@@ -349,8 +465,7 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
-    let base = reqwest::Url::parse(&endpoint.base_url)
-        .with_context(|| format!("HARNESS_BASE_URL 无效: {}", endpoint.base_url))?;
+    let base = reqwest::Url::parse(&endpoint.base_url).context("HARNESS_BASE_URL 无效")?;
     if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
         bail!("HARNESS_BASE_URL 只支持带 host 的 http/https URL")
     }
@@ -360,8 +475,8 @@ fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
     if base.query().is_some() || base.fragment().is_some() {
         bail!("HARNESS_BASE_URL 不得包含 query 或 fragment")
     }
-    if endpoint.messages_path.contains('#') {
-        bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得包含 fragment")
+    if endpoint.messages_path.contains('?') || endpoint.messages_path.contains('#') {
+        bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得包含 query 或 fragment")
     }
     let separator = if endpoint.messages_path.starts_with('/') {
         ""
@@ -374,8 +489,7 @@ fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
         separator,
         endpoint.messages_path
     );
-    let url = reqwest::Url::parse(&candidate)
-        .with_context(|| format!("messages endpoint 无效: {candidate}"))?;
+    let url = reqwest::Url::parse(&candidate).context("messages endpoint 无效")?;
     let same_origin = url.scheme() == base.scheme()
         && url.host_str() == base.host_str()
         && url.port_or_known_default() == base.port_or_known_default()
@@ -383,6 +497,9 @@ fn build_messages_url(endpoint: &EndpointConfig) -> Result<reqwest::Url> {
         && url.password().is_none();
     if !same_origin {
         bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得改变 endpoint origin")
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("HARNESS_API_PATH/HARNESS_MESSAGES_PATH 不得包含 query 或 fragment")
     }
     Ok(url)
 }
@@ -401,7 +518,8 @@ async fn read_body_limited(
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("读取{label}失败"))?;
+        let chunk =
+            chunk.map_err(|error| opaque_transport_error("读取 API response body", &error))?;
         if body.len().saturating_add(chunk.len()) > limit {
             bail!("{label}超过 {limit} 字节限制")
         }
@@ -411,17 +529,58 @@ async fn read_body_limited(
 }
 
 fn api_error(status: StatusCode, body: &str, secret: Option<&str>) -> anyhow::Error {
-    let message = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| truncate(body, 2000));
     let message = redact_text(&message, secret);
-    anyhow::anyhow!("Model endpoint {}: {}", status.as_u16(), message)
+    let field = |pointer: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.pointer(pointer).and_then(Value::as_str))
+            .map(|value| redact_text(value, secret))
+    };
+    ModelEndpointError {
+        status: status.as_u16(),
+        code: field("/error/code").or_else(|| field("/code")),
+        kind: field("/error/type").or_else(|| field("/type")),
+        message,
+    }
+    .into()
+}
+
+fn normalize_error_classifier(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| match character {
+            '-' | ' ' | '.' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+fn size_rejection_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context length exceeded",
+        "context window exceeded",
+        "maximum context length",
+        "input length and `max_tokens` exceed context limit",
+        "too many input tokens",
+        "request body too large",
+        "payload too large",
+        "image exceeds the maximum",
+        "image dimensions exceed",
+        "media is too large",
+        "pdf is too large",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 fn redact_response(response: &mut ModelResponse, secret: Option<&str>) {
@@ -500,6 +659,8 @@ mod tests {
         let url =
             build_messages_url(&endpoint("https://example.invalid/root", "/messages")).unwrap();
         assert_eq!(url.as_str(), "https://example.invalid/root/messages");
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
         assert!(build_messages_url(&endpoint("file:///tmp/socket", "/messages")).is_err());
         assert!(
             build_messages_url(&endpoint(
@@ -508,6 +669,105 @@ mod tests {
             ))
             .is_err()
         );
+
+        for path in [
+            "/messages?api_key=path-query-sentinel",
+            "/messages#path-fragment-sentinel",
+        ] {
+            let error =
+                build_messages_url(&endpoint("https://example.invalid/root", path)).unwrap_err();
+            let display = format!("{error}");
+            let debug = format!("{error:?}");
+            assert!(!display.contains("sentinel"), "{display}");
+            assert!(!debug.contains("sentinel"), "{debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_transport_errors_never_retain_the_request_url() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let sentinel = "transport-url-sentinel";
+        let raw = reqwest::Client::new()
+            .get(format!("http://{address}/{sentinel}"))
+            .send()
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            format!("{raw}").contains(sentinel) || format!("{raw:?}").contains(sentinel),
+            "test precondition: reqwest error should retain its request URL"
+        );
+
+        for operation in ["API 请求", "读取 API response body", "读取 SSE chunk"] {
+            let error = opaque_transport_error(operation, &raw);
+            let display = format!("{error}");
+            let debug = format!("{error:?}");
+            assert!(!display.contains(sentinel), "{display}");
+            assert!(!debug.contains(sentinel), "{debug}");
+            assert!(display.contains(operation));
+        }
+    }
+
+    async fn truncated_response(content_type: &str, sentinel: &str) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let content_type = content_type.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: 64\r\nconnection: close\r\n\r\ndata: "
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/{sentinel}"))
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn body_and_sse_transport_errors_never_retain_the_request_url() {
+        let sentinel = "stream-url-sentinel";
+        let response = truncated_response("application/json", sentinel).await;
+        let error = read_body_limited(response, MAX_RESPONSE_BYTES, "test body")
+            .await
+            .unwrap_err();
+        assert!(!format!("{error}").contains(sentinel));
+        assert!(!format!("{error:?}").contains(sentinel));
+
+        let response = truncated_response("text/event-stream", sentinel).await;
+        let error = parse_sse(response, ApiFormat::Messages, None, None)
+            .await
+            .err()
+            .expect("truncated SSE body must fail");
+        assert!(!format!("{error}").contains(sentinel));
+        assert!(!format!("{error:?}").contains(sentinel));
     }
 
     #[test]
@@ -526,6 +786,66 @@ mod tests {
         let error = api_error(StatusCode::BAD_REQUEST, &body, Some(secret));
         assert!(!error.to_string().contains(secret));
         assert!(error.to_string().contains("redacted-endpoint-token"));
+    }
+
+    #[test]
+    fn size_rejection_requires_specific_status_or_endpoint_signal() {
+        let payload = api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":{"message":"opaque rejection"}}"#,
+            None,
+        );
+        assert!(is_size_rejection(&payload));
+
+        let coded = api_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"context_length_exceeded","message":"limit"}}"#,
+            None,
+        );
+        assert!(is_size_rejection(&coded));
+
+        let worded = api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"error":{"message":"Prompt is too long: 10 > 8"}}"#,
+            None,
+        );
+        assert!(is_size_rejection(&worded));
+
+        let unrelated = api_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","message":"unknown model"}}"#,
+            None,
+        );
+        assert!(!is_size_rejection(&unrelated));
+
+        let server_error = api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"context length exceeded"}}"#,
+            None,
+        );
+        assert!(!is_size_rejection(&server_error));
+    }
+
+    #[test]
+    fn streaming_size_errors_are_typed_but_unrelated_errors_are_not_reclassified() {
+        let error = stream_size_rejection(&json!({
+            "type":"response.failed",
+            "response":{"error":{
+                "code":"model_context_window_exceeded",
+                "message":"limit"
+            }}
+        }))
+        .expect("structured stream size error");
+        assert!(error.is_size_rejection());
+
+        assert!(
+            stream_size_rejection(&json!({
+                "type":"error",
+                "error":{"type":"authentication_error", "message":"bad key"}
+            }))
+            .is_none()
+        );
+        assert!(stream_size_rejection(&json!({"type":"message_stop"})).is_none());
     }
 
     #[test]

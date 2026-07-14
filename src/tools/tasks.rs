@@ -36,7 +36,7 @@ impl Tool for TaskOutputTool {
         "TaskOutput"
     }
     fn description(&self) -> &str {
-        "Reads current output and completion status for a background Bash task or local agent. It waits up to 30 seconds by default; set block=false to poll."
+        "Reads current output and completion status for a background Bash task, Monitor, declarative workflow, or local agent. It waits up to 30 seconds by default; set block=false to poll."
     }
     fn input_schema(&self) -> Value {
         object_schema(
@@ -73,10 +73,24 @@ impl Tool for TaskOutputTool {
                 if saw_bash_task {
                     bail!("后台 Bash 任务已被其他调用取走或停止")
                 }
+                if let Some(output) = context
+                    .workflow_runtime()
+                    .task_output(&input.task_id, input.block, input.timeout)
+                    .await?
+                {
+                    return Ok(output);
+                }
+                if let Some(output) = context
+                    .monitor_service()
+                    .task_output(context, &input.task_id, input.block, input.timeout)
+                    .await?
+                {
+                    return Ok(output);
+                }
                 return context
                     .agent_runtime()
                     .context("未找到后台 Bash 任务，且 agent runtime 不可用")?
-                    .task_output_alias(&input.task_id, input.block, input.timeout)
+                    .task_output_alias(context, &input.task_id, input.block, input.timeout)
                     .await;
             };
             saw_bash_task = true;
@@ -87,9 +101,13 @@ impl Tool for TaskOutputTool {
                 continue;
             }
             let finished = completed.is_some();
-            let status = completed
-                .map(|status| format!("completed ({status})"))
-                .unwrap_or_else(|| "running".into());
+            let status = if task.timed_out {
+                format!("timed out after {}ms", task.timeout_ms)
+            } else {
+                completed
+                    .map(|status| format!("completed ({status})"))
+                    .unwrap_or_else(|| "running".into())
+            };
             if finished {
                 terminate_task(task).await;
             }
@@ -99,10 +117,10 @@ impl Tool for TaskOutputTool {
                 .output_truncated
                 .load(std::sync::atomic::Ordering::Relaxed);
             let keep_output = preview_truncated || capture_truncated;
-            let output_path = task.output_path.clone();
             if keep_output {
+                task.disarm_output_cleanup();
                 output.push_str(&format!(
-                    "\n[Captured output: {} ({} bytes{})]",
+                    "\n[Captured output retained at {} ({} bytes{})]",
                     context.display_path(&task.output_path),
                     size,
                     if capture_truncated {
@@ -118,9 +136,6 @@ impl Tool for TaskOutputTool {
             ));
             if finished {
                 tasks.remove(&input.task_id);
-                if !keep_output {
-                    let _ = std::fs::remove_file(output_path);
-                }
             }
             return Ok(result);
         }
@@ -133,7 +148,7 @@ impl Tool for TaskStopTool {
         "TaskStop"
     }
     fn description(&self) -> &str {
-        "Stops a running background Bash task or local agent."
+        "Stops a running background Bash task, Monitor, declarative workflow, or local agent."
     }
     fn input_schema(&self) -> Value {
         object_schema(
@@ -159,10 +174,20 @@ impl Tool for TaskStopTool {
         let mut tasks = context.tasks.lock().await;
         if !tasks.contains_key(&input.task_id) {
             drop(tasks);
+            if let Some(output) = context.workflow_runtime().task_stop(&input.task_id).await? {
+                return Ok(output);
+            }
+            if let Some(output) = context
+                .monitor_service()
+                .task_stop(context, &input.task_id)
+                .await?
+            {
+                return Ok(output);
+            }
             return context
                 .agent_runtime()
                 .context("未找到后台 Bash 任务，且 agent runtime 不可用")?
-                .task_stop_alias(&input.task_id)
+                .task_stop_alias(context, &input.task_id)
                 .await;
         }
         let mut task = tasks.remove(&input.task_id).context("未找到后台任务")?;
@@ -178,6 +203,7 @@ impl Tool for TaskStopTool {
             .output_truncated
             .load(std::sync::atomic::Ordering::Relaxed);
         if preview_truncated || capture_truncated {
+            task.disarm_output_cleanup();
             output.push_str(&format!(
                 "\n[Captured output retained at {} ({} bytes{})]",
                 context.display_path(&task.output_path),
@@ -188,8 +214,6 @@ impl Tool for TaskStopTool {
                     ""
                 }
             ));
-        } else {
-            let _ = std::fs::remove_file(&task.output_path);
         }
         Ok(ToolOutput::success(format!(
             "Stopped task {}\nOutput:\n{}",

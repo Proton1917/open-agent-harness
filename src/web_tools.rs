@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::{
     config::Settings,
-    tools::{Tool, ToolContext, ToolOutput, object_schema},
+    tools::{Tool, ToolContext, ToolOutput, object_schema, schema},
 };
 
 const DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -31,6 +31,10 @@ const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE_BYTES: usize = 16 * 1024;
 const MAX_URL_BYTES: usize = 16 * 1024;
 const MAX_QUERY_BYTES: usize = 16 * 1024;
+const MAX_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_DOMAIN_FILTERS: usize = 32;
+const MAX_DOMAIN_BYTES: usize = 253;
+const MAX_PROCESSED_BYTES: usize = 128 * 1024;
 const DNS_TIMEOUT: Duration = Duration::from_secs(15);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -100,6 +104,11 @@ pub fn configure_web(settings: &Settings) -> Result<WebIntegration> {
 
 fn parse_search_config(raw: RawSearchConfig) -> Result<SearchConfig> {
     let endpoint = parse_url(&raw.endpoint)?;
+    for (key, _) in endpoint.query_pairs() {
+        if is_sensitive_query_key(&key) {
+            bail!("web.search.endpoint 不允许在 query 中携带凭据参数 {key:?}；请改用 headers")
+        }
+    }
     let query_parameter = raw.query_parameter.unwrap_or_else(|| "q".to_owned());
     if query_parameter.is_empty()
         || query_parameter.len() > 128
@@ -113,7 +122,7 @@ fn parse_search_config(raw: RawSearchConfig) -> Result<SearchConfig> {
         bail!("web.search.headers 超过 {MAX_HEADERS} 项限制")
     }
     let mut headers = HeaderMap::new();
-    let mut secrets = Vec::new();
+    let mut secrets = url_query_secrets(&endpoint);
     for (name, value) in raw.headers {
         if value.len() > MAX_HEADER_VALUE_BYTES {
             bail!("web.search header value 过长")
@@ -126,10 +135,11 @@ fn parse_search_config(raw: RawSearchConfig) -> Result<SearchConfig> {
         ) {
             bail!("web.search 不允许覆盖 header {name}")
         }
-        let value = HeaderValue::from_str(&value).context("web.search header value 无效")?;
+        let mut value = HeaderValue::from_str(&value).context("web.search header value 无效")?;
         if !value.is_sensitive() && !value.as_bytes().is_empty() {
             secrets.push(String::from_utf8_lossy(value.as_bytes()).into_owned());
         }
+        value.set_sensitive(true);
         headers.insert(name, value);
     }
     Ok(SearchConfig {
@@ -152,12 +162,17 @@ struct WebSearchTool {
 #[serde(deny_unknown_fields)]
 struct FetchInput {
     url: String,
+    prompt: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SearchInput {
     query: String,
+    #[serde(default, alias = "allowed_domains")]
+    allowed_domains: Vec<String>,
+    #[serde(default, alias = "blocked_domains")]
+    blocked_domains: Vec<String>,
 }
 
 #[async_trait]
@@ -167,13 +182,16 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetches textual HTTP(S) content with DNS pinning, redirect revalidation, private-network denial, timeouts, and response-size limits."
+        "Fetches textual HTTP(S) content and makes a bounded local prompt-guided extract, with DNS pinning, redirect revalidation, private-network denial, timeouts, and response-size limits."
     }
 
     fn input_schema(&self) -> Value {
         object_schema(
-            json!({"url": {"type": "string", "minLength": 1, "maxLength": MAX_URL_BYTES}}),
-            &["url"],
+            json!({
+                "url": {"type": "string", "minLength": 1, "maxLength": MAX_URL_BYTES},
+                "prompt": {"type": "string", "minLength": 1, "maxLength": MAX_PROMPT_BYTES}
+            }),
+            &["url", "prompt"],
         )
     }
 
@@ -186,11 +204,11 @@ impl Tool for WebFetchTool {
     }
 
     fn summary(&self, input: &Value) -> String {
-        input
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or("<url>")
-            .to_owned()
+        let value = input.get("url").and_then(Value::as_str).unwrap_or("<url>");
+        Url::parse(value)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| format!("domain:{host}")))
+            .unwrap_or_else(|| "domain:<invalid>".to_owned())
     }
 
     async fn execute(&self, _: &ToolContext, input: Value) -> Result<ToolOutput> {
@@ -200,7 +218,10 @@ impl Tool for WebFetchTool {
             .runtime
             .fetch(url, HeaderMap::new(), Vec::new())
             .await?;
-        Ok(ToolOutput::success(response))
+        Ok(ToolOutput::success(apply_prompt_to_response(
+            &response,
+            &input.prompt,
+        )?))
     }
 }
 
@@ -216,9 +237,36 @@ impl Tool for WebSearchTool {
 
     fn input_schema(&self) -> Value {
         object_schema(
-            json!({"query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES}}),
+            json!({
+                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES},
+                "allowedDomains": {
+                    "type":"array", "maxItems":MAX_DOMAIN_FILTERS,
+                    "items":{"type":"string", "minLength":1, "maxLength":MAX_DOMAIN_BYTES}
+                },
+                "blockedDomains": {
+                    "type":"array", "maxItems":MAX_DOMAIN_FILTERS,
+                    "items":{"type":"string", "minLength":1, "maxLength":MAX_DOMAIN_BYTES}
+                },
+                "allowed_domains": {
+                    "type":"array", "maxItems":MAX_DOMAIN_FILTERS,
+                    "items":{"type":"string", "minLength":1, "maxLength":MAX_DOMAIN_BYTES}
+                },
+                "blocked_domains": {
+                    "type":"array", "maxItems":MAX_DOMAIN_FILTERS,
+                    "items":{"type":"string", "minLength":1, "maxLength":MAX_DOMAIN_BYTES}
+                }
+            }),
             &["query"],
         )
+    }
+
+    fn validate_input(&self, input: &Value) -> std::result::Result<(), String> {
+        schema::validate(&self.input_schema(), input)?;
+        let input: SearchInput =
+            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        normalize_domain_filters(&input.allowed_domains, &input.blocked_domains)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn read_only(&self, _: &Value) -> bool {
@@ -239,6 +287,7 @@ impl Tool for WebSearchTool {
 
     async fn execute(&self, _: &ToolContext, input: Value) -> Result<ToolOutput> {
         let input: SearchInput = serde_json::from_value(input)?;
+        let filters = normalize_domain_filters(&input.allowed_domains, &input.blocked_domains)?;
         let search = self
             .runtime
             .search
@@ -251,6 +300,11 @@ impl Tool for WebSearchTool {
             .runtime
             .fetch(url, search.headers.clone(), search.secrets.clone())
             .await?;
+        let response = if filters.is_empty() {
+            response
+        } else {
+            apply_search_domain_filters(&response, &filters)?
+        };
         Ok(ToolOutput::success(response))
     }
 }
@@ -282,7 +336,9 @@ impl WebRuntime {
                 )
                 .send()
                 .await
-                .with_context(|| format!("HTTP request 失败: {}", display_url(&url)))?;
+                // reqwest errors may include their source URL. Discard that source here so a
+                // configured query credential or user search query cannot escape redaction.
+                .map_err(|_| anyhow::anyhow!("HTTP request 失败: {}", display_url(&url)))?;
             if response.status().is_redirection() {
                 if redirect == MAX_REDIRECTS {
                     bail!("HTTP redirect 超过 {MAX_REDIRECTS} 次限制")
@@ -330,7 +386,11 @@ impl WebRuntime {
             }
             let body = read_limited(response, limit).await?;
             let text = String::from_utf8(body).context("HTTP response 不是有效 UTF-8 文本")?;
-            let text = redact(&text, &secrets);
+            let mut response_secrets = secrets.clone();
+            response_secrets.extend(url.query_pairs().filter_map(|(key, value)| {
+                (is_sensitive_query_key(&key) && !value.is_empty()).then(|| value.into_owned())
+            }));
+            let text = redact(&text, &response_secrets);
             if !status.is_success() {
                 bail!(
                     "HTTP {}: {}",
@@ -351,6 +411,310 @@ impl WebRuntime {
         }
         bail!("HTTP fetch 未产生结果")
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DomainFilters {
+    allowed: BTreeSet<String>,
+    blocked: BTreeSet<String>,
+}
+
+impl DomainFilters {
+    fn is_empty(&self) -> bool {
+        self.allowed.is_empty() && self.blocked.is_empty()
+    }
+
+    fn permits(&self, url: &str) -> bool {
+        let Ok(url) = Url::parse(url) else {
+            return false;
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return false;
+        }
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let matches = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+        (self.allowed.is_empty() || self.allowed.iter().any(|domain| matches(domain)))
+            && !self.blocked.iter().any(|domain| matches(domain))
+    }
+}
+
+fn normalize_domain_filters(allowed: &[String], blocked: &[String]) -> Result<DomainFilters> {
+    if !allowed.is_empty() && !blocked.is_empty() {
+        bail!("allowedDomains 与 blockedDomains 不能同时设置")
+    }
+    if allowed.len() > MAX_DOMAIN_FILTERS || blocked.len() > MAX_DOMAIN_FILTERS {
+        bail!("search domain filters 超过 {MAX_DOMAIN_FILTERS} 项限制")
+    }
+    Ok(DomainFilters {
+        allowed: allowed
+            .iter()
+            .map(|domain| normalize_domain(domain))
+            .collect::<Result<_>>()?,
+        blocked: blocked
+            .iter()
+            .map(|domain| normalize_domain(domain))
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn normalize_domain(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_DOMAIN_BYTES {
+        bail!("search domain 为空或超过 {MAX_DOMAIN_BYTES} 字节")
+    }
+    let value = value
+        .strip_prefix("*.")
+        .unwrap_or(value)
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if value.is_empty() || value.contains('*') {
+        bail!("search domain wildcard 只允许最前面的 *. 前缀")
+    }
+    let url = Url::parse(&format!("{}://{value}/", "https")).context("search domain 无效")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        bail!("search domain 只能包含 hostname")
+    }
+    let host = url.host_str().context("search domain 缺少 hostname")?;
+    if host.len() > MAX_DOMAIN_BYTES {
+        bail!("search domain 规范化后过长")
+    }
+    Ok(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn apply_search_domain_filters(response: &str, filters: &DomainFilters) -> Result<String> {
+    let (metadata, body) = split_fetch_response(response)?;
+    let value: Value = serde_json::from_str(body).context(
+        "配置 domain filters 时，provider-neutral search endpoint 必须返回含 url/link 字段的 JSON",
+    )?;
+    let mut saw_url = false;
+    let filtered = filter_search_json(value, filters, &mut saw_url)
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    if !saw_url {
+        bail!("search endpoint JSON 不含可验证的 url/link 结果字段")
+    }
+    Ok(format!(
+        "{metadata}\n\n{}",
+        serde_json::to_string_pretty(&filtered)?
+    ))
+}
+
+fn filter_search_json(value: Value, filters: &DomainFilters, saw_url: &mut bool) -> Option<Value> {
+    match value {
+        Value::Array(values) => Some(Value::Array(
+            values
+                .into_iter()
+                .filter_map(|value| filter_search_json(value, filters, saw_url))
+                .collect(),
+        )),
+        Value::Object(mut object) => {
+            let direct_urls = object
+                .iter()
+                .filter(|(key, value)| {
+                    matches!(key.to_ascii_lowercase().as_str(), "url" | "link") && value.is_string()
+                })
+                .filter_map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>();
+            if !direct_urls.is_empty() {
+                *saw_url = true;
+                if direct_urls.iter().any(|url| !filters.permits(url)) {
+                    return None;
+                }
+            }
+            for value in object.values_mut() {
+                let current = std::mem::take(value);
+                *value = filter_search_json(current, filters, saw_url)?;
+            }
+            Some(Value::Object(object))
+        }
+        other => Some(other),
+    }
+}
+
+fn apply_prompt_to_response(response: &str, prompt: &str) -> Result<String> {
+    if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+        bail!("WebFetch prompt 为空或超过 {MAX_PROMPT_BYTES} 字节限制")
+    }
+    let (metadata, body) = split_fetch_response(response)?;
+    let content_type = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Type: "))
+        .unwrap_or("text/plain");
+    let text = if matches!(content_type, "text/html" | "application/xhtml+xml") {
+        html_to_text(body)
+    } else if content_type.ends_with("json") || content_type.ends_with("+json") {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| body.to_owned())
+    } else {
+        body.to_owned()
+    };
+    let extract = prompt_guided_extract(&text, prompt);
+    Ok(format!(
+        "{metadata}\n\nPrompt: {}\n\nPrompt-guided extract:\n{}",
+        prompt.trim(),
+        extract
+    ))
+}
+
+fn split_fetch_response(response: &str) -> Result<(&str, &str)> {
+    response
+        .split_once("\n\n")
+        .context("内部 Web response envelope 损坏")
+}
+
+fn prompt_guided_extract(content: &str, prompt: &str) -> String {
+    let terms = prompt
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .filter(|term| {
+            !matches!(
+                term.as_str(),
+                "the"
+                    | "and"
+                    | "for"
+                    | "from"
+                    | "this"
+                    | "that"
+                    | "with"
+                    | "return"
+                    | "show"
+                    | "page"
+                    | "content"
+                    | "please"
+                    | "summarize"
+            )
+        })
+        .take(64)
+        .collect::<BTreeSet<_>>();
+    let mut candidates = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let lowercase = line.to_lowercase();
+            let score = terms
+                .iter()
+                .filter(|term| lowercase.contains(term.as_str()))
+                .count();
+            Some((index, score, line))
+        })
+        .collect::<Vec<_>>();
+    let has_match = candidates.iter().any(|(_, score, _)| *score > 0);
+    if has_match {
+        candidates.retain(|(_, score, _)| *score > 0);
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        candidates.truncate(128);
+        candidates.sort_by_key(|(index, _, _)| *index);
+    }
+    let mut output = String::new();
+    for (_, _, line) in candidates {
+        if output.len().saturating_add(line.len()).saturating_add(1) > MAX_PROCESSED_BYTES {
+            break;
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line);
+    }
+    if output.is_empty() {
+        truncate_text(content.trim(), MAX_PROCESSED_BYTES).to_owned()
+    } else {
+        output
+    }
+}
+
+fn html_to_text(html: &str) -> String {
+    let mut output = String::with_capacity(html.len().min(MAX_PROCESSED_BYTES * 2));
+    let mut tag = String::new();
+    let mut in_tag = false;
+    let mut suppressed: Option<&'static str> = None;
+    for character in html.chars() {
+        if in_tag {
+            if character == '>' {
+                let normalized = tag.trim().to_ascii_lowercase();
+                let closing = normalized.starts_with('/');
+                let name = normalized
+                    .trim_start_matches('/')
+                    .split(|character: char| character.is_ascii_whitespace() || character == '/')
+                    .next()
+                    .unwrap_or("");
+                if closing && suppressed == Some(name) {
+                    suppressed = None;
+                } else if !closing && matches!(name, "script" | "style" | "noscript") {
+                    suppressed = Some(match name {
+                        "script" => "script",
+                        "style" => "style",
+                        _ => "noscript",
+                    });
+                }
+                if suppressed.is_none()
+                    && matches!(
+                        name,
+                        "address"
+                            | "article"
+                            | "aside"
+                            | "blockquote"
+                            | "br"
+                            | "div"
+                            | "footer"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "header"
+                            | "li"
+                            | "main"
+                            | "nav"
+                            | "p"
+                            | "pre"
+                            | "section"
+                            | "table"
+                            | "tr"
+                    )
+                {
+                    output.push('\n');
+                }
+                tag.clear();
+                in_tag = false;
+            } else if tag.len() < 512 {
+                tag.push(character);
+            }
+        } else if character == '<' {
+            in_tag = true;
+            tag.clear();
+        } else if suppressed.is_none() {
+            output.push(character);
+        }
+    }
+    let decoded = output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    decoded
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_url(value: &str) -> Result<Url> {
@@ -375,7 +739,7 @@ fn validate_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_target(url: &Url, allow_private: bool) -> Result<SocketAddr> {
+pub(crate) async fn resolve_target(url: &Url, allow_private: bool) -> Result<SocketAddr> {
     validate_url(url)?;
     let host = url.host_str().context("URL 缺少 host")?;
     let port = url.port_or_known_default().context("URL 缺少可识别端口")?;
@@ -509,8 +873,37 @@ fn origin(url: &Url) -> (String, String, Option<u16>) {
 
 fn display_url(url: &Url) -> String {
     let mut clean = url.clone();
+    clean.set_query(None);
     clean.set_fragment(None);
     clean.to_string()
+}
+
+fn url_query_secrets(url: &Url) -> Vec<String> {
+    url.query_pairs()
+        .filter_map(|(_, value)| (!value.is_empty()).then(|| value.into_owned()))
+        .collect()
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let normalized = String::from_utf8_lossy(&normalized);
+    normalized == "key"
+        || normalized == "sig"
+        || normalized == "jwt"
+        || normalized == "code"
+        || normalized.ends_with("key")
+        || normalized.contains("auth")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("credential")
+        || normalized.contains("signature")
+        || normalized.contains("session")
 }
 
 fn redact(value: &str, secrets: &[String]) -> String {
@@ -596,12 +989,16 @@ mod tests {
             .execute(
                 &context,
                 "WebFetch",
-                json!({"url": format!("http://{address}/text")}),
+                json!({
+                    "url": format!("http://{address}/text"),
+                    "prompt":"Return the local response"
+                }),
             )
             .await;
         server.join().unwrap();
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("local response"));
+        assert!(output.content.contains("Prompt-guided extract"));
     }
 
     #[test]
@@ -615,6 +1012,178 @@ mod tests {
         };
         let integration = configure_web(&settings).unwrap();
         assert_eq!(integration.deferred_tools.len(), 2);
+    }
+
+    #[test]
+    fn search_endpoint_rejects_query_credentials_without_echoing_them() {
+        let configured_secret = "unit-test-query-credential";
+        let settings = Settings {
+            raw: json!({"web": {"search": {
+                "endpoint": format!(
+                    "https://search.example.invalid/query?api_key={configured_secret}"
+                )
+            }}}),
+        };
+        let error = configure_web(&settings).err().unwrap();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("请改用 headers"));
+        assert!(!rendered.contains(configured_secret));
+    }
+
+    #[tokio::test]
+    async fn search_query_and_configured_secrets_are_absent_from_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /query?fixed=unit-test-filter&query=rust+agents "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: unit-test-header-credential")
+            );
+            let body = "unit-test-header-credential unit-test-filter";
+            write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let settings = Settings {
+            raw: json!({"web": {
+                "allowPrivateNetwork": true,
+                "search": {
+                    "endpoint": format!("http://{address}/query?fixed=unit-test-filter"),
+                    "queryParameter": "query",
+                    "headers": {"authorization": "unit-test-header-credential"}
+                }
+            }}),
+        };
+        let integration = configure_web(&settings).unwrap();
+        let registry =
+            ToolRegistry::with_extensions(integration.deferred_tools, Vec::new()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let output = registry
+            .execute(&context, "WebSearch", json!({"query": "rust agents"}))
+            .await;
+        server.join().unwrap();
+        assert!(output.is_error);
+        assert!(!output.content.contains("unit-test-header-credential"));
+        assert!(!output.content.contains("unit-test-filter"));
+        assert!(!output.content.contains("rust+agents"));
+        assert!(output.content.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn displayed_urls_never_include_query_or_fragment() {
+        let url = Url::parse(
+            "https://search.example.invalid/query?token=unit-test-query-credential#fragment",
+        )
+        .unwrap();
+        assert_eq!(display_url(&url), "https://search.example.invalid/query");
+    }
+
+    #[test]
+    fn search_domain_filters_are_normalized_and_enforced_on_json_results() {
+        let filters = normalize_domain_filters(&["*.Example.INVALID.".to_owned()], &[]).unwrap();
+        assert!(filters.permits("https://docs.example.invalid/a"));
+        assert!(filters.permits("https://example.invalid/root"));
+        assert!(!filters.permits("https://other.invalid/no"));
+
+        let response = concat!(
+            "URL: https://search.invalid/query\nStatus: 200\nContent-Type: application/json\n\n",
+            r#"{"results":[{"title":"keep","url":"https://docs.example.invalid/a"},{"title":"drop","url":"https://other.invalid/b"}],"metadata":{"count":2}}"#
+        );
+        let filtered = apply_search_domain_filters(response, &filters).unwrap();
+        assert!(filtered.contains("keep"));
+        assert!(!filtered.contains("drop"));
+        assert!(filtered.contains("metadata"));
+
+        let blocked = normalize_domain_filters(&[], &["other.invalid".to_owned()]).unwrap();
+        let filtered = apply_search_domain_filters(response, &blocked).unwrap();
+        assert!(filtered.contains("keep"));
+        assert!(!filtered.contains("drop"));
+        assert!(apply_search_domain_filters("metadata\n\nplain text", &filters).is_err());
+    }
+
+    #[test]
+    fn nested_blocked_urls_remove_the_result_without_removing_allowed_siblings() {
+        let filters = normalize_domain_filters(&[], &["blocked.invalid".to_owned()]).unwrap();
+        let response = concat!(
+            "URL: https://search.invalid/query\nStatus: 200\nContent-Type: application/json\n\n",
+            r#"{"results":[{"title":"blocked snippet","source":{"details":{"url":"https://blocked.invalid/private"}}},{"title":"allowed sibling","source":{"details":{"url":"https://allowed.invalid/public"}}}],"metadata":{"count":2}}"#
+        );
+        let filtered = apply_search_domain_filters(response, &filters).unwrap();
+        assert!(!filtered.contains("blocked snippet"));
+        assert!(!filtered.contains("blocked.invalid"));
+        assert!(!filtered.contains("\"source\": null"));
+        assert!(filtered.contains("allowed sibling"));
+        assert!(filtered.contains("allowed.invalid"));
+        assert!(filtered.contains("metadata"));
+    }
+
+    #[test]
+    fn search_domain_filter_schema_rejects_conflicts_and_invalid_hosts() {
+        let tool = WebSearchTool {
+            runtime: Arc::new(WebRuntime {
+                allow_private_network: false,
+                max_bytes: DEFAULT_MAX_BYTES,
+                search: None,
+            }),
+        };
+        assert!(
+            tool.validate_input(&json!({
+                "query":"rust",
+                "allowedDomains":["example.com"],
+                "blockedDomains":["example.net"]
+            }))
+            .is_err()
+        );
+        assert!(
+            tool.validate_input(&json!({
+                "query":"rust", "allowed_domains":["https://example.invalid/path"]
+            }))
+            .is_err()
+        );
+        assert!(
+            tool.validate_input(&json!({
+                "query":"rust", "blocked_domains":["*.example.com"]
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn prompt_processing_removes_active_html_and_selects_relevant_lines() {
+        let response = concat!(
+            "URL: https://example.invalid/\nStatus: 200\nContent-Type: text/html\n\n",
+            "<html><style>.secret{}</style><script>alert('hidden')</script>",
+            "<p>Rust ownership keeps memory safe.</p><p>Unrelated weather text.</p></html>"
+        );
+        let processed = apply_prompt_to_response(response, "Explain Rust ownership").unwrap();
+        assert!(processed.contains("Rust ownership keeps memory safe"));
+        assert!(!processed.contains("Unrelated weather"));
+        assert!(!processed.contains("hidden"));
+        assert!(!processed.contains(".secret"));
     }
 
     #[test]

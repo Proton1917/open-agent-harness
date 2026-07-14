@@ -84,6 +84,9 @@ pub fn permission_mode_section(mode: PermissionMode) -> String {
         PermissionMode::BypassPermissions => {
             "The user explicitly disabled interactive permission prompts. Explicit deny rules still apply, and removing prompts does not remove responsibility: stay within the requested scope and avoid unnecessary destructive actions."
         }
+        PermissionMode::DontAsk => {
+            "Calls already allowed by explicit permission rules, plus automatically safe read-only operations inside the workspace, can run. Any call that would require approval is denied without prompting the user."
+        }
     };
     format!(
         "# Current permission mode\n\nMode: {}. {behavior}",
@@ -117,6 +120,7 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::AcceptEdits => "accept-edits",
         PermissionMode::Plan => "plan",
         PermissionMode::BypassPermissions => "bypass-permissions",
+        PermissionMode::DontAsk => "dont-ask",
     }
 }
 
@@ -136,6 +140,9 @@ mod tests {
             "# Registered tools\n\nThe harness currently exposes: Read, Edit."
         );
         assert!(permission_mode_section(PermissionMode::AcceptEdits).contains("accept-edits"));
+        let dont_ask = permission_mode_section(PermissionMode::DontAsk);
+        assert!(dont_ask.contains("dont-ask"));
+        assert!(dont_ask.contains("denied without prompting"));
     }
 
     #[test]

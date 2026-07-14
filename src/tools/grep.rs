@@ -129,14 +129,15 @@ impl Tool for GrepTool {
             )
         }
         let cwd = context.cwd();
-        let result = tokio::task::spawn_blocking(move || search(root, cwd, input))
+        let context = context.clone();
+        let result = tokio::task::spawn_blocking(move || search(root, cwd, input, &context))
             .await
             .context("Rust Grep worker 失败")??;
         Ok(ToolOutput::success(result))
     }
 }
 
-fn search(root: PathBuf, cwd: PathBuf, input: Input) -> Result<String> {
+fn search(root: PathBuf, cwd: PathBuf, input: Input, context: &ToolContext) -> Result<String> {
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive)
         .multi_line(input.multiline)
@@ -172,12 +173,20 @@ fn search(root: PathBuf, cwd: PathBuf, input: Input) -> Result<String> {
     let mut budget = SearchBudget::new();
 
     if root.is_file() {
-        scan_candidate(&root, &root, &cwd, &options, &mut collector, &mut budget)?;
+        scan_candidate(
+            &root,
+            &root,
+            &cwd,
+            context,
+            &options,
+            &mut collector,
+            &mut budget,
+        )?;
     } else {
         for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(include_entry)
+            .filter_entry(|entry| include_entry(entry) && !context.read_path_denied(entry.path()))
         {
             budget.check_time()?;
             let entry = match entry {
@@ -199,6 +208,7 @@ fn search(root: PathBuf, cwd: PathBuf, input: Input) -> Result<String> {
                 entry.path(),
                 &root,
                 &cwd,
+                context,
                 &options,
                 &mut collector,
                 &mut budget,
@@ -250,11 +260,15 @@ fn scan_candidate(
     path: &Path,
     root: &Path,
     cwd: &Path,
+    context: &ToolContext,
     options: &SearchOptions,
     collector: &mut Collector,
     budget: &mut SearchBudget,
 ) -> Result<bool> {
     budget.check_time()?;
+    if context.read_path_denied(path) {
+        return Ok(true);
+    }
     let relative = path.strip_prefix(root).unwrap_or(path);
     if !matches_filters(path, relative, options) {
         return Ok(true);

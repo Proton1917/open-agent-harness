@@ -1,7 +1,7 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -307,6 +307,159 @@ async fn nested_foreground_agent_reuses_single_scheduler_slot() {
     assert_eq!(requests.lock().unwrap().len(), 5);
 }
 
+#[tokio::test]
+async fn cancelled_agent_rolls_back_no_persistence_hot_refresh() {
+    assert_interrupted_agent_hot_refresh_rolls_back(true).await;
+}
+
+#[tokio::test]
+async fn timed_out_agent_rolls_back_no_persistence_hot_refresh() {
+    assert_interrupted_agent_hot_refresh_rolls_back(false).await;
+}
+
+async fn assert_interrupted_agent_hot_refresh_rolls_back(explicit_stop: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut first);
+        let response = write_agents_stream("interrupted rule", "interrupted-write");
+        write_sse_response(&mut first, &response);
+
+        let (mut blocked, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut blocked);
+        blocked_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(blocked);
+
+        let (mut recovery_write, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut recovery_write);
+        let response = write_agents_stream("completed rule", "recovery-write");
+        write_sse_response(&mut recovery_write, &response);
+
+        let (mut recovery_final, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut recovery_final);
+        write_sse_response(
+            &mut recovery_final,
+            &text_stream("recovery complete", "recovery-final"),
+        );
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let integration = configure_agents(&Settings::default()).unwrap();
+    let registry = ToolRegistry::with_extensions(integration.deferred_tools, Vec::new()).unwrap();
+    let mut context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    context.set_agent_limits(integration.limits);
+    let tools_context = context.clone();
+    let engine = QueryEngine::new(
+        client,
+        registry.clone(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "test system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    let selected = registry
+        .execute(
+            &tools_context,
+            "ToolSearch",
+            json!({"query":"select:Agent"}),
+        )
+        .await;
+    assert!(!selected.is_error, "{}", selected.content);
+    let started = registry
+        .execute(
+            &tools_context,
+            "Agent",
+            json!({
+                "prompt":"write the context file, then wait",
+                "description":"hot refresh interruption",
+                "runInBackground":true,
+                "timeoutMs": if explicit_stop { 60_000 } else { 1_000 }
+            }),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let agent_id = started
+        .content
+        .lines()
+        .find_map(|line| line.strip_prefix("agent_id="))
+        .unwrap()
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(3), blocked_rx)
+        .await
+        .expect("subagent did not reach its blocked model round")
+        .unwrap();
+
+    let interrupted = if explicit_stop {
+        registry
+            .execute(&tools_context, "TaskStop", json!({"task_id":agent_id}))
+            .await
+    } else {
+        registry
+            .execute(
+                &tools_context,
+                "TaskOutput",
+                json!({"task_id":agent_id,"block":true,"timeout":5_000}),
+            )
+            .await
+    };
+    assert!(!interrupted.content.is_empty());
+    assert!(
+        !temp.path().join("AGENTS.md").exists(),
+        "interrupted subagent left a no-persistence context edit behind"
+    );
+    release_tx.send(()).unwrap();
+
+    let recovered = registry
+        .execute(
+            &tools_context,
+            "Agent",
+            json!({
+                "prompt":"write the context file and complete",
+                "description":"hot refresh recovery",
+                "timeoutMs":5_000
+            }),
+        )
+        .await;
+    assert!(!recovered.is_error, "{}", recovered.content);
+    assert!(recovered.content.contains("recovery complete"));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("AGENTS.md")).unwrap(),
+        "completed rule"
+    );
+
+    engine.shutdown().await;
+    server.join().unwrap();
+}
+
 fn agent_tool_stream() -> String {
     agent_tool_stream_for("parent-tool", "agent-1", "inspect independently")
 }
@@ -356,6 +509,41 @@ fn text_stream(text: &str, id: &str) -> String {
     .into_iter()
     .map(sse_event)
     .collect()
+}
+
+fn write_agents_stream(content: &str, id: &str) -> String {
+    let input = serde_json::to_string(&json!({
+        "file_path":"AGENTS.md",
+        "content":content
+    }))
+    .unwrap();
+    [
+        json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":id,"content":[],"usage":{}
+        }}),
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":format!("{id}-tool"),"name":"Write","input":{}
+        }}),
+        json!({"type":"content_block_delta","index":0,"delta":{
+            "type":"input_json_delta","partial_json":input
+        }}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+        json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(sse_event)
+    .collect()
+}
+
+fn write_sse_response(stream: &mut std::net::TcpStream, response: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response.len(),
+        response
+    )
+    .unwrap();
 }
 
 fn sse_event(value: Value) -> String {

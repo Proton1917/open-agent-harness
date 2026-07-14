@@ -97,6 +97,8 @@ impl Tool for EditTool {
             original.replacen(&actual_old, &replacement, 1)
         };
         debug_assert_eq!(updated.len(), updated_bytes);
+        context.track_before_edit(&path)?;
+        context.expect_after_edit(&path, updated.as_bytes())?;
         atomic_write(&path, &updated)?;
         context.remember_read(path.clone(), updated, false).await?;
         Ok(ToolOutput::success(format!(

@@ -19,7 +19,9 @@ use tokio::{
     time::timeout,
 };
 
-use crate::process::terminate_process_tree;
+use crate::process::{
+    ProcessTreeGuard, SecretEnvScrubber, resolve_trusted_executable, spawn_managed,
+};
 
 const MAX_RPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -38,6 +40,7 @@ struct ReaderLoopState {
     closed: Arc<AtomicBool>,
     label: String,
     server_request_handler: Option<RpcServerRequestHandler>,
+    process_tree: ProcessTreeGuard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,32 +77,35 @@ pub struct StdioRpcClient {
     next_id: AtomicU64,
     closed: Arc<AtomicBool>,
     shutdown_started: AtomicBool,
-    process_group_id: Option<u32>,
+    process_tree: ProcessTreeGuard,
 }
 
 impl StdioRpcClient {
     pub async fn spawn(config: StdioRpcConfig) -> Result<Self> {
+        Self::spawn_with_secret_env_scrubber(config, SecretEnvScrubber::default()).await
+    }
+
+    pub(crate) async fn spawn_with_secret_env_scrubber(
+        config: StdioRpcConfig,
+        secret_env_scrubber: SecretEnvScrubber,
+    ) -> Result<Self> {
         if config.command.trim().is_empty() {
             bail!("{} RPC command 不能为空", config.label)
         }
-        let mut command = Command::new(&config.command);
+        let executable = resolve_trusted_executable(&config.command, &config.cwd)
+            .with_context(|| format!("{} RPC executable 不可信", config.label))?;
+        let mut command = Command::new(executable);
         command
             .args(&config.args)
             .envs(&config.env)
-            .env_remove("HARNESS_API_KEY")
-            .env_remove("HARNESS_AUTH_TOKEN")
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-
-        let mut child = command
-            .spawn()
+        secret_env_scrubber.scrub_tokio(&mut command);
+        let (mut child, process_tree) = spawn_managed(&mut command)
             .with_context(|| format!("无法启动 {} RPC process", config.label))?;
-        let process_group_id = child.id();
         let stdin = child.stdin.take().context("无法打开 RPC stdin")?;
         let stdout = child.stdout.take().context("无法打开 RPC stdout")?;
         let stderr_pipe = child.stderr.take().context("无法打开 RPC stderr")?;
@@ -119,6 +125,7 @@ impl StdioRpcClient {
                 closed: Arc::clone(&closed),
                 label: config.label.clone(),
                 server_request_handler: config.server_request_handler,
+                process_tree: process_tree.clone(),
             },
         ));
         let stderr_task = tokio::spawn(drain_stderr(stderr_pipe, Arc::clone(&stderr)));
@@ -137,7 +144,7 @@ impl StdioRpcClient {
             next_id: AtomicU64::new(1),
             closed,
             shutdown_started: AtomicBool::new(false),
-            process_group_id,
+            process_tree,
         })
     }
 
@@ -146,6 +153,16 @@ impl StdioRpcClient {
     }
 
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_with_timeout(method, params, self.request_timeout)
+            .await
+    }
+
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        request_timeout: Duration,
+    ) -> Result<Value> {
         if self.closed.load(Ordering::Acquire) {
             bail!("{} RPC process 已关闭", self.label)
         }
@@ -167,7 +184,7 @@ impl StdioRpcClient {
             return Err(error).with_context(|| format!("发送 {method} RPC request 失败"));
         }
 
-        match timeout(self.request_timeout, receiver).await {
+        match timeout(request_timeout, receiver).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(error))) => bail!("{error}"),
             Ok(Err(_)) => bail!("{} RPC process 在响应前关闭", self.label),
@@ -177,7 +194,7 @@ impl StdioRpcClient {
                 bail!(
                     "{} RPC request {method} 超过 {}ms timeout",
                     self.label,
-                    self.request_timeout.as_millis()
+                    request_timeout.as_millis()
                 )
             }
         }
@@ -232,12 +249,13 @@ impl StdioRpcClient {
             match timeout(SHUTDOWN_GRACE, child.wait()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) | Err(_) => {
-                    terminate_process_tree(self.process_group_id);
+                    self.process_tree.terminate();
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                 }
             }
         }
+        self.process_tree.terminate();
         drop(child);
 
         if let Some(mut task) = self.reader_task.lock().await.take() {
@@ -258,8 +276,8 @@ impl Drop for StdioRpcClient {
             writer.take();
         }
         let child = self.child.get_mut();
+        self.process_tree.terminate();
         if child.try_wait().ok().flatten().is_none() {
-            terminate_process_tree(self.process_group_id);
             let _ = child.start_kill();
         }
         if let Some(task) = self.reader_task.get_mut().take() {
@@ -283,6 +301,7 @@ where
         closed,
         label,
         server_request_handler,
+        process_tree,
     } = state;
     let outcome = async {
         while let Some(message) = read_message(&mut reader, framing, MAX_RPC_MESSAGE_BYTES).await? {
@@ -328,6 +347,7 @@ where
     .await;
 
     closed.store(true, Ordering::Release);
+    process_tree.terminate();
     let reason = outcome.err().map_or_else(
         || format!("{label} RPC stdout 已关闭"),
         |error| format!("{error:#}"),
@@ -550,6 +570,8 @@ fn bounded_json(value: &Value, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::config::Settings;
 
     #[tokio::test]
     async fn newline_framing_round_trips_without_raw_newlines() {
@@ -593,5 +615,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("1024"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_rpc_scrubs_declared_secret_even_from_explicit_child_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_name = "MCP_RPC_SECRET_TEST";
+        let scrubber = SecretEnvScrubber::from_settings(&Settings {
+            raw: json!({"mcpServers":{"local":{"auth":{
+                "type":"bearer-env", "env":secret_name
+            }}}}),
+        })
+        .unwrap();
+        let mut env = BTreeMap::new();
+        env.insert(secret_name.to_owned(), "must-not-leak".to_owned());
+        let script = format!(
+            "read request; if [ -z \"${{{secret_name}+x}}\" ]; then value=true; else value=false; fi; printf '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"scrubbed\":%s}}}}\\n' \"$value\""
+        );
+        let client = StdioRpcClient::spawn_with_secret_env_scrubber(
+            StdioRpcConfig {
+                label: "secret scrub test".to_owned(),
+                command: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), script],
+                env,
+                cwd: temp.path().to_owned(),
+                framing: RpcFraming::Newline,
+                request_timeout: Duration::from_secs(2),
+                server_request_handler: None,
+            },
+            scrubber,
+        )
+        .await
+        .unwrap();
+        let response = client.request("ping", None).await.unwrap();
+        assert_eq!(response, json!({"scrubbed":true}));
+        client.shutdown().await;
     }
 }

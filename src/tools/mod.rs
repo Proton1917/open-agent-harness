@@ -1,22 +1,28 @@
-mod bash;
+mod ask_user;
+pub(crate) mod bash;
+mod cron;
 mod edit;
 mod glob;
 mod grep;
+mod memory;
 mod notebook;
 mod read;
 pub(crate) mod schema;
 mod skill;
 mod tasks;
+mod team;
+mod wakeup;
 mod work_items;
+mod workflow;
 mod write;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, RwLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -26,24 +32,51 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::{process::Child, sync::Mutex};
 
-use crate::agents::{AgentLimits, AgentRuntime};
+use crate::agents::{
+    AgentLimits, AgentRuntime, AgentToolPolicy,
+    team::{TeamMessageKind, TeamService},
+};
+use crate::cron::CronService;
+use crate::file_history::{
+    CheckpointBoundary, CheckpointInfo, DiffStats, FileHistory, RewindReport,
+};
 use crate::hooks::HookRunner;
-use crate::permissions::{PermissionDecision, PermissionManager};
+use crate::interactions::{UserInteractionHandler, UserInteractionRequest};
+use crate::monitor::{MonitorNotificationCheckpoint, MonitorService, MonitorTool};
+use crate::permissions::{PermissionDecision, PermissionManager, PermissionTarget};
+use crate::plugins::PluginMonitorDefinition;
+use crate::process::SecretEnvScrubber;
+use crate::sandbox::SandboxRuntime;
+use crate::session::sanitize_transport_text;
+use crate::workflow::WorkflowRuntime;
 use crate::{
-    config::project_deny_rules,
-    context::{discover_agent_instructions, render_agent_instructions},
+    config::{Settings, project_deny_rules},
+    context::{
+        InstructionFile, discover_agent_instructions, discover_nested_agent_instructions,
+        render_agent_instructions,
+    },
     skills::{SkillCatalog, SkillDefinition, discover_skills, render_skill_index},
 };
 
+pub type WorkspaceStateRecorder = Arc<dyn Fn(&Path, &Path) -> Result<()> + Send + Sync>;
+pub type CurrentCwdStateRecorder = Arc<dyn Fn(&Path, &Path) -> Result<()> + Send + Sync>;
+
+pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
+pub(crate) use bash::command_is_destructive;
+pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use memory::MemoryTool;
 pub use notebook::NotebookEditTool;
 pub use read::ReadTool;
 pub use skill::SkillTool;
 pub use tasks::{TaskOutputTool, TaskStopTool};
+pub use team::TeamTool;
+pub use wakeup::ScheduleWakeupTool;
 pub use work_items::{TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool, TodoWriteTool};
+pub use workflow::RunWorkflowTool;
 pub use write::WriteTool;
 
 #[derive(Debug, Clone)]
@@ -59,8 +92,28 @@ struct ReadCache {
     bytes: usize,
 }
 
+#[derive(Default)]
+struct HotRefreshTransactionManager {
+    next_id: u64,
+    retained_bytes: usize,
+    frames: BTreeMap<u64, HotRefreshFileTransaction>,
+    path_owners: HashMap<PathBuf, u64>,
+}
+
+struct HotRefreshFileTransaction {
+    parent: Option<u64>,
+    snapshots: BTreeMap<PathBuf, HotRefreshFileSnapshot>,
+}
+
+struct HotRefreshFileSnapshot {
+    original: Option<Vec<u8>>,
+    original_permissions: Option<std::fs::Permissions>,
+    expected: Option<Vec<u8>>,
+}
+
 pub(crate) const MAX_EDITABLE_FILE_BYTES: usize = 256 * 1024;
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+const MAX_MODEL_TOOL_RESULT_BYTES: usize = 12 * 1024 * 1024;
 const MAX_CONCURRENT_READ_TOOLS: usize = 8;
 const MAX_ACTIVE_TOOLS: usize = 128;
 const MAX_DEFERRED_TOOLS: usize = 512;
@@ -71,28 +124,93 @@ const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 const DEFAULT_WORKSPACE_CONTEXT_BUDGET: usize = 2 * 1024 * 1024;
 const MAX_READ_CACHE_FILES: usize = 512;
 const MAX_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HOT_REFRESH_TRANSACTION_FILES: usize = 64;
+const MAX_HOT_REFRESH_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRUSTED_WORKSPACE_ROOTS: usize = 33;
+const MAX_BACKGROUND_NOTIFICATIONS: usize = 16;
+const MAX_BACKGROUND_NOTIFICATION_BYTES: usize = 8 * 1024;
+const MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_CONTEXT_CHANGE_ENTRIES: usize = 256;
+const MAX_WORKSPACE_CONTEXT_CHANGED_PATHS: usize = 64;
 
 #[derive(Debug)]
 pub struct BackgroundTask {
     pub child: Child,
     pub output_path: PathBuf,
+    output_cleanup_armed: bool,
     pub command: String,
-    pub process_group_id: Option<u32>,
+    pub(crate) process_tree: crate::process::ProcessTreeGuard,
     pub drains: Vec<tokio::task::JoinHandle<()>>,
     pub output_truncated: Arc<AtomicBool>,
+    pub timeout_cancelled: Arc<AtomicBool>,
+    pub timeout_ms: u64,
+    pub timed_out: bool,
+    pub notification_delivered: bool,
+}
+
+impl BackgroundTask {
+    pub(crate) fn disarm_output_cleanup(&mut self) {
+        self.output_cleanup_armed = false;
+    }
 }
 
 impl Drop for BackgroundTask {
     fn drop(&mut self) {
+        self.timeout_cancelled.store(true, Ordering::Release);
         let child_running = self.child.try_wait().ok().flatten().is_none();
         let drains_running = self.drains.iter().any(|drain| !drain.is_finished());
+        self.process_tree.terminate();
         if child_running || drains_running {
-            crate::process::terminate_process_tree(self.process_group_id);
             let _ = self.child.start_kill();
         }
         for drain in &self.drains {
             drain.abort();
         }
+        if self.output_cleanup_armed {
+            let _ = std::fs::remove_file(&self.output_path);
+        }
+    }
+}
+
+/// Stable ownership boundary for asynchronous work created by one query
+/// context. Clones keep the same owner; agent forks append a fresh owner to
+/// the lineage so ancestors may coordinate descendants without granting
+/// sibling or descendant access in the opposite direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AsyncOwner {
+    id: uuid::Uuid,
+    lineage: Arc<Vec<uuid::Uuid>>,
+}
+
+impl AsyncOwner {
+    fn root() -> Self {
+        let id = uuid::Uuid::new_v4();
+        Self {
+            id,
+            lineage: Arc::new(vec![id]),
+        }
+    }
+
+    fn fork(&self) -> Self {
+        let id = uuid::Uuid::new_v4();
+        let mut lineage = self.lineage.as_ref().clone();
+        lineage.push(id);
+        Self {
+            id,
+            lineage: Arc::new(lineage),
+        }
+    }
+
+    pub(crate) fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    pub(crate) fn can_manage(&self, target: &Self) -> bool {
+        target.lineage.starts_with(self.lineage.as_slice())
+    }
+
+    pub(crate) fn is_root(&self) -> bool {
+        self.lineage.len() == 1
     }
 }
 
@@ -106,22 +224,54 @@ pub struct TodoItem {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    async_owner: AsyncOwner,
     location: Arc<RwLock<WorkspaceLocation>>,
+    trusted_roots: Arc<RwLock<Vec<PathBuf>>>,
+    explicit_context_roots: Arc<RwLock<HashSet<PathBuf>>>,
     pub permissions: Arc<PermissionManager>,
     read_cache: Arc<Mutex<ReadCache>>,
     pub tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+    task_capture_root: Arc<RwLock<Option<PathBuf>>>,
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     skills: Arc<RwLock<SkillCatalog>>,
+    extension_skills: Arc<RwLock<SkillCatalog>>,
     pub task_store_lock: Arc<Mutex<()>>,
     task_store_path: Arc<RwLock<PathBuf>>,
     agent_runtime: Arc<OnceLock<Arc<AgentRuntime>>>,
+    execution_registry: Arc<OnceLock<ToolRegistry>>,
+    workflow_runtime: WorkflowRuntime,
     agent_depth: usize,
     agent_limits: AgentLimits,
+    agent_tool_policy: AgentToolPolicy,
     hooks: Arc<HookRunner>,
     bare: bool,
+    workspace_context_launch_cwd: PathBuf,
     workspace_context_base: Arc<OnceLock<String>>,
+    workspace_context_base_override: Arc<RwLock<Option<String>>>,
     workspace_context_overlay: Arc<RwLock<String>>,
+    current_instruction_paths: Arc<RwLock<HashSet<PathBuf>>>,
+    nested_instructions: Arc<RwLock<BTreeMap<PathBuf, InstructionFile>>>,
     workspace_context_budget: Arc<AtomicUsize>,
+    workspace_context_refresh_lock: Arc<Mutex<()>>,
+    workspace_context_changes: Arc<WorkspaceContextChanges>,
+    workspace_context_parent_changes: Option<Arc<WorkspaceContextChanges>>,
+    workspace_context_seen_generation: Arc<AtomicU64>,
+    interaction_handler: Arc<RwLock<Option<UserInteractionHandler>>>,
+    sandbox_runtime: Arc<RwLock<SandboxRuntime>>,
+    file_history: Arc<RwLock<Option<FileHistory>>>,
+    file_histories: Arc<RwLock<HashMap<String, FileHistory>>>,
+    file_checkpoint: Arc<RwLock<Option<uuid::Uuid>>>,
+    ancestor_file_checkpoints: Arc<RwLock<Vec<uuid::Uuid>>>,
+    hot_refresh_transactions: Arc<RwLock<HotRefreshTransactionManager>>,
+    hot_refresh_transaction: Arc<RwLock<Option<u64>>>,
+    hot_refresh_parent_transaction: Option<u64>,
+    team_identity: Arc<RwLock<Option<(uuid::Uuid, uuid::Uuid)>>>,
+    team_mailboxes: Arc<RwLock<HashMap<uuid::Uuid, TrackedTeamMailbox>>>,
+    workspace_state_recorder: Arc<RwLock<Option<WorkspaceStateRecorder>>>,
+    current_cwd_state_recorder: Arc<RwLock<Option<CurrentCwdStateRecorder>>>,
+    cron: CronService,
+    monitor: MonitorService,
+    secret_env_scrubber: SecretEnvScrubber,
 }
 
 #[derive(Debug, Clone)]
@@ -130,32 +280,1301 @@ struct WorkspaceLocation {
     root: PathBuf,
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkspaceContextCheckpoint {
+    base_override: Option<String>,
+    overlay: String,
+    current_instruction_paths: HashSet<PathBuf>,
+    nested_instructions: BTreeMap<PathBuf, InstructionFile>,
+    skills: SkillCatalog,
+    workspace_deny: Vec<String>,
+    seen_generation: u64,
+}
+
+#[derive(Clone)]
+struct WorkspaceDiscovery {
+    rendered: String,
+    instruction_paths: HashSet<PathBuf>,
+    skills: SkillCatalog,
+    workspace_deny: Vec<String>,
+}
+
+struct WorkspaceContextCandidate {
+    launch_rendered: String,
+    overlay: String,
+    current_instruction_paths: HashSet<PathBuf>,
+    nested_instructions: BTreeMap<PathBuf, InstructionFile>,
+    skills: SkillCatalog,
+    workspace_deny: Vec<String>,
+    instruction_hook_paths: Vec<PathBuf>,
+    changed_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct WorkspaceContextChangeState {
+    generation: u64,
+    entries: VecDeque<(u64, Vec<PathBuf>)>,
+}
+
+#[derive(Default)]
+struct WorkspaceContextChanges {
+    state: RwLock<WorkspaceContextChangeState>,
+}
+
+impl WorkspaceContextChanges {
+    fn publish(&self, mut paths: Vec<PathBuf>) -> u64 {
+        paths.sort_unstable();
+        paths.dedup();
+        if paths.len() > MAX_WORKSPACE_CONTEXT_CHANGED_PATHS {
+            paths.clear();
+        }
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
+        state.entries.push_back((generation, paths));
+        while state.entries.len() > MAX_WORKSPACE_CONTEXT_CHANGE_ENTRIES {
+            state.entries.pop_front();
+        }
+        generation
+    }
+
+    fn changes_since(&self, seen: u64) -> (u64, Option<Vec<PathBuf>>) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen >= state.generation {
+            return (state.generation, Some(Vec::new()));
+        }
+        if state
+            .entries
+            .front()
+            .is_none_or(|(generation, _)| *generation > seen.saturating_add(1))
+        {
+            return (state.generation, None);
+        }
+        let mut paths = Vec::new();
+        for (_, changed) in state
+            .entries
+            .iter()
+            .filter(|(generation, _)| *generation > seen)
+        {
+            if changed.is_empty() {
+                return (state.generation, None);
+            }
+            paths.extend(changed.iter().cloned());
+            if paths.len() > MAX_WORKSPACE_CONTEXT_CHANGED_PATHS {
+                return (state.generation, None);
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        (state.generation, Some(paths))
+    }
+
+    fn generation(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn accumulated_changes(&self) -> (bool, Option<Vec<PathBuf>>) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.entries.is_empty() {
+            return (false, Some(Vec::new()));
+        }
+        let mut paths = Vec::new();
+        for (_, changed) in &state.entries {
+            if changed.is_empty() {
+                return (true, None);
+            }
+            paths.extend(changed.iter().cloned());
+            if paths.len() > MAX_WORKSPACE_CONTEXT_CHANGED_PATHS {
+                return (true, None);
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        (true, Some(paths))
+    }
+}
+
+#[derive(Clone)]
+struct TrackedTeamMailbox {
+    service: TeamService,
+    actor: uuid::Uuid,
+    delivered_through: u64,
+}
+
+pub(crate) type TeamNotificationCheckpoint = HashMap<uuid::Uuid, (uuid::Uuid, u64)>;
+
+struct BashTaskCheckpoint {
+    notification_delivered: bool,
+    output_path: PathBuf,
+    output_cleanup_armed: bool,
+}
+
+pub(crate) struct BackgroundNotificationCheckpoint {
+    bash_tasks: HashMap<String, BashTaskCheckpoint>,
+    workflow_tasks: HashMap<String, bool>,
+    monitor: MonitorNotificationCheckpoint,
+}
+
 impl ToolContext {
     pub fn new(cwd: PathBuf, permissions: PermissionManager) -> Self {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let task_store_path = task_store_path(&cwd);
         let workspace_root = cwd.clone();
         Self {
+            async_owner: AsyncOwner::root(),
             location: Arc::new(RwLock::new(WorkspaceLocation {
-                cwd,
-                root: workspace_root,
+                cwd: cwd.clone(),
+                root: workspace_root.clone(),
             })),
+            trusted_roots: Arc::new(RwLock::new(vec![cwd.clone()])),
+            explicit_context_roots: Arc::new(RwLock::new(HashSet::new())),
             permissions: Arc::new(permissions),
             read_cache: Arc::new(Mutex::new(ReadCache::default())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            task_capture_root: Arc::new(RwLock::new(None)),
             todos: Arc::new(Mutex::new(Vec::new())),
             skills: Arc::new(RwLock::new(SkillCatalog::default())),
+            extension_skills: Arc::new(RwLock::new(SkillCatalog::default())),
             task_store_lock: Arc::new(Mutex::new(())),
             task_store_path: Arc::new(RwLock::new(task_store_path)),
             agent_runtime: Arc::new(OnceLock::new()),
+            execution_registry: Arc::new(OnceLock::new()),
+            workflow_runtime: WorkflowRuntime::default(),
             agent_depth: 0,
             agent_limits: AgentLimits::default(),
+            agent_tool_policy: AgentToolPolicy::default(),
             hooks: Arc::new(HookRunner::default()),
             bare: false,
+            workspace_context_launch_cwd: cwd.clone(),
             workspace_context_base: Arc::new(OnceLock::new()),
+            workspace_context_base_override: Arc::new(RwLock::new(None)),
             workspace_context_overlay: Arc::new(RwLock::new(String::new())),
+            current_instruction_paths: Arc::new(RwLock::new(HashSet::new())),
+            nested_instructions: Arc::new(RwLock::new(BTreeMap::new())),
             workspace_context_budget: Arc::new(AtomicUsize::new(DEFAULT_WORKSPACE_CONTEXT_BUDGET)),
+            workspace_context_refresh_lock: Arc::new(Mutex::new(())),
+            workspace_context_changes: Arc::new(WorkspaceContextChanges::default()),
+            workspace_context_parent_changes: None,
+            workspace_context_seen_generation: Arc::new(AtomicU64::new(0)),
+            interaction_handler: Arc::new(RwLock::new(None)),
+            sandbox_runtime: Arc::new(RwLock::new(SandboxRuntime::default())),
+            file_history: Arc::new(RwLock::new(None)),
+            file_histories: Arc::new(RwLock::new(HashMap::new())),
+            file_checkpoint: Arc::new(RwLock::new(None)),
+            ancestor_file_checkpoints: Arc::new(RwLock::new(Vec::new())),
+            hot_refresh_transactions: Arc::new(
+                RwLock::new(HotRefreshTransactionManager::default()),
+            ),
+            hot_refresh_transaction: Arc::new(RwLock::new(None)),
+            hot_refresh_parent_transaction: None,
+            team_identity: Arc::new(RwLock::new(None)),
+            team_mailboxes: Arc::new(RwLock::new(HashMap::new())),
+            workspace_state_recorder: Arc::new(RwLock::new(None)),
+            current_cwd_state_recorder: Arc::new(RwLock::new(None)),
+            cron: CronService::for_workspace(&workspace_root),
+            monitor: MonitorService::default(),
+            secret_env_scrubber: SecretEnvScrubber::default(),
         }
+    }
+
+    pub(crate) fn set_secret_env_scrubber(&mut self, scrubber: SecretEnvScrubber) {
+        self.secret_env_scrubber = scrubber;
+    }
+
+    pub fn configure_secret_env_scrubber(&mut self, settings: &Settings) -> Result<()> {
+        self.set_secret_env_scrubber(SecretEnvScrubber::from_settings(settings)?);
+        Ok(())
+    }
+
+    pub(crate) fn scrub_child_environment(&self, command: &mut tokio::process::Command) {
+        self.secret_env_scrubber.scrub_tokio(command);
+    }
+
+    pub(crate) fn secret_env_scrubber(&self) -> SecretEnvScrubber {
+        self.secret_env_scrubber.clone()
+    }
+
+    pub(crate) fn monitor_service(&self) -> MonitorService {
+        self.monitor.clone()
+    }
+
+    /// Overrides the private task-capture directory for an embedding or test
+    /// harness. Normal CLI runs leave this unset and use the private
+    /// `~/.open-agent-harness/tasks` directory.
+    pub fn set_task_capture_root(&self, root: PathBuf) -> Result<()> {
+        ensure_private_directory(&root)?;
+        let metadata = std::fs::symlink_metadata(&root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("task capture root 必须是非 symlink 目录")
+        }
+        let root = std::fs::canonicalize(root).context("无法解析 task capture root")?;
+        *self
+            .task_capture_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(root);
+        Ok(())
+    }
+
+    pub(crate) fn task_capture_root(&self) -> Result<PathBuf> {
+        if let Some(root) = self
+            .task_capture_root
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(root);
+        }
+        Ok(dirs::home_dir()
+            .context("无法确定主目录")?
+            .join(".open-agent-harness/tasks"))
+    }
+
+    pub(crate) fn async_owner(&self) -> AsyncOwner {
+        self.async_owner.clone()
+    }
+
+    pub fn configure_plugin_monitors(&self, monitors: Vec<PluginMonitorDefinition>) {
+        self.monitor.configure_plugin_monitors(monitors);
+    }
+
+    pub async fn start_always_plugin_monitors(&self) -> Vec<String> {
+        self.monitor.start_always_plugin_monitors(self).await
+    }
+
+    pub async fn trigger_skill_monitors(&self, skill: &str) -> Vec<String> {
+        self.monitor.trigger_skill_monitors(self, skill).await
+    }
+
+    pub async fn shutdown_monitors(&self) {
+        if self.agent_depth == 0 {
+            self.monitor.shutdown().await;
+        }
+    }
+
+    pub fn cron_service(&self) -> CronService {
+        self.cron.clone()
+    }
+
+    pub fn start_cron_scheduler(&self) -> Result<()> {
+        self.cron.start()
+    }
+
+    pub fn take_scheduled_prompt(&self) -> Result<Option<String>> {
+        self.cron.take_ready_prompt()
+    }
+
+    pub async fn wait_scheduled_prompt(&self) -> Result<String> {
+        self.cron.wait_ready_prompt().await
+    }
+
+    pub fn stop_cron_scheduler(&self) {
+        if self.agent_depth == 0 {
+            self.cron.stop();
+        }
+    }
+
+    pub fn set_user_interaction_handler(&self, handler: Option<UserInteractionHandler>) {
+        *self
+            .interaction_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
+    }
+
+    pub fn set_workspace_state_recorder(&self, recorder: Option<WorkspaceStateRecorder>) {
+        *self
+            .workspace_state_recorder
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = recorder;
+    }
+
+    pub fn set_current_cwd_state_recorder(&self, recorder: Option<CurrentCwdStateRecorder>) {
+        *self
+            .current_cwd_state_recorder
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = recorder;
+    }
+
+    pub(crate) fn record_workspace_transition(&self) -> Result<()> {
+        let recorder = self
+            .workspace_state_recorder
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(recorder) = recorder {
+            recorder(&self.cwd(), &self.workspace_root())?;
+        }
+        Ok(())
+    }
+
+    fn record_current_cwd_transition(&self) -> Result<()> {
+        let recorder = self
+            .current_cwd_state_recorder
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(recorder) = recorder {
+            recorder(&self.cwd(), &self.workspace_root())?;
+        }
+        Ok(())
+    }
+
+    pub fn request_user_interaction(&self, tool: &str, input: Value) -> Result<Option<Value>> {
+        let handler = self
+            .interaction_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        handler
+            .map(|handler| {
+                handler(&UserInteractionRequest {
+                    tool: tool.to_owned(),
+                    input,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn set_sandbox_runtime(&self, runtime: SandboxRuntime) {
+        *self
+            .sandbox_runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
+    }
+
+    pub fn sandbox_runtime(&self) -> SandboxRuntime {
+        self.sandbox_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Adds directories explicitly trusted by the session (for example via
+    /// `--add-dir`). Project settings never call this API, so they cannot widen
+    /// filesystem scope.
+    pub fn add_trusted_roots(&self, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let total_path_bytes = roots
+            .iter()
+            .try_fold(0usize, |total, root| {
+                total.checked_add(root.as_os_str().as_encoded_bytes().len())
+            })
+            .context("--add-dir 路径总长度溢出")?;
+        if roots.len() > MAX_TRUSTED_WORKSPACE_ROOTS.saturating_sub(1)
+            || total_path_bytes > 64 * 1024
+        {
+            bail!("--add-dir 超过 32 个目录或 64 KiB 路径总限制")
+        }
+        let mut accepted = Vec::new();
+        let mut explicit = Vec::new();
+        let mut trusted = self
+            .trusted_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for requested in roots {
+            if requested.as_os_str().is_empty()
+                || requested.as_os_str().as_encoded_bytes().len() > 4096
+            {
+                bail!("--add-dir 路径为空或超过 4096 字节")
+            }
+            let canonical = std::fs::canonicalize(requested)
+                .with_context(|| format!("无法解析 --add-dir {}", requested.display()))?;
+            if !canonical.is_dir() {
+                bail!("--add-dir 不是目录: {}", requested.display())
+            }
+            explicit.push(canonical.clone());
+            if trusted.iter().any(|root| canonical.starts_with(root)) {
+                continue;
+            }
+            if trusted.len() >= MAX_TRUSTED_WORKSPACE_ROOTS {
+                bail!(
+                    "可信工作区根目录超过 {} 个限制",
+                    MAX_TRUSTED_WORKSPACE_ROOTS
+                )
+            }
+            trusted.push(canonical.clone());
+            accepted.push(canonical);
+        }
+        drop(trusted);
+        self.explicit_context_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(explicit);
+        Ok(accepted)
+    }
+
+    pub fn trusted_roots(&self) -> Vec<PathBuf> {
+        self.trusted_roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn bind_team_identity(&self, team_id: uuid::Uuid, actor_id: uuid::Uuid) {
+        *self
+            .team_identity
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((team_id, actor_id));
+    }
+
+    pub(crate) fn bound_team_actor(&self, team_id: uuid::Uuid) -> Result<uuid::Uuid> {
+        self.team_identity
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .filter(|(bound_team, _)| *bound_team == team_id)
+            .map(|(_, actor)| actor)
+            .context("当前 agent 未绑定到该 team，不能提交 actor 身份")
+    }
+
+    pub(crate) fn track_team_mailbox(&self, service: TeamService, actor: uuid::Uuid) {
+        let team_id = service.id();
+        let mut tracked = self
+            .team_mailboxes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match tracked.get_mut(&team_id) {
+            Some(mailbox) if mailbox.actor == actor => mailbox.service = service,
+            _ => {
+                tracked.insert(
+                    team_id,
+                    TrackedTeamMailbox {
+                        service,
+                        actor,
+                        delivered_through: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn untrack_team_mailbox(&self, team_id: uuid::Uuid) {
+        self.team_mailboxes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&team_id);
+    }
+
+    pub(crate) fn record_team_mailbox_cursor(
+        &self,
+        team_id: uuid::Uuid,
+        actor: uuid::Uuid,
+        through_sequence: u64,
+    ) {
+        if let Some(mailbox) = self
+            .team_mailboxes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&team_id)
+            .filter(|mailbox| mailbox.actor == actor)
+        {
+            mailbox.delivered_through = mailbox.delivered_through.max(through_sequence);
+        }
+    }
+
+    pub(crate) fn team_notification_checkpoint(&self) -> TeamNotificationCheckpoint {
+        self.team_mailboxes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(team_id, mailbox)| (*team_id, (mailbox.actor, mailbox.delivered_through)))
+            .collect()
+    }
+
+    pub(crate) fn restore_team_notification_checkpoint(
+        &self,
+        checkpoint: &TeamNotificationCheckpoint,
+    ) {
+        let mut tracked = self
+            .team_mailboxes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tracked.retain(|team_id, mailbox| {
+            checkpoint
+                .get(team_id)
+                .is_some_and(|(actor, _)| *actor == mailbox.actor)
+        });
+        for (team_id, (actor, cursor)) in checkpoint {
+            if let Some(mailbox) = tracked
+                .get_mut(team_id)
+                .filter(|mailbox| mailbox.actor == *actor)
+            {
+                mailbox.delivered_through = *cursor;
+            }
+        }
+    }
+
+    fn drain_team_notifications(&self, maximum: usize, maximum_bytes: usize) -> Vec<String> {
+        if maximum == 0 || maximum_bytes == 0 {
+            return Vec::new();
+        }
+        let mut teams = self
+            .team_mailboxes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(team_id, mailbox)| {
+                (
+                    *team_id,
+                    mailbox.service.clone(),
+                    mailbox.actor,
+                    mailbox.delivered_through,
+                )
+            })
+            .collect::<Vec<_>>();
+        teams.sort_unstable_by_key(|(team_id, _, _, _)| *team_id);
+        let cwd = self.cwd();
+        let mut notifications = Vec::new();
+        let mut total_bytes = 0usize;
+        for (team_id, service, actor, cursor) in teams {
+            if notifications.len() >= maximum || total_bytes >= maximum_bytes {
+                break;
+            }
+            let remaining = maximum - notifications.len();
+            let Ok(messages) = service.read_mailbox(actor, actor, cursor, remaining.min(256))
+            else {
+                continue;
+            };
+            let mut delivered_through = cursor;
+            for message in messages {
+                let kind = match message.kind {
+                    TeamMessageKind::Message => "message",
+                    TeamMessageKind::Assignment => "assignment",
+                    TeamMessageKind::Status => "status",
+                };
+                let mut notification = format!(
+                    "Team {team_id} {kind} #{} from {}:\n{}",
+                    message.sequence,
+                    message.from,
+                    sanitize_transport_text(&message.body, &cwd),
+                );
+                truncate_utf8_with_marker(
+                    &mut notification,
+                    MAX_BACKGROUND_NOTIFICATION_BYTES,
+                    "\n[team notification truncated; use Team read for the full message]",
+                );
+                if total_bytes.saturating_add(notification.len()) > maximum_bytes {
+                    break;
+                }
+                total_bytes += notification.len();
+                delivered_through = message.sequence;
+                notifications.push(notification);
+            }
+            if delivered_through > cursor {
+                self.record_team_mailbox_cursor(team_id, actor, delivered_through);
+            }
+        }
+        notifications
+    }
+
+    pub fn set_file_history(&self, history: FileHistory) {
+        self.set_file_histories(vec![history])
+            .expect("validated file history must install");
+    }
+
+    /// Starts a bounded, memory-only transaction for workspace context files
+    /// when durable file history is disabled. This is deliberately separate
+    /// from public checkpoints: it exists only so a failed AGENTS.md/SKILL.md
+    /// refresh can undo the writes that made the in-memory context invalid.
+    pub(crate) fn begin_hot_refresh_file_transaction(&self) -> Result<bool> {
+        let transaction_ids = self.file_transaction_ids();
+        if !transaction_ids.is_empty() {
+            let histories = self
+                .file_histories
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for history in histories {
+                for transaction_id in &transaction_ids {
+                    if history.is_transaction_active(*transaction_id)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        let mut local = self
+            .hot_refresh_transaction
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if local.is_some() {
+            bail!("已有活跃的临时 workspace context 文件事务")
+        }
+        let mut manager = self
+            .hot_refresh_transactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager.next_id = manager
+            .next_id
+            .checked_add(1)
+            .context("临时 workspace context 文件事务 id 溢出")?;
+        let id = manager.next_id;
+        let parent = self
+            .hot_refresh_parent_transaction
+            .filter(|parent| manager.frames.contains_key(parent));
+        manager.frames.insert(
+            id,
+            HotRefreshFileTransaction {
+                parent,
+                snapshots: BTreeMap::new(),
+            },
+        );
+        *local = Some(id);
+        Ok(true)
+    }
+
+    pub(crate) fn finish_hot_refresh_file_transaction(&self) -> Result<()> {
+        let id = self
+            .hot_refresh_transaction
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .context("找不到要结束的临时 workspace context 文件事务")?;
+        let mut manager = self
+            .hot_refresh_transactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction = manager
+            .frames
+            .remove(&id)
+            .context("临时 workspace context 文件事务已丢失")?;
+        let parent = transaction
+            .parent
+            .filter(|parent| manager.frames.contains_key(parent));
+
+        for frame in manager.frames.values_mut() {
+            if frame.parent == Some(id) {
+                frame.parent = parent;
+            }
+        }
+
+        if let Some(parent_id) = parent {
+            for (path, child_snapshot) in transaction.snapshots {
+                let owner_is_child = manager.path_owners.get(&path) == Some(&id);
+                let parent_expected_bytes = manager
+                    .frames
+                    .get(&parent_id)
+                    .and_then(|frame| frame.snapshots.get(&path))
+                    .and_then(|snapshot| snapshot.expected.as_ref())
+                    .map_or(0, Vec::len);
+                let parent_has_snapshot = manager
+                    .frames
+                    .get(&parent_id)
+                    .is_some_and(|frame| frame.snapshots.contains_key(&path));
+                if parent_has_snapshot {
+                    let child_original_bytes = child_snapshot.original.as_ref().map_or(0, Vec::len);
+                    manager.retained_bytes = manager
+                        .retained_bytes
+                        .saturating_sub(child_original_bytes)
+                        .saturating_sub(parent_expected_bytes);
+                    manager
+                        .frames
+                        .get_mut(&parent_id)
+                        .and_then(|frame| frame.snapshots.get_mut(&path))
+                        .expect("validated parent snapshot must exist")
+                        .expected = child_snapshot.expected;
+                } else {
+                    manager
+                        .frames
+                        .get_mut(&parent_id)
+                        .expect("validated parent frame must exist")
+                        .snapshots
+                        .insert(path.clone(), child_snapshot);
+                }
+                if owner_is_child {
+                    manager.path_owners.insert(path, parent_id);
+                }
+            }
+        } else {
+            for (path, snapshot) in transaction.snapshots {
+                manager.retained_bytes = manager
+                    .retained_bytes
+                    .saturating_sub(hot_refresh_snapshot_bytes(&snapshot));
+                if manager.path_owners.get(&path) == Some(&id) {
+                    manager.path_owners.remove(&path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn rollback_hot_refresh_file_transaction(&self) -> Result<()> {
+        let id = self
+            .hot_refresh_transaction
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .context("找不到要回滚的临时 workspace context 文件事务")?;
+        let (paths, rollback) = {
+            let mut manager = self
+                .hot_refresh_transactions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if manager
+                .frames
+                .values()
+                .any(|frame| frame.parent == Some(id))
+            {
+                bail!("临时 workspace context 文件事务仍有活跃子事务，拒绝并发回滚")
+            }
+            let transaction = manager
+                .frames
+                .remove(&id)
+                .context("临时 workspace context 文件事务已丢失")?;
+            let parent = transaction
+                .parent
+                .filter(|parent| manager.frames.contains_key(parent));
+            *self
+                .hot_refresh_transaction
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            let paths = transaction.snapshots.keys().cloned().collect::<Vec<_>>();
+            let rollback = rollback_hot_refresh_snapshots(&transaction.snapshots);
+            for (path, snapshot) in transaction.snapshots {
+                manager.retained_bytes = manager
+                    .retained_bytes
+                    .saturating_sub(hot_refresh_snapshot_bytes(&snapshot));
+                if manager.path_owners.get(&path) == Some(&id) {
+                    if let Some(parent) = parent.filter(|parent| {
+                        manager
+                            .frames
+                            .get(parent)
+                            .is_some_and(|frame| frame.snapshots.contains_key(&path))
+                    }) {
+                        manager.path_owners.insert(path, parent);
+                    } else {
+                        manager.path_owners.remove(&path);
+                    }
+                }
+            }
+            (paths, rollback)
+        };
+
+        if !paths.is_empty() {
+            let mut cache = self.read_cache.lock().await;
+            for path in &paths {
+                if let Some(snapshot) = cache.values.remove(path) {
+                    cache.bytes = cache.bytes.saturating_sub(snapshot.content.len());
+                }
+                cache.order.retain(|candidate| candidate != path);
+            }
+        }
+        rollback
+    }
+
+    pub(crate) fn persistence_enabled(&self) -> bool {
+        self.file_history
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(FileHistory::is_enabled)
+    }
+
+    /// Installs one durable history per trusted workspace root. Supplying every
+    /// root is important for resume/fork because each root has an independent
+    /// persisted manifest.
+    pub fn set_file_histories(&self, histories: Vec<FileHistory>) -> Result<()> {
+        let mut installed = HashMap::new();
+        for history in histories {
+            let root = std::fs::canonicalize(history.workspace()).with_context(|| {
+                format!(
+                    "无法解析 file-history 工作区 {}",
+                    history.workspace().display()
+                )
+            })?;
+            if self.root_for_resolved_path(&root).as_deref() != Some(root.as_path()) {
+                bail!("file-history 工作区未被会话明确信任")
+            }
+            let key = workspace_key(&root);
+            if installed.insert(key, history).is_some() {
+                bail!("重复的 file-history 工作区")
+            }
+        }
+        let Some(template) = installed.values().next().cloned() else {
+            *self
+                .file_history
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            self.file_histories
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            return Ok(());
+        };
+        for root in self.trusted_roots() {
+            let key = workspace_key(&root);
+            if let std::collections::hash_map::Entry::Vacant(entry) = installed.entry(key) {
+                entry.insert(template.relocate(&root)?);
+            }
+        }
+        let active_key = workspace_key(&self.workspace_root());
+        let active = installed
+            .get(&active_key)
+            .cloned()
+            .context("当前工作区缺少 file-history")?;
+        *self
+            .file_histories
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = installed;
+        *self
+            .file_history
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(active);
+        Ok(())
+    }
+
+    pub fn begin_file_checkpoint(
+        &self,
+        boundary: CheckpointBoundary,
+        message_count: usize,
+    ) -> Result<Option<CheckpointInfo>> {
+        self.begin_file_checkpoint_with_id(uuid::Uuid::new_v4(), boundary, message_count)
+    }
+
+    pub fn begin_file_checkpoint_with_id(
+        &self,
+        id: uuid::Uuid,
+        boundary: CheckpointBoundary,
+        message_count: usize,
+    ) -> Result<Option<CheckpointInfo>> {
+        self.begin_file_checkpoint_with_id_and_ancestors(id, boundary, message_count, &[])
+    }
+
+    fn begin_file_checkpoint_with_id_and_ancestors(
+        &self,
+        id: uuid::Uuid,
+        boundary: CheckpointBoundary,
+        message_count: usize,
+        ancestor_ids: &[uuid::Uuid],
+    ) -> Result<Option<CheckpointInfo>> {
+        let histories = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if histories.is_empty() {
+            return Ok(None);
+        }
+        if histories.iter().all(|history| !history.is_enabled()) {
+            return Ok(None);
+        }
+        for history in &histories {
+            if history.can_rewind(id)? {
+                bail!("重复的 user message/checkpoint UUID")
+            }
+        }
+        let mut info = None;
+        for history in histories {
+            let current =
+                history.checkpoint_with_ancestors(id, boundary, message_count, ancestor_ids)?;
+            info.get_or_insert(current);
+        }
+        *self
+            .file_checkpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
+        Ok(info)
+    }
+
+    pub fn track_before_edit(&self, path: &Path) -> Result<()> {
+        let history = self.file_history_for_path(path)?;
+        if let Some(history) = history {
+            for checkpoint in self.file_transaction_ids() {
+                if history.is_transaction_active(checkpoint)? {
+                    history.track_before_edit(checkpoint, path)?;
+                }
+            }
+        }
+        self.track_hot_refresh_before_edit(path)
+    }
+
+    pub fn expect_after_edit(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let history = self.file_history_for_path(path)?;
+        if let Some(history) = history {
+            for checkpoint in self.file_transaction_ids() {
+                if history.is_transaction_active(checkpoint)? {
+                    history.expect_after_edit(checkpoint, path, bytes)?;
+                }
+            }
+        }
+        self.expect_hot_refresh_after_edit(path, bytes)
+    }
+
+    fn track_hot_refresh_before_edit(&self, path: &Path) -> Result<()> {
+        let Some(id) = *self
+            .hot_refresh_transaction
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        else {
+            return Ok(());
+        };
+        let Some(resolved) = self.hot_refresh_sensitive_path(path)? else {
+            return Ok(());
+        };
+        let mut manager = self
+            .hot_refresh_transactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let already_snapshotted = manager
+            .frames
+            .get(&id)
+            .is_some_and(|frame| frame.snapshots.contains_key(&resolved));
+        if let Some(owner) = manager.path_owners.get(&resolved).copied() {
+            if owner == id {
+                if already_snapshotted {
+                    return Ok(());
+                }
+                bail!("workspace context 文件 owner 缺少事务快照")
+            }
+            // A child may take a fresh nested snapshot from its ancestor. The
+            // reverse direction is forbidden: while the child owns the path,
+            // the parent must fail before its tool can write any bytes.
+            if already_snapshotted {
+                bail!(
+                    "workspace context 文件正被活跃子事务修改: {}",
+                    self.display_path(&resolved)
+                )
+            }
+            if !hot_refresh_transaction_is_ancestor(&manager.frames, owner, id) {
+                bail!(
+                    "workspace context 文件正被另一个并发事务修改: {}",
+                    self.display_path(&resolved)
+                )
+            }
+        }
+        let snapshot = read_hot_refresh_snapshot(&resolved)?;
+        let retained = hot_refresh_snapshot_bytes(&snapshot);
+        let snapshot_count = manager
+            .frames
+            .values()
+            .map(|frame| frame.snapshots.len())
+            .sum::<usize>();
+        if snapshot_count >= MAX_HOT_REFRESH_TRANSACTION_FILES {
+            bail!(
+                "临时 workspace context 文件事务超过 {MAX_HOT_REFRESH_TRANSACTION_FILES} 个文件限制"
+            )
+        }
+        if manager.retained_bytes.saturating_add(retained) > MAX_HOT_REFRESH_TRANSACTION_BYTES {
+            bail!(
+                "临时 workspace context 文件事务超过 {MAX_HOT_REFRESH_TRANSACTION_BYTES} 字节限制"
+            )
+        }
+        manager.retained_bytes += retained;
+        manager
+            .frames
+            .get_mut(&id)
+            .context("临时 workspace context 文件事务已丢失")?
+            .snapshots
+            .insert(resolved.clone(), snapshot);
+        manager.path_owners.insert(resolved, id);
+        Ok(())
+    }
+
+    fn expect_hot_refresh_after_edit(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let Some(id) = *self
+            .hot_refresh_transaction
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        else {
+            return Ok(());
+        };
+        let Some(resolved) = self.hot_refresh_sensitive_path(path)? else {
+            return Ok(());
+        };
+        if bytes.len() > MAX_EDITABLE_FILE_BYTES {
+            bail!("workspace context 修改后状态超过可编辑文件限制")
+        }
+        let mut manager = self
+            .hot_refresh_transactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if manager.path_owners.get(&resolved) != Some(&id) {
+            bail!(
+                "workspace context 文件事务不再拥有修改目标: {}",
+                self.display_path(&resolved)
+            )
+        }
+        let previous = manager
+            .frames
+            .get(&id)
+            .and_then(|frame| frame.snapshots.get(&resolved))
+            .context("workspace context 修改后状态缺少修改前快照")?
+            .expected
+            .as_deref()
+            .map_or(0, <[u8]>::len);
+        let retained = manager
+            .retained_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes.len());
+        if retained > MAX_HOT_REFRESH_TRANSACTION_BYTES {
+            bail!(
+                "临时 workspace context 文件事务超过 {MAX_HOT_REFRESH_TRANSACTION_BYTES} 字节限制"
+            )
+        }
+        manager
+            .frames
+            .get_mut(&id)
+            .and_then(|frame| frame.snapshots.get_mut(&resolved))
+            .expect("validated hot refresh snapshot must exist")
+            .expected = Some(bytes.to_vec());
+        manager.retained_bytes = retained;
+        Ok(())
+    }
+
+    fn hot_refresh_sensitive_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if self.bare {
+            return Ok(None);
+        }
+        let resolved = canonicalize_for_scope(path).with_context(|| {
+            format!("无法解析临时 workspace context 事务目标 {}", path.display())
+        })?;
+        let Some(root) = self.root_for_resolved_path(&resolved) else {
+            return Ok(None);
+        };
+        let relative = resolved
+            .strip_prefix(&root)
+            .expect("resolved trusted path must be under its selected root");
+        let is_instruction = resolved.file_name().is_some_and(|name| name == "AGENTS.md");
+        Ok((is_instruction || is_project_skill_path(relative)).then_some(resolved))
+    }
+
+    pub(crate) fn begin_detached_file_checkpoint(&mut self) -> Result<Option<CheckpointInfo>> {
+        if let Some(parent) = *self
+            .file_checkpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            let mut ancestors = self
+                .ancestor_file_checkpoints
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !ancestors.contains(&parent) {
+                ancestors.push(parent);
+            }
+        }
+        self.file_checkpoint = Arc::new(RwLock::new(None));
+        let ancestors = self
+            .ancestor_file_checkpoints
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.begin_file_checkpoint_with_id_and_ancestors(
+            uuid::Uuid::new_v4(),
+            CheckpointBoundary::Turn,
+            0,
+            &ancestors,
+        )
+    }
+
+    fn file_transaction_ids(&self) -> Vec<uuid::Uuid> {
+        let mut checkpoints = self
+            .ancestor_file_checkpoints
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(current) = *self
+            .file_checkpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            if !checkpoints.contains(&current) {
+                checkpoints.push(current);
+            }
+        }
+        checkpoints
+    }
+
+    pub fn rewind_files(
+        &self,
+        checkpoint: uuid::Uuid,
+        max_message_count: usize,
+    ) -> Result<(RewindReport, usize)> {
+        self.apply_file_checkpoint(checkpoint, max_message_count, false)
+    }
+
+    pub fn rollback_file_checkpoint(
+        &self,
+        checkpoint: uuid::Uuid,
+        max_message_count: usize,
+    ) -> Result<(RewindReport, usize)> {
+        self.apply_file_checkpoint(checkpoint, max_message_count, true)
+    }
+
+    pub fn diff_file_checkpoint(
+        &self,
+        checkpoint: uuid::Uuid,
+        max_message_count: usize,
+    ) -> Result<(DiffStats, usize)> {
+        let histories = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matching = Vec::new();
+        for history in histories {
+            if let Some(info) = history
+                .checkpoints()?
+                .into_iter()
+                .find(|info| info.id == checkpoint)
+            {
+                if info.message_count > max_message_count {
+                    bail!("checkpoint message_count 超过当前会话历史")
+                }
+                matching.push((history, info));
+            }
+        }
+        let message_count = matching
+            .first()
+            .map(|(_, info)| info.message_count)
+            .context("找不到 file history checkpoint")?;
+        if matching
+            .iter()
+            .any(|(_, info)| info.message_count != message_count)
+        {
+            bail!("跨 workspace checkpoint message_count 不一致")
+        }
+        let mut combined = DiffStats::default();
+        for (history, _) in matching {
+            let stats = history.diff_stats(checkpoint)?;
+            combined.insertions = combined.insertions.saturating_add(stats.insertions);
+            combined.deletions = combined.deletions.saturating_add(stats.deletions);
+            combined.files_changed.extend(stats.files_changed);
+        }
+        Ok((combined, message_count))
+    }
+
+    fn apply_file_checkpoint(
+        &self,
+        checkpoint: uuid::Uuid,
+        max_message_count: usize,
+        transaction_only: bool,
+    ) -> Result<(RewindReport, usize)> {
+        let histories = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matching = Vec::new();
+        for history in histories {
+            if let Some(info) = history
+                .checkpoints()?
+                .into_iter()
+                .find(|info| info.id == checkpoint)
+            {
+                if info.message_count > max_message_count {
+                    bail!("checkpoint message_count 超过当前会话历史")
+                }
+                matching.push((history, info));
+            }
+        }
+        let message_count = matching
+            .first()
+            .map(|(_, info)| info.message_count)
+            .context("找不到 file history checkpoint")?;
+        if matching
+            .iter()
+            .any(|(_, info)| info.message_count != message_count)
+        {
+            bail!("跨 workspace checkpoint message_count 不一致")
+        }
+        // Two-phase cross-root operation: validate every manifest, backup,
+        // destination and rollback ownership check before the first root is
+        // mutated.
+        let validation = matching.iter().try_for_each(|(history, _)| {
+            if transaction_only {
+                history.validate_rollback(checkpoint)
+            } else {
+                history.validate_rewind(checkpoint)
+            }
+        });
+        if let Err(error) = validation {
+            if transaction_only {
+                for (history, _) in &matching {
+                    if let Err(mark_error) = history.mark_rollback_conflict(checkpoint) {
+                        return Err(error.context(format!(
+                            "跨 workspace rollback 冲突状态持久化失败: {mark_error:#}"
+                        )));
+                    }
+                }
+            }
+            return Err(error);
+        }
+        let mut combined = RewindReport::default();
+        for (history, _) in matching {
+            let report = if transaction_only {
+                history.rollback_checkpoint(checkpoint)?
+            } else {
+                history.rewind(checkpoint)?
+            };
+            combined.restored = combined.restored.saturating_add(report.restored);
+            combined.deleted = combined.deleted.saturating_add(report.deleted);
+            combined.files_changed.extend(report.files_changed);
+        }
+        Ok((combined, message_count))
+    }
+
+    pub(crate) fn finish_file_checkpoint(&self, checkpoint: uuid::Uuid) -> Result<()> {
+        let histories = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut found = false;
+        for history in histories {
+            if history.can_rewind(checkpoint)? {
+                history.finish_transaction(checkpoint)?;
+                found = true;
+            }
+        }
+        if !found {
+            bail!("找不到要结束的 file history checkpoint")
+        }
+        let mut active = self
+            .file_checkpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *active == Some(checkpoint) {
+            *active = None;
+        }
+        self.ancestor_file_checkpoints
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|ancestor| *ancestor != checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn file_checkpoint_active(&self, checkpoint: uuid::Uuid) -> Result<bool> {
+        let histories = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for history in histories {
+            if history.is_transaction_active(checkpoint)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn set_bare(&mut self, bare: bool) {
@@ -172,6 +1591,20 @@ impl ToolContext {
             .skills
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills;
+    }
+
+    pub fn set_extension_skills(&self, skills: SkillCatalog) {
+        *self
+            .extension_skills
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills;
+    }
+
+    pub fn skill_catalog(&self) -> SkillCatalog {
+        self.skills
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn set_task_store_path(&self, path: PathBuf) {
@@ -197,35 +1630,142 @@ impl ToolContext {
     }
 
     pub fn workspace_system_context(&self) -> String {
-        let base = self
-            .workspace_context_base
-            .get()
-            .map(String::as_str)
-            .unwrap_or("");
+        let base = self.effective_workspace_context_base();
         let overlay = self
             .workspace_context_overlay
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match (base.is_empty(), overlay.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => base.to_owned(),
-            (true, false) => overlay.clone(),
-            (false, false) => format!("{base}\n\n{overlay}"),
+        let nested = self.render_nested_instruction_context();
+        [base, overlay.clone(), nested]
+            .into_iter()
+            .filter(|section| !section.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn effective_workspace_context_base(&self) -> String {
+        if let Some(override_context) = self
+            .workspace_context_base_override
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            return override_context.clone();
+        }
+        self.workspace_context_base
+            .get()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn workspace_context_checkpoint(&self) -> WorkspaceContextCheckpoint {
+        WorkspaceContextCheckpoint {
+            base_override: self
+                .workspace_context_base_override
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            overlay: self
+                .workspace_context_overlay
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            current_instruction_paths: self
+                .current_instruction_paths
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            nested_instructions: self
+                .nested_instructions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            skills: self.skill_catalog(),
+            workspace_deny: self.permissions.workspace_deny_rules(),
+            seen_generation: self
+                .workspace_context_seen_generation
+                .load(Ordering::Acquire),
         }
     }
 
-    pub async fn reload_workspace_context(&self) -> Result<()> {
-        let cwd = self.cwd();
-        let instructions = discover_agent_instructions(&cwd, self.bare).await?;
-        let skill_cwd = cwd.clone();
+    pub(crate) fn restore_workspace_context_checkpoint(
+        &self,
+        checkpoint: &WorkspaceContextCheckpoint,
+    ) {
+        *self
+            .workspace_context_base_override
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = checkpoint.base_override.clone();
+        *self
+            .workspace_context_overlay
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = checkpoint.overlay.clone();
+        *self
+            .current_instruction_paths
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            checkpoint.current_instruction_paths.clone();
+        *self
+            .nested_instructions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            checkpoint.nested_instructions.clone();
+        self.set_skills(checkpoint.skills.clone());
+        self.permissions
+            .set_workspace_deny(checkpoint.workspace_deny.clone());
+        self.workspace_context_seen_generation
+            .store(checkpoint.seen_generation, Ordering::Release);
+    }
+
+    async fn discover_workspace_context(&self, cwd: &Path) -> Result<WorkspaceDiscovery> {
+        let instructions = discover_agent_instructions(cwd, self.bare).await?;
+        let instruction_paths = instructions
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let skill_cwd = cwd.to_owned();
         let bare = self.bare;
-        let (skills, workspace_deny) = tokio::task::spawn_blocking(move || {
+        let mut containing_roots = self
+            .trusted_roots()
+            .into_iter()
+            .filter(|root| cwd.starts_with(root))
+            .collect::<Vec<_>>();
+        containing_roots.sort_by_key(|root| root.components().count());
+        let mut deny_directories = Vec::new();
+        for root in containing_roots {
+            let mut directory = root.clone();
+            if !deny_directories.contains(&directory) {
+                deny_directories.push(directory.clone());
+            }
+            if let Ok(relative) = cwd.strip_prefix(&root) {
+                for component in relative.components() {
+                    directory.push(component.as_os_str());
+                    if !deny_directories.contains(&directory) {
+                        deny_directories.push(directory.clone());
+                    }
+                }
+            }
+        }
+        let (mut skills, workspace_deny) = tokio::task::spawn_blocking(move || {
             let skills = discover_skills(&skill_cwd, bare)?;
-            let deny = project_deny_rules(&skill_cwd, bare)?;
+            let mut deny = Vec::new();
+            for directory in deny_directories {
+                for rule in project_deny_rules(&directory, bare)? {
+                    if !deny.contains(&rule) {
+                        deny.push(rule);
+                    }
+                }
+            }
             Ok::<_, anyhow::Error>((skills, deny))
         })
         .await
         .context("workspace discovery worker 失败")??;
+        skills.merge(
+            self.extension_skills
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )?;
         let instruction_text = render_agent_instructions(&instructions);
         let skill_text = render_skill_index(&skills);
         let rendered = match (instruction_text.is_empty(), skill_text.is_empty()) {
@@ -238,32 +1778,470 @@ impl ToolContext {
         if rendered.len() > budget {
             bail!("workspace system context 超过 {budget} 字节预算")
         }
-        let base = self.workspace_context_base.get_or_init(|| rendered.clone());
-        let overlay = if base == &rendered {
+        Ok(WorkspaceDiscovery {
+            rendered,
+            instruction_paths,
+            skills,
+            workspace_deny,
+        })
+    }
+
+    pub async fn reload_workspace_context(&self) -> Result<()> {
+        let _refresh_guard = self.workspace_context_refresh_lock.lock().await;
+        let observed_generation = self.workspace_context_changes.generation();
+        let cwd = self.cwd();
+        let discovery = self.discover_workspace_context(&cwd).await?;
+        let previous_instruction_paths = self
+            .current_instruction_paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut newly_loaded_paths = discovery
+            .instruction_paths
+            .difference(&previous_instruction_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut nested_instructions = self
+            .nested_instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let explicit_roots = self
+            .explicit_context_roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for root in &explicit_roots {
+            for file in discover_nested_agent_instructions(root, root, false).await? {
+                if !nested_instructions.contains_key(&file.path) {
+                    newly_loaded_paths.push(file.path.clone());
+                    nested_instructions.insert(file.path.clone(), file);
+                }
+            }
+        }
+        if nested_instructions.len() > 64 {
+            bail!("nested AGENTS.md 超过 64 个会话级限制")
+        }
+        let budget = self.workspace_context_budget.load(Ordering::Acquire);
+        let base = if self.workspace_context_base.get().is_none()
+            && self
+                .workspace_context_base_override
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        {
+            discovery.rendered.clone()
+        } else {
+            self.effective_workspace_context_base()
+        };
+        let overlay = if base == discovery.rendered {
             String::new()
         } else {
             format!(
-                "# Current workspace context\n\nThe session changed working directories. The following current-workspace instructions and skills take precedence over the launch context.\n\n{rendered}"
+                "# Current workspace context\n\nThe session changed working directories. The following current-workspace instructions and skills take precedence over the launch context.\n\n{}",
+                discovery.rendered
             )
         };
-        let effective_bytes = base
-            .len()
-            .saturating_add(if base.is_empty() || overlay.is_empty() {
-                0
-            } else {
-                2
-            })
-            .saturating_add(overlay.len());
+        let nested = self.render_nested_instruction_context_from(
+            &nested_instructions,
+            &discovery.instruction_paths,
+        );
+        let effective_bytes = combined_workspace_context_bytes(&base, &overlay, &nested);
         if effective_bytes > budget {
             bail!("combined workspace system context 超过 {budget} 字节预算")
         }
-        self.permissions.set_workspace_deny(workspace_deny);
-        self.set_skills(skills);
+        newly_loaded_paths.sort_unstable();
+        newly_loaded_paths.dedup();
+        for path in &newly_loaded_paths {
+            let display = self.display_path(path);
+            self.hooks()
+                .run(
+                    "InstructionsLoaded",
+                    Some(&display),
+                    json!({"file_path":display, "load_reason":"workspace_context"}),
+                    &cwd,
+                )
+                .await?;
+        }
+        self.workspace_context_base
+            .get_or_init(|| discovery.rendered.clone());
+        self.permissions
+            .set_workspace_deny(discovery.workspace_deny);
+        self.set_skills(discovery.skills);
         *self
             .workspace_context_overlay
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = overlay;
+        *self
+            .current_instruction_paths
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = discovery.instruction_paths;
+        *self
+            .nested_instructions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = nested_instructions;
+        self.workspace_context_seen_generation
+            .store(observed_generation, Ordering::Release);
         Ok(())
+    }
+
+    async fn prepare_workspace_hot_refresh(
+        &self,
+        changed_paths: &[PathBuf],
+    ) -> Result<Option<WorkspaceContextCandidate>> {
+        if self.bare {
+            return Ok(None);
+        }
+        let mut relevant = Vec::new();
+        let mut seen = HashSet::new();
+        for path in changed_paths {
+            let resolved = canonicalize_for_scope(path).with_context(|| {
+                format!("无法解析 workspace context 变更路径 {}", path.display())
+            })?;
+            let Some(root) = self.root_for_resolved_path(&resolved) else {
+                continue;
+            };
+            let is_instruction = resolved.file_name().is_some_and(|name| name == "AGENTS.md");
+            let is_skill = resolved
+                .strip_prefix(&root)
+                .is_ok_and(is_project_skill_path);
+            if (is_instruction || is_skill) && seen.insert(resolved.clone()) {
+                relevant.push((resolved, root, is_instruction));
+            }
+        }
+        if relevant.is_empty() {
+            return Ok(None);
+        }
+
+        let launch_cwd = self.workspace_context_launch_cwd.clone();
+        let current_cwd = self.cwd();
+        let launch = self.discover_workspace_context(&launch_cwd).await?;
+        let current = if current_cwd == launch_cwd {
+            launch.clone()
+        } else {
+            self.discover_workspace_context(&current_cwd).await?
+        };
+        let mut nested_instructions = self
+            .nested_instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut instruction_hook_paths = Vec::new();
+        for (path, root, is_instruction) in &relevant {
+            if !is_instruction {
+                continue;
+            }
+            nested_instructions.remove(path);
+            if path.is_file() {
+                for file in discover_nested_agent_instructions(root, path, false).await? {
+                    nested_instructions.insert(file.path.clone(), file);
+                }
+                if launch.instruction_paths.contains(path)
+                    || current.instruction_paths.contains(path)
+                    || nested_instructions.contains_key(path)
+                {
+                    instruction_hook_paths.push(path.clone());
+                }
+            }
+        }
+        if nested_instructions.len() > 64 {
+            bail!("nested AGENTS.md 超过 64 个会话级限制")
+        }
+        instruction_hook_paths.sort_unstable();
+        instruction_hook_paths.dedup();
+        let changed_paths = relevant
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect::<Vec<_>>();
+
+        let overlay = workspace_context_overlay(&launch.rendered, &current.rendered);
+        let nested = self.render_nested_instruction_context_from(
+            &nested_instructions,
+            &current.instruction_paths,
+        );
+        let budget = self.workspace_context_budget.load(Ordering::Acquire);
+        if combined_workspace_context_bytes(&launch.rendered, &overlay, &nested) > budget {
+            bail!("combined workspace system context 超过 {budget} 字节预算")
+        }
+        Ok(Some(WorkspaceContextCandidate {
+            launch_rendered: launch.rendered,
+            overlay,
+            current_instruction_paths: current.instruction_paths,
+            nested_instructions,
+            skills: current.skills,
+            workspace_deny: current.workspace_deny,
+            instruction_hook_paths,
+            changed_paths,
+        }))
+    }
+
+    async fn run_workspace_hot_refresh_hooks(
+        &self,
+        candidate: &WorkspaceContextCandidate,
+    ) -> Result<()> {
+        let cwd = self.cwd();
+        for path in &candidate.instruction_hook_paths {
+            let display = self.display_path(path);
+            self.hooks()
+                .run(
+                    "InstructionsLoaded",
+                    Some(&display),
+                    json!({"file_path":display, "load_reason":"hot_refresh"}),
+                    &cwd,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn commit_workspace_context_candidate(&self, candidate: WorkspaceContextCandidate) {
+        *self
+            .workspace_context_base_override
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(candidate.launch_rendered);
+        *self
+            .workspace_context_overlay
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.overlay;
+        *self
+            .current_instruction_paths
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.current_instruction_paths;
+        *self
+            .nested_instructions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.nested_instructions;
+        self.set_skills(candidate.skills);
+        self.permissions
+            .set_workspace_deny(candidate.workspace_deny);
+    }
+
+    fn commit_workspace_hot_refresh(&self, candidate: WorkspaceContextCandidate) {
+        let changed_paths = candidate.changed_paths.clone();
+        self.commit_workspace_context_candidate(candidate);
+        let generation = self.workspace_context_changes.publish(changed_paths);
+        self.workspace_context_seen_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn workspace_context_full_refresh_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for root in [self.workspace_context_launch_cwd.clone(), self.cwd()] {
+            paths.push(root.join("AGENTS.md"));
+            paths.push(root.join(".open-agent-harness/skills/__context_refresh__/SKILL.md"));
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// Refreshes this logical context after another fork committed a
+    /// project-instruction or project-skill mutation. Discovery and hooks are
+    /// completed before any local state is replaced.
+    pub(crate) async fn refresh_workspace_context_if_stale(&self) -> Result<bool> {
+        let seen = self
+            .workspace_context_seen_generation
+            .load(Ordering::Acquire);
+        if seen >= self.workspace_context_changes.generation() {
+            return Ok(false);
+        }
+        let _refresh_guard = self.workspace_context_refresh_lock.lock().await;
+        let mut refreshed = false;
+        for _ in 0..4 {
+            let seen = self
+                .workspace_context_seen_generation
+                .load(Ordering::Acquire);
+            let (target, paths) = self.workspace_context_changes.changes_since(seen);
+            if seen >= target {
+                return Ok(refreshed);
+            }
+            let paths = paths.unwrap_or_else(|| self.workspace_context_full_refresh_paths());
+            let candidate = self.prepare_workspace_hot_refresh(&paths).await?;
+            if self.workspace_context_changes.generation() != target {
+                continue;
+            }
+            if let Some(candidate) = candidate {
+                self.run_workspace_hot_refresh_hooks(&candidate).await?;
+                if self.workspace_context_changes.generation() != target {
+                    continue;
+                }
+                self.commit_workspace_context_candidate(candidate);
+                refreshed = true;
+            }
+            self.workspace_context_seen_generation
+                .store(target, Ordering::Release);
+            if self.workspace_context_changes.generation() == target {
+                return Ok(refreshed);
+            }
+        }
+        bail!("workspace context 持续并发变化，无法取得稳定刷新快照")
+    }
+
+    /// Announces that a completed file rollback may have reverted project
+    /// context files. The restoring context keeps its checkpoint generation,
+    /// so it and every sibling rediscover from disk before the next request.
+    pub(crate) fn publish_workspace_context_rollback(&self) {
+        self.workspace_context_changes.publish(Vec::new());
+    }
+
+    /// Commits this agent context's successful project-context mutations to
+    /// its immediate parent. Nested agents publish one level at a time, so a
+    /// failed outer agent never updates the root context generation.
+    pub(crate) fn commit_workspace_context_changes_to_parent(&self) {
+        let Some(parent) = &self.workspace_context_parent_changes else {
+            return;
+        };
+        let (changed, paths) = self.workspace_context_changes.accumulated_changes();
+        if changed {
+            parent.publish(paths.unwrap_or_default());
+        }
+    }
+
+    /// Loads nested `AGENTS.md` layers only after a permitted tool first
+    /// reaches the corresponding directory tree. The resulting prompt blocks
+    /// carry an explicit relative scope and are deduplicated for the session.
+    pub async fn refresh_nested_instructions_for_path(&self, target: &Path) -> Result<()> {
+        let _refresh_guard = self.workspace_context_refresh_lock.lock().await;
+        let resolved = canonicalize_for_scope(target)
+            .with_context(|| format!("无法解析嵌套指令目标 {}", target.display()))?;
+        let Some(root) = self.root_for_resolved_path(&resolved) else {
+            return Ok(());
+        };
+        let explicit = self
+            .explicit_context_roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|explicit| resolved.starts_with(explicit));
+        let mut files =
+            discover_nested_agent_instructions(&root, &resolved, self.bare && !explicit).await?;
+        let cwd = self.cwd();
+        if self
+            .root_for_resolved_path(&cwd)
+            .is_some_and(|current_root| current_root == root)
+        {
+            files.retain(|file| {
+                !file
+                    .path
+                    .parent()
+                    .is_some_and(|scope| cwd.starts_with(scope))
+            });
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        let newly_loaded = files
+            .iter()
+            .filter(|file| {
+                !self
+                    .nested_instructions
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&file.path)
+            })
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let before = {
+            let mut nested = self
+                .nested_instructions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = nested.clone();
+            for file in files {
+                nested.entry(file.path.clone()).or_insert(file);
+            }
+            if nested.len() > 64 {
+                *nested = before;
+                bail!("nested AGENTS.md 超过 64 个会话级限制")
+            }
+            before
+        };
+        if self.workspace_system_context().len()
+            > self.workspace_context_budget.load(Ordering::Acquire)
+        {
+            *self
+                .nested_instructions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = before;
+            bail!("nested workspace instructions 超过 system context 字节预算")
+        }
+        for path in newly_loaded {
+            let display = self.display_path(&path);
+            if let Err(error) = self
+                .hooks()
+                .run(
+                    "InstructionsLoaded",
+                    Some(&display),
+                    json!({"file_path":display, "load_reason":"first_path_access"}),
+                    &cwd,
+                )
+                .await
+            {
+                *self
+                    .nested_instructions
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn render_nested_instruction_context(&self) -> String {
+        let nested = self
+            .nested_instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self
+            .current_instruction_paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.render_nested_instruction_context_from(&nested, &current)
+    }
+
+    fn render_nested_instruction_context_from(
+        &self,
+        nested: &BTreeMap<PathBuf, InstructionFile>,
+        current: &HashSet<PathBuf>,
+    ) -> String {
+        if nested.is_empty() {
+            return String::new();
+        }
+        let roots = self.trusted_roots();
+        let mut rendered = String::from(
+            "# Scoped workspace instructions\n\nEach block below applies only to files in its declared workspace-relative directory tree. More specific scopes take precedence.\n",
+        );
+        for file in nested.values() {
+            if current.contains(&file.path) {
+                continue;
+            }
+            let Some(scope_dir) = file.path.parent() else {
+                continue;
+            };
+            let Some((index, root)) = roots
+                .iter()
+                .enumerate()
+                .filter(|(_, root)| scope_dir.starts_with(root))
+                .max_by_key(|(_, root)| root.components().count())
+            else {
+                continue;
+            };
+            let relative = scope_dir.strip_prefix(root).unwrap_or(Path::new(""));
+            let scope = if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                normalize_path_for_display(relative.display().to_string())
+            };
+            let scope = escape_context_attribute(&scope);
+            rendered.push_str(&format!(
+                "\n<agent_instructions workspace=\"{}\" scope=\"{scope}/**\">\n{}\n</agent_instructions>\n",
+                index + 1,
+                file.content.trim()
+            ));
+        }
+        rendered
     }
 
     pub fn set_agent_limits(&mut self, limits: AgentLimits) {
@@ -286,6 +2264,18 @@ impl ToolContext {
         self.agent_depth
     }
 
+    pub(crate) fn set_agent_depth(&mut self, depth: usize) {
+        self.agent_depth = depth;
+    }
+
+    pub(crate) fn agent_tool_policy(&self) -> &AgentToolPolicy {
+        &self.agent_tool_policy
+    }
+
+    pub(crate) fn set_agent_tool_policy(&mut self, policy: AgentToolPolicy) {
+        self.agent_tool_policy = policy;
+    }
+
     pub(crate) fn install_agent_runtime(&self, runtime: Arc<AgentRuntime>) -> Result<()> {
         self.agent_runtime
             .set(runtime)
@@ -299,17 +2289,54 @@ impl ToolContext {
             .context("agent runtime 尚未初始化")
     }
 
+    fn bind_execution_registry(&self, registry: ToolRegistry) -> bool {
+        if let Some(existing) = self.execution_registry.get() {
+            return existing.same_registry(&registry);
+        }
+        match self.execution_registry.set(registry) {
+            Ok(()) => true,
+            Err(registry) => self
+                .execution_registry
+                .get()
+                .is_some_and(|existing| existing.same_registry(&registry)),
+        }
+    }
+
+    pub(crate) fn execution_registry_has_active(&self, name: &str) -> bool {
+        self.execution_registry
+            .get()
+            .is_some_and(|registry| registry.has_active(name))
+    }
+
+    pub(crate) fn workflow_runtime(&self) -> WorkflowRuntime {
+        self.workflow_runtime.clone()
+    }
+
     pub(crate) fn fork_for_agent(&self) -> Self {
         Self {
+            async_owner: self.async_owner.fork(),
             location: Arc::new(RwLock::new(
                 self.location
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
-            permissions: Arc::clone(&self.permissions),
+            trusted_roots: Arc::new(RwLock::new(
+                self.trusted_roots
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+            explicit_context_roots: Arc::new(RwLock::new(
+                self.explicit_context_roots
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+            permissions: Arc::new(self.permissions.fork_for_context()),
             read_cache: Arc::new(Mutex::new(ReadCache::default())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            task_capture_root: Arc::clone(&self.task_capture_root),
             todos: Arc::new(Mutex::new(Vec::new())),
             skills: Arc::new(RwLock::new(
                 self.skills
@@ -317,21 +2344,83 @@ impl ToolContext {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+            extension_skills: Arc::clone(&self.extension_skills),
             task_store_lock: Arc::clone(&self.task_store_lock),
             task_store_path: Arc::new(RwLock::new(self.task_store_path())),
             agent_runtime: Arc::clone(&self.agent_runtime),
+            execution_registry: Arc::new(OnceLock::new()),
+            workflow_runtime: WorkflowRuntime::default(),
             agent_depth: self.agent_depth.saturating_add(1),
             agent_limits: self.agent_limits,
+            agent_tool_policy: self.agent_tool_policy.clone(),
             hooks: Arc::clone(&self.hooks),
             bare: self.bare,
+            workspace_context_launch_cwd: self.workspace_context_launch_cwd.clone(),
             workspace_context_base: Arc::clone(&self.workspace_context_base),
+            workspace_context_base_override: Arc::new(RwLock::new(
+                self.workspace_context_base_override
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
             workspace_context_overlay: Arc::new(RwLock::new(
                 self.workspace_context_overlay
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+            current_instruction_paths: Arc::new(RwLock::new(
+                self.current_instruction_paths
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+            nested_instructions: Arc::new(RwLock::new(
+                self.nested_instructions
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
             workspace_context_budget: Arc::clone(&self.workspace_context_budget),
+            workspace_context_refresh_lock: Arc::new(Mutex::new(())),
+            workspace_context_changes: Arc::new(WorkspaceContextChanges::default()),
+            workspace_context_parent_changes: Some(Arc::clone(&self.workspace_context_changes)),
+            workspace_context_seen_generation: Arc::new(AtomicU64::new(0)),
+            interaction_handler: Arc::clone(&self.interaction_handler),
+            sandbox_runtime: Arc::clone(&self.sandbox_runtime),
+            file_history: Arc::new(RwLock::new(
+                self.file_history
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+            file_histories: Arc::clone(&self.file_histories),
+            file_checkpoint: Arc::clone(&self.file_checkpoint),
+            ancestor_file_checkpoints: Arc::new(RwLock::new(
+                self.ancestor_file_checkpoints
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+            hot_refresh_transactions: Arc::clone(&self.hot_refresh_transactions),
+            hot_refresh_transaction: Arc::new(RwLock::new(None)),
+            hot_refresh_parent_transaction: (*self
+                .hot_refresh_transaction
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()))
+            .or(self.hot_refresh_parent_transaction),
+            team_identity: Arc::new(RwLock::new(
+                *self
+                    .team_identity
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )),
+            team_mailboxes: Arc::new(RwLock::new(HashMap::new())),
+            workspace_state_recorder: Arc::new(RwLock::new(None)),
+            current_cwd_state_recorder: Arc::new(RwLock::new(None)),
+            cron: self.cron.clone(),
+            monitor: self.monitor.clone(),
+            secret_env_scrubber: self.secret_env_scrubber.clone(),
         }
     }
 
@@ -351,6 +2440,62 @@ impl ToolContext {
             .clone()
     }
 
+    fn root_for_resolved_path(&self, path: &Path) -> Option<PathBuf> {
+        self.trusted_roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    }
+
+    fn file_history_for_path(&self, path: &Path) -> Result<Option<FileHistory>> {
+        let resolved = canonicalize_for_scope(path)
+            .with_context(|| format!("无法解析 file-history 目标 {}", path.display()))?;
+        let root = self
+            .root_for_resolved_path(&resolved)
+            .context("file-history 目标不在可信工作区内")?;
+        let key = workspace_key(&root);
+        if let Some(history) = self
+            .file_histories
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(Some(history));
+        }
+        let Some(template) = self
+            .file_history
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let history = template.relocate(&root)?;
+        for checkpoint_id in self.file_transaction_ids() {
+            if let Some(info) = template
+                .checkpoints()?
+                .into_iter()
+                .find(|info| info.id == checkpoint_id)
+            {
+                history.checkpoint_with_ancestors(
+                    checkpoint_id,
+                    info.boundary,
+                    info.message_count,
+                    &info.ancestor_ids,
+                )?;
+            }
+        }
+        self.file_histories
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, history.clone());
+        Ok(Some(history))
+    }
+
     pub async fn switch_workspace(&self, cwd: PathBuf, root: PathBuf) -> Result<()> {
         let cwd = std::fs::canonicalize(&cwd)
             .with_context(|| format!("无法解析新工作目录 {}", cwd.display()))?;
@@ -359,20 +2504,158 @@ impl ToolContext {
         if !cwd.is_dir() || !root.is_dir() || !cwd.starts_with(&root) {
             bail!("新工作目录必须位于有效工作区根目录内")
         }
+        {
+            let mut trusted = self
+                .trusted_roots
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !trusted.contains(&root) {
+                if trusted.len() >= MAX_TRUSTED_WORKSPACE_ROOTS {
+                    bail!(
+                        "可信工作区根目录超过 {} 个限制",
+                        MAX_TRUSTED_WORKSPACE_ROOTS
+                    )
+                }
+                trusted.push(root.clone());
+            }
+        }
+        let history = self
+            .file_history
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let checkpoints = self.file_transaction_ids();
+        let relocated_history = match history {
+            Some(history) => {
+                self.file_histories
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(workspace_key(history.workspace()), history.clone());
+                let key = workspace_key(&root);
+                let relocated = self
+                    .file_histories
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&key)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| history.relocate(&root))?;
+                for checkpoint_id in checkpoints {
+                    if history.is_transaction_active(checkpoint_id)?
+                        && !relocated.can_rewind(checkpoint_id)?
+                    {
+                        if let Some(info) = history
+                            .checkpoints()?
+                            .into_iter()
+                            .find(|info| info.id == checkpoint_id)
+                        {
+                            relocated.checkpoint_with_ancestors(
+                                checkpoint_id,
+                                info.boundary,
+                                info.message_count,
+                                &info.ancestor_ids,
+                            )?;
+                        }
+                    }
+                }
+                self.file_histories
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, relocated.clone());
+                Some(relocated)
+            }
+            None => None,
+        };
         let mut read_cache = self.read_cache.lock().await;
         *self
             .location
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = WorkspaceLocation { cwd, root };
+        *self
+            .file_history
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = relocated_history;
         self.set_task_store_path(task_store_path(&self.cwd()));
         *read_cache = ReadCache::default();
         Ok(())
+    }
+
+    /// Restores a persisted foreground-shell cwd only when its hashed root is
+    /// one of this invocation's already trusted roots. The persisted path is
+    /// relative and every component must still be a real directory rather
+    /// than a symlink.
+    pub async fn restore_persisted_cwd(&self, root_key: &str, relative: &Path) -> Result<()> {
+        if root_key.len() != 32 || !root_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("persisted current root key 必须是 32 位十六进制标识")
+        }
+        validate_persisted_relative_cwd(relative)?;
+        let mut matches = self
+            .trusted_roots()
+            .into_iter()
+            .filter(|root| workspace_key(root) == root_key)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!("persisted current root 不再唯一匹配本次显式信任的 workspace")
+        }
+        let root = matches.pop().expect("one trusted root match");
+        let cwd = canonicalize_restored_cwd(&root, relative)?;
+        self.switch_workspace(cwd, root).await
+    }
+
+    /// Persists the physical cwd reported by a successful foreground shell.
+    /// A cwd outside every trusted root is rejected and the previous cwd stays
+    /// active, even if the subprocess itself visited that directory.
+    pub async fn update_cwd_from_shell(&self, cwd: &Path) -> Result<bool> {
+        let cwd = std::fs::canonicalize(cwd)
+            .with_context(|| format!("无法解析 shell cwd {}", cwd.display()))?;
+        if !cwd.is_dir() {
+            bail!("shell cwd 不是目录")
+        }
+        let Some(root) = self.root_for_resolved_path(&cwd) else {
+            return Ok(false);
+        };
+        if cwd == self.cwd() && root == self.workspace_root() {
+            return Ok(true);
+        }
+        let previous_cwd = self.cwd();
+        let previous_root = self.workspace_root();
+        self.switch_workspace(cwd.clone(), root).await?;
+        if let Err(error) = self.reload_workspace_context().await {
+            self.switch_workspace(previous_cwd, previous_root).await?;
+            self.reload_workspace_context().await?;
+            return Err(error).context("shell cwd 上下文刷新失败，已恢复原 cwd");
+        }
+        if let Err(error) = self
+            .hooks()
+            .run(
+                "CwdChanged",
+                Some("shell"),
+                json!({
+                    "source":"shell",
+                    "old_cwd":self.display_path(&previous_cwd),
+                    "new_cwd":self.display_path(&cwd),
+                }),
+                &cwd,
+            )
+            .await
+        {
+            self.switch_workspace(previous_cwd, previous_root).await?;
+            self.reload_workspace_context().await?;
+            return Err(error).context("CwdChanged hook 拒绝 shell cwd 更新，已恢复原 cwd");
+        }
+        if let Err(error) = self.record_current_cwd_transition() {
+            self.switch_workspace(previous_cwd, previous_root).await?;
+            self.reload_workspace_context().await?;
+            return Err(error).context("shell cwd 持久化失败，已恢复原 cwd");
+        }
+        Ok(true)
     }
 
     pub fn resolve_path(&self, value: &str) -> Result<PathBuf> {
         if value.trim().is_empty() {
             bail!("路径不能为空");
         }
+        reject_windows_network_or_device_path(value)?;
         let expanded = if value == "~" {
             dirs::home_dir().context("无法确定用户主目录")?
         } else if let Some(rest) = value.strip_prefix("~/") {
@@ -391,7 +2674,50 @@ impl ToolContext {
         let path = self.resolve_path(value)?;
         let resolved = canonicalize_for_scope(&path)
             .with_context(|| format!("无法解析路径边界: {}", path.display()))?;
-        Ok(!resolved.starts_with(self.workspace_root()))
+        Ok(self.root_for_resolved_path(&resolved).is_none())
+    }
+
+    /// Produces equivalent, normalized path identities for permission rules.
+    /// The raw spelling is never authoritative: existing paths include their
+    /// canonical target (closing symlink aliases), while missing write targets
+    /// inherit a canonical parent. Relative identities are derived from every
+    /// trusted workspace root so `./`, absolute, and `..` spellings converge.
+    pub fn permission_path_candidates(&self, value: &str) -> Result<Vec<String>> {
+        let path = self.resolve_path(value)?;
+        self.permission_path_candidates_for_resolved(&path)
+    }
+
+    pub(crate) fn permission_path_candidates_for_resolved(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<String>> {
+        reject_windows_network_or_device_path(&path.to_string_lossy())?;
+        let lexical = normalize_lexical_path(path);
+        let canonical = canonicalize_for_scope(&lexical)
+            .with_context(|| format!("无法规范化权限路径: {}", path.display()))?;
+        let mut candidates = Vec::new();
+        push_permission_path_candidate(&mut candidates, &lexical);
+        push_permission_path_candidate(&mut candidates, &canonical);
+        for root in self.trusted_roots() {
+            for candidate in [&lexical, &canonical] {
+                if let Ok(relative) = candidate.strip_prefix(&root) {
+                    let relative = if relative.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        relative
+                    };
+                    push_permission_path_candidate(&mut candidates, relative);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn read_path_denied(&self, path: &Path) -> bool {
+        self.permission_path_candidates_for_resolved(path)
+            .map(|candidates| self.permissions.denies_read_path(&candidates))
+            // Search must fail closed when a candidate cannot be normalized.
+            .unwrap_or(true)
     }
 
     pub fn display_path(&self, path: &Path) -> String {
@@ -464,10 +2790,238 @@ impl ToolContext {
             bash::terminate_task(task).await;
         }
         tasks.clear();
+        drop(tasks);
+        self.workflow_runtime.shutdown().await;
     }
 
     pub async fn background_task_ids(&self) -> HashSet<String> {
-        self.tasks.lock().await.keys().cloned().collect()
+        let mut ids = self
+            .tasks
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        ids.extend(self.workflow_runtime.task_ids().await);
+        ids.extend(self.monitor.owned_task_ids(&self.async_owner).await);
+        ids
+    }
+
+    pub(crate) async fn background_notification_checkpoint(
+        &self,
+    ) -> BackgroundNotificationCheckpoint {
+        let bash_tasks = self
+            .tasks
+            .lock()
+            .await
+            .iter()
+            .map(|(id, task)| {
+                (
+                    id.clone(),
+                    BashTaskCheckpoint {
+                        notification_delivered: task.notification_delivered,
+                        output_path: task.output_path.clone(),
+                        output_cleanup_armed: task.output_cleanup_armed,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        BackgroundNotificationCheckpoint {
+            bash_tasks,
+            workflow_tasks: self.workflow_runtime.notification_checkpoint().await,
+            monitor: self
+                .monitor
+                .notification_checkpoint(&self.async_owner)
+                .await,
+        }
+    }
+
+    pub(crate) async fn restore_background_notification_checkpoint(
+        &self,
+        checkpoint: &BackgroundNotificationCheckpoint,
+    ) {
+        let mut tasks = self.tasks.lock().await;
+        let mut orphaned_captures = Vec::new();
+        for (id, snapshot) in &checkpoint.bash_tasks {
+            match tasks.get_mut(id) {
+                Some(task) if task.output_path == snapshot.output_path => {
+                    task.notification_delivered = snapshot.notification_delivered;
+                    task.output_cleanup_armed = snapshot.output_cleanup_armed;
+                }
+                Some(_) | None if snapshot.output_cleanup_armed => {
+                    orphaned_captures.push(snapshot.output_path.clone());
+                }
+                Some(_) | None => {}
+            }
+        }
+        drop(tasks);
+        for path in orphaned_captures {
+            let _ = std::fs::remove_file(path);
+        }
+        self.workflow_runtime
+            .restore_notification_checkpoint(&checkpoint.workflow_tasks)
+            .await;
+        self.monitor
+            .restore_notification_checkpoint(&checkpoint.monitor)
+            .await;
+    }
+
+    /// Claims completed background work exactly once without consuming it.
+    /// `TaskOutput`/`AgentOutput` remain authoritative and can still retrieve
+    /// the full bounded result after this model-visible notification.
+    pub(crate) async fn drain_background_notifications(&self) -> Vec<String> {
+        let cwd = self.cwd();
+        let mut notifications = Vec::new();
+        let mut total_bytes = 0usize;
+        {
+            let mut tasks = self.tasks.lock().await;
+            let mut ids = tasks.keys().cloned().collect::<Vec<_>>();
+            ids.sort_unstable();
+            for id in ids {
+                if notifications.len() >= MAX_BACKGROUND_NOTIFICATIONS
+                    || total_bytes >= MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+                {
+                    break;
+                }
+                let Some(task) = tasks.get_mut(&id) else {
+                    continue;
+                };
+                if task.notification_delivered
+                    || task.child.try_wait().ok().flatten().is_none()
+                    || task.drains.iter().any(|drain| !drain.is_finished())
+                {
+                    continue;
+                }
+                let status = if task.timed_out {
+                    format!("timed out after {}ms", task.timeout_ms)
+                } else {
+                    "completed".to_owned()
+                };
+                let output = bash::read_output_preview(
+                    &task.output_path,
+                    MAX_BACKGROUND_NOTIFICATION_BYTES / 2,
+                )
+                .map(|(output, truncated, _)| {
+                    if truncated {
+                        format!(
+                            "{output}\n[preview truncated; use TaskOutput for the full capture]"
+                        )
+                    } else {
+                        output
+                    }
+                })
+                .unwrap_or_else(|error| format!("[output preview unavailable: {error:#}]"));
+                let mut notification = format!(
+                    "Background Bash task {id} {status}.\nOutput preview:\n{}",
+                    sanitize_transport_text(&output, &cwd)
+                );
+                truncate_utf8_with_marker(
+                    &mut notification,
+                    MAX_BACKGROUND_NOTIFICATION_BYTES,
+                    "\n[background notification truncated]",
+                );
+                if total_bytes.saturating_add(notification.len())
+                    > MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+                {
+                    break;
+                }
+                total_bytes += notification.len();
+                task.notification_delivered = true;
+                notifications.push(notification);
+            }
+        }
+
+        if notifications.len() < MAX_BACKGROUND_NOTIFICATIONS
+            && total_bytes < MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+        {
+            for mut notification in self
+                .workflow_runtime
+                .drain_notifications(MAX_BACKGROUND_NOTIFICATIONS - notifications.len())
+                .await
+            {
+                truncate_utf8_with_marker(
+                    &mut notification,
+                    MAX_BACKGROUND_NOTIFICATION_BYTES,
+                    "\n[background notification truncated]",
+                );
+                if total_bytes.saturating_add(notification.len())
+                    > MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+                {
+                    break;
+                }
+                total_bytes += notification.len();
+                notifications.push(notification);
+            }
+        }
+
+        if notifications.len() < MAX_BACKGROUND_NOTIFICATIONS
+            && total_bytes < MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+        {
+            for mut notification in self
+                .monitor
+                .drain_notifications(
+                    &self.async_owner,
+                    MAX_BACKGROUND_NOTIFICATIONS - notifications.len(),
+                    MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES - total_bytes,
+                    &cwd,
+                )
+                .await
+            {
+                truncate_utf8_with_marker(
+                    &mut notification,
+                    MAX_BACKGROUND_NOTIFICATION_BYTES,
+                    "\n[background notification truncated; use TaskOutput for the full result]",
+                );
+                if total_bytes.saturating_add(notification.len())
+                    > MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+                {
+                    break;
+                }
+                total_bytes += notification.len();
+                notifications.push(notification);
+            }
+        }
+
+        if notifications.len() < MAX_BACKGROUND_NOTIFICATIONS
+            && total_bytes < MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+        {
+            if let Ok(runtime) = self.agent_runtime() {
+                let remaining_count = MAX_BACKGROUND_NOTIFICATIONS - notifications.len();
+                for (id, description, output) in runtime
+                    .drain_ready_notifications(&self.async_owner, remaining_count)
+                    .await
+                {
+                    let mut notification = format!(
+                        "Background agent {id} completed ({description}).\nResult preview:\n{}",
+                        sanitize_transport_text(&output.content, &cwd)
+                    );
+                    truncate_utf8_with_marker(
+                        &mut notification,
+                        MAX_BACKGROUND_NOTIFICATION_BYTES,
+                        "\n[background notification truncated; use AgentOutput for the full result]",
+                    );
+                    if total_bytes.saturating_add(notification.len())
+                        > MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+                    {
+                        runtime
+                            .restore_notification_delivery(&self.async_owner, id)
+                            .await;
+                        break;
+                    }
+                    total_bytes += notification.len();
+                    notifications.push(notification);
+                }
+            }
+        }
+        if notifications.len() < MAX_BACKGROUND_NOTIFICATIONS
+            && total_bytes < MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES
+        {
+            notifications.extend(self.drain_team_notifications(
+                MAX_BACKGROUND_NOTIFICATIONS - notifications.len(),
+                MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES - total_bytes,
+            ));
+        }
+        notifications
     }
 
     pub async fn rollback_background_tasks(&self, keep: &HashSet<String>) {
@@ -484,9 +3038,24 @@ impl ToolContext {
         };
         for task in &mut added {
             bash::terminate_task(task).await;
-            let _ = std::fs::remove_file(&task.output_path);
         }
+        self.workflow_runtime.rollback_new(keep).await;
+        self.monitor
+            .rollback_new_tasks(&self.async_owner, keep)
+            .await;
     }
+}
+
+fn truncate_utf8_with_marker(value: &mut String, maximum: usize, marker: &str) {
+    if value.len() <= maximum {
+        return;
+    }
+    let mut end = maximum.saturating_sub(marker.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value.push_str(marker);
 }
 
 pub(crate) fn normalize_path_for_display(value: String) -> String {
@@ -498,6 +3067,180 @@ pub(crate) fn normalize_path_for_display(value: String) -> String {
     {
         value
     }
+}
+
+fn escape_context_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn workspace_context_overlay(launch: &str, current: &str) -> String {
+    if launch == current {
+        String::new()
+    } else {
+        format!(
+            "# Current workspace context\n\nThe session changed working directories. The following current-workspace instructions and skills take precedence over the launch context.\n\n{current}"
+        )
+    }
+}
+
+fn combined_workspace_context_bytes(base: &str, overlay: &str, nested: &str) -> usize {
+    [base, overlay, nested]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .fold((0usize, false), |(bytes, has_previous), section| {
+            (
+                bytes
+                    .saturating_add(if has_previous { 2 } else { 0 })
+                    .saturating_add(section.len()),
+                true,
+            )
+        })
+        .0
+}
+
+fn hot_refresh_snapshot_bytes(snapshot: &HotRefreshFileSnapshot) -> usize {
+    snapshot.original.as_deref().map_or(0, <[u8]>::len)
+        + snapshot.expected.as_deref().map_or(0, <[u8]>::len)
+}
+
+fn hot_refresh_transaction_is_ancestor(
+    frames: &BTreeMap<u64, HotRefreshFileTransaction>,
+    candidate: u64,
+    transaction: u64,
+) -> bool {
+    let mut current = frames.get(&transaction).and_then(|frame| frame.parent);
+    let mut remaining = frames.len();
+    while let Some(id) = current {
+        if id == candidate {
+            return true;
+        }
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        current = frames.get(&id).and_then(|frame| frame.parent);
+    }
+    false
+}
+
+fn read_hot_refresh_snapshot(path: &Path) -> Result<HotRefreshFileSnapshot> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "临时 workspace context 事务只支持普通文件: {}",
+                    path.display()
+                )
+            }
+            let bytes = read_hot_refresh_file_state(path)?
+                .context("临时 workspace context 事务读取到的文件状态与 metadata 不一致")?;
+            Ok(HotRefreshFileSnapshot {
+                original: Some(bytes),
+                original_permissions: Some(metadata.permissions()),
+                expected: None,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HotRefreshFileSnapshot {
+            original: None,
+            original_permissions: None,
+            expected: None,
+        }),
+        Err(error) => Err(error)
+            .with_context(|| format!("无法读取临时 workspace context 事务目标 {}", path.display())),
+    }
+}
+
+fn read_hot_refresh_file_state(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "临时 workspace context 事务目标不再是普通文件: {}",
+            path.display()
+        )
+    }
+    if metadata.len() > MAX_EDITABLE_FILE_BYTES as u64 {
+        bail!(
+            "临时 workspace context 事务文件超过 {} 字节限制: {}",
+            MAX_EDITABLE_FILE_BYTES,
+            path.display()
+        )
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take((MAX_EDITABLE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_EDITABLE_FILE_BYTES {
+        bail!(
+            "临时 workspace context 事务文件超过 {} 字节限制: {}",
+            MAX_EDITABLE_FILE_BYTES,
+            path.display()
+        )
+    }
+    Ok(Some(bytes))
+}
+
+fn rollback_hot_refresh_snapshots(
+    snapshots: &BTreeMap<PathBuf, HotRefreshFileSnapshot>,
+) -> Result<()> {
+    let mut current = Vec::with_capacity(snapshots.len());
+    for (path, snapshot) in snapshots {
+        let state = read_hot_refresh_file_state(path)?;
+        let is_original = state == snapshot.original;
+        let is_expected = snapshot
+            .expected
+            .as_ref()
+            .is_some_and(|expected| state.as_ref() == Some(expected));
+        let is_tracked_delete =
+            snapshot.expected.is_none() && snapshot.original.is_some() && state.is_none();
+        if !is_original && !is_expected && !is_tracked_delete {
+            bail!(
+                "拒绝回滚被其他进程并发修改的 workspace context 文件: {}",
+                path.display()
+            )
+        }
+        current.push((path, snapshot, state));
+    }
+
+    for (path, snapshot, validated_state) in current {
+        if read_hot_refresh_file_state(path)? != validated_state {
+            bail!(
+                "workspace context 文件在回滚预检后再次变化: {}",
+                path.display()
+            )
+        }
+        if validated_state.as_ref() == snapshot.original.as_ref() {
+            continue;
+        }
+        match (&snapshot.original, &snapshot.original_permissions) {
+            (None, None) => std::fs::remove_file(path)
+                .with_context(|| format!("无法删除本轮新建的 context 文件 {}", path.display()))?,
+            (Some(bytes), Some(permissions)) => {
+                atomic_write_bytes(path, bytes, Some(permissions.clone())).with_context(|| {
+                    format!("无法还原 workspace context 文件 {}", path.display())
+                })?;
+            }
+            _ => bail!("临时 workspace context 文件快照缺少权限元数据"),
+        }
+    }
+    Ok(())
+}
+
+fn is_project_skill_path(path: &Path) -> bool {
+    let components = path.components().collect::<Vec<_>>();
+    components.len() >= 4
+        && components[0].as_os_str() == ".open-agent-harness"
+        && components[1].as_os_str() == "skills"
+        && components
+            .last()
+            .is_some_and(|component| component.as_os_str() == "SKILL.md")
 }
 
 fn compact_value(value: &Value) -> String {
@@ -513,36 +3256,109 @@ fn compact_value(value: &Value) -> String {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
+    pub model_content: Option<Value>,
     pub is_error: bool,
     pub interrupted: bool,
+    pub(crate) rollback_turn: bool,
+    pub(crate) skill_invocation: Option<crate::skills::SkillInvocation>,
 }
 
 impl ToolOutput {
     pub fn success(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            model_content: None,
             is_error: false,
             interrupted: false,
+            rollback_turn: false,
+            skill_invocation: None,
+        }
+    }
+
+    pub fn success_with_model_content(content: impl Into<String>, model_content: Value) -> Self {
+        Self {
+            content: content.into(),
+            model_content: Some(model_content),
+            is_error: false,
+            interrupted: false,
+            rollback_turn: false,
+            skill_invocation: None,
         }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            model_content: None,
             is_error: true,
             interrupted: false,
+            rollback_turn: false,
+            skill_invocation: None,
+        }
+    }
+
+    fn transaction_error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            model_content: None,
+            is_error: true,
+            interrupted: false,
+            rollback_turn: true,
+            skill_invocation: None,
         }
     }
 
     pub fn interrupted() -> Self {
         Self {
             content: "用户中断了权限确认".to_owned(),
+            model_content: None,
             is_error: true,
             interrupted: true,
+            rollback_turn: false,
+            skill_invocation: None,
+        }
+    }
+
+    pub(crate) fn success_with_skill_invocation(
+        content: impl Into<String>,
+        invocation: crate::skills::SkillInvocation,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            model_content: None,
+            is_error: false,
+            interrupted: false,
+            rollback_turn: false,
+            skill_invocation: Some(invocation),
+        }
+    }
+
+    pub(crate) fn append_context(&mut self, label: &str, context: &str) {
+        let addition = format!("\n\n[{label}]\n{context}");
+        self.content.push_str(&addition);
+        if let Some(model_content) = &mut self.model_content {
+            match model_content {
+                Value::Array(blocks) => blocks.push(json!({"type":"text", "text":addition})),
+                previous => {
+                    let first = std::mem::take(previous);
+                    *previous = Value::Array(vec![first, json!({"type":"text", "text":addition})]);
+                }
+            }
         }
     }
 
     fn bounded(mut self) -> Self {
+        if self
+            .model_content
+            .as_ref()
+            .and_then(|content| serde_json::to_vec(content).ok())
+            .is_some_and(|encoded| encoded.len() > MAX_MODEL_TOOL_RESULT_BYTES)
+        {
+            self.content =
+                format!("结构化工具结果超过 {MAX_MODEL_TOOL_RESULT_BYTES} 字节 harness 限制");
+            self.model_content = None;
+            self.is_error = true;
+        }
         const MARKER: &str = "\n[Tool result truncated at the 256 KiB harness limit]";
         if self.content.len() <= MAX_TOOL_RESULT_BYTES {
             return self;
@@ -593,6 +3409,9 @@ pub trait Tool: Send + Sync {
     }
     fn requires_permission(&self) -> bool {
         true
+    }
+    fn requires_permission_for(&self, _context: &ToolContext, _input: &Value) -> bool {
+        self.requires_permission()
     }
     fn path_fields(&self) -> &'static [&'static str] {
         &[]
@@ -649,12 +3468,22 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    fn same_registry(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     fn builtins() -> Vec<Arc<dyn Tool>> {
         vec![
+            Arc::new(AskUserQuestionTool),
             Arc::new(BashTool),
+            Arc::new(RunWorkflowTool),
+            Arc::new(CronCreateTool),
+            Arc::new(CronDeleteTool),
+            Arc::new(CronListTool),
             Arc::new(GlobTool),
             Arc::new(GrepTool),
             Arc::new(ReadTool),
+            Arc::new(ScheduleWakeupTool),
             Arc::new(EditTool),
             Arc::new(NotebookEditTool),
             Arc::new(WriteTool),
@@ -696,11 +3525,15 @@ impl ToolRegistry {
             validate_registry_tool(tool.as_ref())?;
             insert_unique_tool(&mut active, &deferred, tool)?;
         }
-        for tool in deferred_extensions {
+        for tool in deferred_extensions
+            .into_iter()
+            .chain(std::iter::once(Arc::new(MonitorTool) as Arc<dyn Tool>))
+        {
             validate_registry_tool(tool.as_ref())?;
             insert_unique_tool(&mut deferred, &active, tool)?;
         }
-        let search_slots = usize::from(!deferred.is_empty());
+        let has_dynamic_discovery = !discoverers.is_empty();
+        let search_slots = usize::from(!deferred.is_empty() || has_dynamic_discovery);
         if active.len().saturating_add(search_slots) > MAX_ACTIVE_TOOLS {
             bail!("active tool 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
         }
@@ -709,7 +3542,7 @@ impl ToolRegistry {
         }
         let state = Arc::new(RwLock::new(RegistryState { active, deferred }));
         let discoverers = Arc::new(discoverers);
-        if !read_registry(&state).deferred.is_empty() {
+        if !read_registry(&state).deferred.is_empty() || has_dynamic_discovery {
             let search: Arc<dyn Tool> = Arc::new(ToolSearchTool {
                 state: Arc::downgrade(&state),
                 discoverers: Arc::clone(&discoverers),
@@ -736,6 +3569,108 @@ impl ToolRegistry {
         tools
     }
 
+    pub fn restrict_to(&self, names: &[String]) -> Result<()> {
+        if names.len() > MAX_ACTIVE_TOOLS {
+            bail!("--tools 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
+        }
+        let requested = names.iter().cloned().collect::<HashSet<_>>();
+        if requested.len() != names.len() {
+            bail!("--tools 包含重复名称")
+        }
+        let mut state = write_registry(&self.state);
+        for name in &requested {
+            if !state.active.contains_key(name) && !state.deferred.contains_key(name) {
+                bail!("--tools 指定了未知工具: {name}")
+            }
+        }
+        let preserves_structured_output = state.active.contains_key("StructuredOutput")
+            && !requested.contains("StructuredOutput");
+        if requested
+            .len()
+            .saturating_add(usize::from(preserves_structured_output))
+            > MAX_ACTIVE_TOOLS
+        {
+            bail!("--tools 选择后 active tool 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
+        }
+        for name in &requested {
+            if let Some(tool) = state.deferred.remove(name) {
+                state.active.insert(name.clone(), tool);
+            }
+        }
+        state
+            .active
+            .retain(|name, _| requested.contains(name) || name == "StructuredOutput");
+        if !requested.contains("ToolSearch") {
+            state.deferred.clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scoped_for_agent(&self, policy: &AgentToolPolicy) -> Result<Self> {
+        let state = read_registry(&self.state);
+        let known = state
+            .active
+            .keys()
+            .chain(state.deferred.keys())
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if let Some(allowed) = &policy.allowed_tools {
+            if allowed.contains("ToolSearch") {
+                bail!("受限 agent 不得启用 ToolSearch")
+            }
+            if let Some(unknown) = allowed.iter().find(|name| !known.contains(name.as_str())) {
+                bail!("agent allowedTools 包含未知工具: {unknown}")
+            }
+        }
+        if let Some(unknown) = policy
+            .disallowed_tools
+            .iter()
+            .find(|name| !known.contains(name.as_str()))
+        {
+            bail!("agent disallowedTools 包含未知工具: {unknown}")
+        }
+
+        let mut active = state
+            .active
+            .iter()
+            .filter(|(name, _)| name.as_str() != "ToolSearch" && policy.allows(name))
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect::<HashMap<_, _>>();
+        match &policy.allowed_tools {
+            Some(allowed) => {
+                for name in allowed {
+                    if let Some(tool) = state.deferred.get(name) {
+                        active.insert(name.clone(), Arc::clone(tool));
+                    }
+                }
+            }
+            None => {
+                // A deny-only policy means every capability inherited from the
+                // parent remains available except the explicitly denied names.
+                // Scoped agents do not receive ToolSearch, so eagerly promote
+                // every allowed deferred tool and fail closed at the same active
+                // tool ceiling instead of silently dropping capabilities.
+                for (name, tool) in &state.deferred {
+                    if policy.allows(name) {
+                        active.insert(name.clone(), Arc::clone(tool));
+                    }
+                }
+            }
+        }
+        if active.len() > MAX_ACTIVE_TOOLS {
+            bail!("agent scoped active tool 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
+        }
+        drop(state);
+        Ok(Self {
+            state: Arc::new(RwLock::new(RegistryState {
+                active,
+                deferred: HashMap::new(),
+            })),
+            services: Arc::clone(&self.services),
+            discoverers: Arc::new(Vec::new()),
+        })
+    }
+
     pub fn summary(&self, name: &str, input: &Value) -> String {
         read_registry(&self.state)
             .active
@@ -743,7 +3678,28 @@ impl ToolRegistry {
             .map_or_else(|| compact_value(input), |tool| tool.summary(input))
     }
 
+    pub(crate) fn has_active(&self, name: &str) -> bool {
+        read_registry(&self.state).active.contains_key(name)
+    }
+
     pub async fn execute(&self, context: &ToolContext, name: &str, input: Value) -> ToolOutput {
+        let tool_use_id = uuid::Uuid::new_v4().to_string();
+        self.execute_with_id(context, name, input, &tool_use_id)
+            .await
+    }
+
+    async fn execute_with_id(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        input: Value,
+        tool_use_id: &str,
+    ) -> ToolOutput {
+        if !context.bind_execution_registry(self.clone()) {
+            return ToolOutput::error(
+                "同一 ToolContext 不能跨独立 tool registry 执行；请为受限 registry 使用隔离 context",
+            );
+        }
         let tool = read_registry(&self.state).active.get(name).cloned();
         let Some(tool) = tool else {
             return ToolOutput::error(format!("未知工具: {name}"));
@@ -752,54 +3708,312 @@ impl ToolRegistry {
             return ToolOutput::error(format!("工具输入校验失败: {error}"));
         }
         let hooks = context.hooks();
-        let (input, pre_context) = match hooks.pre_tool(tool.name(), input, &context.cwd()).await {
+        let (mut input, mut pre_context) = match hooks
+            .pre_tool(tool.name(), input, &context.cwd())
+            .await
+        {
             Ok(result) => result,
             Err(error) => return ToolOutput::error(format!("Pre-tool hook 拒绝调用: {error:#}")),
         };
         if let Err(error) = tool.validate_input(&input) {
             return ToolOutput::error(format!("hook 修改后的工具输入校验失败: {error}"));
         }
-        let outside_workspace = match tool
-            .path_fields()
-            .iter()
-            .filter_map(|field| input.get(*field).and_then(Value::as_str))
-            .try_fold(false, |outside, path| {
-                context
-                    .is_outside_workspace(path)
-                    .map(|current| outside || current)
-            }) {
+        let outside_workspace_for = |candidate: &Value| {
+            tool.path_fields()
+                .iter()
+                .filter_map(|field| candidate.get(*field).and_then(Value::as_str))
+                .try_fold(false, |outside, path| {
+                    context
+                        .is_outside_workspace(path)
+                        .map(|current| outside || current)
+                })
+        };
+        let outside_workspace = match outside_workspace_for(&input) {
             Ok(outside) => outside,
             Err(error) => return ToolOutput::error(format!("路径边界检查失败: {error:#}")),
         };
         let summary = tool.summary(&input);
-        if tool.requires_permission() {
-            match context.permissions.decide(
+        let permission_targets =
+            match permission_targets_for(context, tool.as_ref(), &input, &summary) {
+                Ok(targets) => targets,
+                Err(error) => {
+                    return ToolOutput::error(format!("权限目标规范化失败: {error:#}"));
+                }
+            };
+        if tool.requires_permission_for(context, &input) {
+            match hooks
+                .run(
+                    "PermissionRequest",
+                    Some(tool.name()),
+                    json!({
+                        "tool_name":tool.name(),
+                        "tool_input":&input,
+                        "tool_use_id":tool_use_id,
+                        "summary":&summary,
+                    }),
+                    &context.cwd(),
+                )
+                .await
+            {
+                Ok(outcome) => pre_context.extend(outcome.additional_context),
+                Err(error) => {
+                    return ToolOutput::error(format!(
+                        "PermissionRequest hook 拒绝调用: {error:#}"
+                    ));
+                }
+            }
+            match context.permissions.decide_invocation_with_targets(
                 tool.name(),
+                &input,
+                tool_use_id,
                 &summary,
                 tool.read_only(&input),
                 tool.destructive(&input),
                 outside_workspace,
+                &permission_targets,
             ) {
                 Ok(PermissionDecision::Allow) => {}
+                Ok(PermissionDecision::AllowWithUpdatedInput(updated)) => {
+                    if let Err(error) = tool.validate_input(&updated) {
+                        return ToolOutput::error(format!(
+                            "权限响应修改后的工具输入校验失败: {error}"
+                        ));
+                    }
+                    let updated_outside_workspace = match outside_workspace_for(&updated) {
+                        Ok(outside) => outside,
+                        Err(error) => {
+                            return ToolOutput::error(format!(
+                                "权限响应修改后的路径边界检查失败: {error:#}"
+                            ));
+                        }
+                    };
+                    let updated_summary = tool.summary(&updated);
+                    let updated_targets = match permission_targets_for(
+                        context,
+                        tool.as_ref(),
+                        &updated,
+                        &updated_summary,
+                    ) {
+                        Ok(targets) => targets,
+                        Err(error) => {
+                            return ToolOutput::error(format!(
+                                "权限响应修改后的目标规范化失败: {error:#}"
+                            ));
+                        }
+                    };
+                    if !context.permissions.permits_updated_invocation_with_targets(
+                        tool.name(),
+                        &updated_summary,
+                        tool.read_only(&updated),
+                        updated_outside_workspace,
+                        &updated_targets,
+                    ) {
+                        let mut output =
+                            ToolOutput::error("权限响应修改后的工具调用违反 deny 或 plan 规则");
+                        if !pre_context.is_empty() {
+                            output.append_context(
+                                "PermissionRequest hook context",
+                                &pre_context.join("\n"),
+                            );
+                        }
+                        match hooks
+                            .run(
+                                "PermissionDenied",
+                                Some(tool.name()),
+                                json!({
+                                    "tool_name":tool.name(),
+                                    "tool_input":&updated,
+                                    "tool_use_id":tool_use_id,
+                                    "reason":"updated_input_rejected",
+                                }),
+                                &context.cwd(),
+                            )
+                            .await
+                        {
+                            Ok(outcome) if !outcome.additional_context.is_empty() => {
+                                output.append_context(
+                                    "PermissionDenied hook context",
+                                    &outcome.additional_context.join("\n"),
+                                );
+                            }
+                            Err(error) => output.append_context(
+                                "PermissionDenied hook failed",
+                                &format!("{error:#}"),
+                            ),
+                            _ => {}
+                        }
+                        return output;
+                    }
+                    input = updated;
+                }
                 Ok(PermissionDecision::Deny) => {
-                    return ToolOutput::error("用户或权限规则拒绝了此工具调用");
+                    let mut output = ToolOutput::error("用户或权限规则拒绝了此工具调用");
+                    if !pre_context.is_empty() {
+                        output.append_context(
+                            "PermissionRequest hook context",
+                            &pre_context.join("\n"),
+                        );
+                    }
+                    match hooks
+                        .run(
+                            "PermissionDenied",
+                            Some(tool.name()),
+                            json!({
+                                "tool_name":tool.name(),
+                                "tool_input":&input,
+                                "tool_use_id":tool_use_id,
+                                "reason":"denied",
+                            }),
+                            &context.cwd(),
+                        )
+                        .await
+                    {
+                        Ok(outcome) if !outcome.additional_context.is_empty() => {
+                            output.append_context(
+                                "PermissionDenied hook context",
+                                &outcome.additional_context.join("\n"),
+                            );
+                        }
+                        Err(error) => output
+                            .append_context("PermissionDenied hook failed", &format!("{error:#}")),
+                        _ => {}
+                    }
+                    return output;
                 }
                 Ok(PermissionDecision::Interrupt) => return ToolOutput::interrupted(),
                 Err(error) => return ToolOutput::error(format!("权限检查失败: {error:#}")),
+            }
+        }
+        for field in tool.path_fields() {
+            let Some(value) = input.get(*field).and_then(Value::as_str) else {
+                continue;
+            };
+            let target = match context.resolve_path(value) {
+                Ok(target) => target,
+                Err(error) => {
+                    return ToolOutput::error(format!("嵌套指令路径解析失败: {error:#}"));
+                }
+            };
+            if let Err(error) = context.refresh_nested_instructions_for_path(&target).await {
+                return ToolOutput::error(format!("嵌套 AGENTS.md 发现失败: {error:#}"));
             }
         }
         let mut output = match tool.execute(context, input.clone()).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(format!("{error:#}")),
         };
-        if !pre_context.is_empty() {
-            output.content.push_str("\n\n[Pre-tool hook context]\n");
-            output.content.push_str(&pre_context.join("\n"));
+        let inspect_context_change =
+            !output.is_error && !tool.read_only(&input) && !tool.path_fields().is_empty();
+        let _refresh_guard = if inspect_context_change {
+            Some(context.workspace_context_refresh_lock.lock().await)
+        } else {
+            None
+        };
+        let mut hot_refresh_candidate = None;
+        let mut relevant_context_mutation = false;
+        if inspect_context_change {
+            let paths = tool
+                .path_fields()
+                .iter()
+                .filter_map(|field| {
+                    input
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .map(|path| (field, path))
+                })
+                .map(|(field, path)| {
+                    context
+                        .resolve_path(path)
+                        .map(|resolved| ((*field).to_owned(), resolved))
+                })
+                .collect::<Result<Vec<_>>>();
+            match paths {
+                Ok(paths) => {
+                    let hook_paths = paths
+                        .iter()
+                        .map(|(field, path)| {
+                            json!({"field":field, "path":context.display_path(path)})
+                        })
+                        .collect::<Vec<_>>();
+                    if !hook_paths.is_empty() {
+                        match hooks
+                            .run(
+                                "FileChanged",
+                                Some(tool.name()),
+                                json!({"tool_name":tool.name(), "files":hook_paths}),
+                                &context.cwd(),
+                            )
+                            .await
+                        {
+                            Ok(outcome) if !outcome.additional_context.is_empty() => {
+                                output.append_context(
+                                    "FileChanged hook context",
+                                    &outcome.additional_context.join("\n"),
+                                );
+                            }
+                            Err(error) => {
+                                output.is_error = true;
+                                output.append_context(
+                                    "FileChanged hook failed",
+                                    &format!("{error:#}"),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    let changed_paths = paths.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+                    match context.prepare_workspace_hot_refresh(&changed_paths).await {
+                        Ok(Some(candidate)) => {
+                            relevant_context_mutation = true;
+                            if output.is_error {
+                                output.rollback_turn = true;
+                            } else if let Err(error) =
+                                context.run_workspace_hot_refresh_hooks(&candidate).await
+                            {
+                                output.is_error = true;
+                                output.rollback_turn = true;
+                                output.append_context(
+                                    "Workspace context refresh hook failed",
+                                    &format!("{error:#}"),
+                                );
+                            }
+                            hot_refresh_candidate = Some(candidate);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            relevant_context_mutation = true;
+                            output.is_error = true;
+                            output.rollback_turn = true;
+                            output.append_context(
+                                "Workspace context refresh failed",
+                                &format!("{error:#}"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    output = ToolOutput::transaction_error(format!(
+                        "文件已修改，但无法解析 FileChanged 路径并安全刷新上下文: {error:#}"
+                    ));
+                }
+            }
         }
-        hooks
+        if !pre_context.is_empty() {
+            output.append_context("Pre-tool hook context", &pre_context.join("\n"));
+        }
+        let mut output = hooks
             .post_tool(tool.name(), &input, output.bounded(), &context.cwd())
             .await
-            .bounded()
+            .bounded();
+        if relevant_context_mutation && output.is_error {
+            output.rollback_turn = true;
+        }
+        if !output.is_error {
+            if let Some(candidate) = hot_refresh_candidate {
+                context.commit_workspace_hot_refresh(candidate);
+            }
+        }
+        output
     }
 
     pub async fn execute_batch(
@@ -816,6 +4030,34 @@ impl ToolRegistry {
         calls: &[(String, Value)],
         observer: Option<&ToolExecutionObserver>,
     ) -> Vec<ToolOutput> {
+        self.execute_batch_observed_inner(context, calls, None, observer)
+            .await
+    }
+
+    pub async fn execute_batch_observed_with_ids(
+        &self,
+        context: &ToolContext,
+        calls: &[(String, Value)],
+        tool_use_ids: &[String],
+        observer: Option<&ToolExecutionObserver>,
+    ) -> Vec<ToolOutput> {
+        if calls.len() != tool_use_ids.len() {
+            return calls
+                .iter()
+                .map(|_| ToolOutput::error("tool invocation id 数量与调用数量不一致"))
+                .collect();
+        }
+        self.execute_batch_observed_inner(context, calls, Some(tool_use_ids), observer)
+            .await
+    }
+
+    async fn execute_batch_observed_inner(
+        &self,
+        context: &ToolContext,
+        calls: &[(String, Value)],
+        tool_use_ids: Option<&[String]>,
+        observer: Option<&ToolExecutionObserver>,
+    ) -> Vec<ToolOutput> {
         let mut outputs = Vec::with_capacity(calls.len());
         let mut index = 0;
         while index < calls.len() {
@@ -826,14 +4068,20 @@ impl ToolRegistry {
                     observer.started(index);
                 }
                 let started = Instant::now();
-                let output = self.execute(context, name, input.clone()).await;
+                let output = match tool_use_ids.and_then(|ids| ids.get(index)) {
+                    Some(tool_use_id) => {
+                        self.execute_with_id(context, name, input.clone(), tool_use_id)
+                            .await
+                    }
+                    None => self.execute(context, name, input.clone()).await,
+                };
                 if let Some(observer) = observer {
                     observer.finished(index, &output, started.elapsed());
                 }
-                let interrupted = output.interrupted;
+                let stop_batch = output.interrupted || output.rollback_turn;
                 outputs.push(output);
                 index += 1;
-                if interrupted {
+                if stop_batch {
                     break;
                 }
                 continue;
@@ -854,6 +4102,8 @@ impl ToolRegistry {
                         .enumerate()
                         .map(|(offset, (candidate_name, candidate_input))| {
                             let interrupted = Arc::clone(&interrupted);
+                            let tool_use_id =
+                                tool_use_ids.and_then(|ids| ids.get(chunk_start + offset));
                             async move {
                                 let call_index = chunk_start + offset;
                                 if interrupted.load(Ordering::Acquire) {
@@ -863,9 +4113,25 @@ impl ToolRegistry {
                                     observer.started(call_index);
                                 }
                                 let started = Instant::now();
-                                let output = self
-                                    .execute(context, candidate_name, candidate_input.clone())
-                                    .await;
+                                let output = match tool_use_id {
+                                    Some(tool_use_id) => {
+                                        self.execute_with_id(
+                                            context,
+                                            candidate_name,
+                                            candidate_input.clone(),
+                                            tool_use_id,
+                                        )
+                                        .await
+                                    }
+                                    None => {
+                                        self.execute(
+                                            context,
+                                            candidate_name,
+                                            candidate_input.clone(),
+                                        )
+                                        .await
+                                    }
+                                };
                                 if let Some(observer) = observer {
                                     observer.finished(call_index, &output, started.elapsed());
                                 }
@@ -877,7 +4143,10 @@ impl ToolRegistry {
                         });
                 outputs.extend(futures_util::future::join_all(concurrent).await);
                 index += chunk.len();
-                if outputs.iter().any(|output| output.interrupted) {
+                if outputs
+                    .iter()
+                    .any(|output| output.interrupted || output.rollback_turn)
+                {
                     return outputs;
                 }
                 if index >= end {
@@ -998,7 +4267,7 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search deferred tools by keyword, or load exact tools with query `select:name1,name2`. Load all tools needed for a task in one call."
+        "Refresh and search deferred tools by keyword, or load exact tools with query `select:name1,name2`. Load all tools needed for a task in one call."
     }
 
     fn input_schema(&self) -> Value {
@@ -1219,6 +4488,66 @@ pub(crate) fn workspace_key(path: &Path) -> String {
     format!("{hash:032x}")
 }
 
+fn validate_persisted_relative_cwd(relative: &Path) -> Result<()> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("persisted current cwd 必须是无 parent 逃逸的相对路径")
+    }
+    Ok(())
+}
+
+fn canonicalize_restored_cwd(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let root_metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("persisted current root 已缺失: {}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("persisted current root 不再是可信实体目录")
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("persisted current root 无法解析: {}", root.display()))?;
+    if canonical_root != root {
+        bail!("persisted current root 已被替换或重定向")
+    }
+
+    let mut candidate = root.to_owned();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(value) => candidate.push(value),
+            _ => bail!("persisted current cwd 包含不安全路径组件"),
+        }
+        let metadata = std::fs::symlink_metadata(&candidate)
+            .with_context(|| format!("persisted current cwd 已缺失: {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "persisted current cwd 拒绝 symlink: {}",
+                candidate.display()
+            )
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "persisted current cwd 组件不是目录: {}",
+                candidate.display()
+            )
+        }
+    }
+
+    let canonical = std::fs::canonicalize(&candidate)
+        .with_context(|| format!("persisted current cwd 无法解析: {}", candidate.display()))?;
+    if !canonical.is_dir() || !canonical.starts_with(root) {
+        bail!("persisted current cwd 已移出 trusted root")
+    }
+    Ok(canonical)
+}
+
 fn canonicalize_for_scope(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return std::fs::canonicalize(path).context("canonicalize 失败");
@@ -1229,6 +4558,129 @@ fn canonicalize_for_scope(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().context("路径没有可解析的父目录")?;
     let name = path.file_name().context("路径没有文件名")?;
     Ok(canonicalize_for_scope(parent)?.join(name))
+}
+
+fn permission_targets_for(
+    context: &ToolContext,
+    tool: &dyn Tool,
+    input: &Value,
+    summary: &str,
+) -> Result<Vec<PermissionTarget>> {
+    if tool.name() == "Monitor" {
+        if let Some(command) = input.get("command").and_then(Value::as_str) {
+            return Ok(vec![PermissionTarget::new(
+                "Bash",
+                vec![command.to_owned()],
+            )]);
+        }
+        if let Some(ws) = input.get("ws").and_then(Value::as_str) {
+            return Ok(vec![PermissionTarget::new("Monitor", vec![ws.to_owned()])]);
+        }
+    }
+    let mut targets = Vec::new();
+    let mut path_groups = Vec::new();
+    for field in tool.path_fields() {
+        if let Some(path) = input.get(*field).and_then(Value::as_str) {
+            path_groups.push(context.permission_path_candidates(path)?);
+        }
+    }
+    if matches!(tool.name(), "Glob" | "Grep") {
+        targets.push(PermissionTarget::new(tool.name(), vec![summary.to_owned()]));
+        if path_groups.is_empty() {
+            path_groups.push(context.permission_path_candidates_for_resolved(&context.cwd())?);
+        }
+        for candidates in path_groups {
+            targets.push(PermissionTarget::new("Read", candidates));
+        }
+    } else if path_groups.is_empty() {
+        targets.push(PermissionTarget::new(tool.name(), vec![summary.to_owned()]));
+    } else {
+        for candidates in path_groups {
+            targets.push(PermissionTarget::new(tool.name(), candidates));
+        }
+    }
+    Ok(targets)
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn push_permission_path_candidate(candidates: &mut Vec<String>, path: &Path) {
+    let rendered = normalize_path_for_display(path.to_string_lossy().into_owned());
+    if !candidates.contains(&rendered) {
+        candidates.push(rendered);
+    }
+}
+
+fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
+    let normalized = value.replace('\\', "/");
+    let namespace = normalized.to_ascii_lowercase();
+    if normalized.starts_with("//")
+        || matches!(
+            namespace.as_str(),
+            "/??" | "/device" | "/dosdevices" | "/global??"
+        )
+        || namespace.starts_with("/??/")
+        || namespace.starts_with("/device/")
+        || namespace.starts_with("/dosdevices/")
+        || namespace.starts_with("/global??/")
+    {
+        bail!("拒绝 UNC 或 Windows device namespace 路径")
+    }
+    #[cfg(windows)]
+    {
+        let without_drive = normalized
+            .get(2..)
+            .filter(|_| normalized.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or(&normalized);
+        if without_drive.contains(':') {
+            bail!("拒绝 NTFS alternate data stream 路径")
+        }
+        for component in normalized.split('/') {
+            if component.ends_with(['.', ' '])
+                || (component.len() >= 3 && component.chars().all(|ch| ch == '.'))
+            {
+                bail!("拒绝 Windows 可疑路径规范化形式")
+            }
+            let component = component.trim_end_matches(['.', ' ']);
+            let stem = component
+                .split_once('.')
+                .map_or(component, |(stem, _)| stem)
+                .to_ascii_uppercase();
+            if matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+            ) || stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|number| {
+                    number.len() == 1
+                        && number
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|digit| matches!(digit, b'1'..=b'9'))
+                })
+            {
+                bail!("拒绝 Windows 保留设备路径")
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T> {
@@ -1259,6 +4711,35 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
         file.flush()?;
         if let Ok(metadata) = std::fs::metadata(path) {
             let _ = file.set_permissions(metadata.permissions());
+        }
+        std::fs::rename(&temp, path).with_context(|| format!("无法原子替换 {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn atomic_write_bytes(
+    path: &Path,
+    content: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
+    let parent = path.parent().context("目标文件没有父目录")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("无法创建目录 {}", parent.display()))?;
+    let temp = parent.join(format!(".open-agent-harness-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("无法创建临时文件 {}", temp.display()))?;
+        file.write_all(content)?;
+        file.flush()?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
         }
         std::fs::rename(&temp, path).with_context(|| format!("无法原子替换 {}", path.display()))?;
         Ok(())
@@ -1328,46 +4809,178 @@ pub(crate) fn atomic_write_private(path: &Path, content: &str) -> Result<()> {
 }
 
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
+    if let Some(home) = dirs::home_dir() {
+        let harness_root = home.join(".open-agent-harness");
+        if path.starts_with(&harness_root) {
+            return ensure_private_managed_directory(&harness_root, path);
+        }
+    }
+    // Explicit trusted storage overrides (primarily tests/embedding) retain
+    // ordinary create_dir_all semantics. The default harness tree above is the
+    // security boundary and is created one non-symlink component at a time.
     std::fs::create_dir_all(path)?;
+    set_private_directory_permissions(path)?;
+    Ok(())
+}
+
+fn ensure_private_managed_directory(managed_root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(managed_root)
+        .context("私有目录不在 managed root 内")?;
+    ensure_private_directory_component(managed_root)?;
+    let mut current = managed_root.to_owned();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            _ => bail!("私有目录包含非法路径组件"),
+        }
+        ensure_private_directory_component(&current)?;
+    }
+    Ok(())
+}
+
+fn ensure_private_directory_component(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("私有目录组件不能是 symlink: {}", path.display())
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("私有目录组件不是目录: {}", path.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path)
+                .with_context(|| format!("无法创建私有目录组件 {}", path.display()))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    set_private_directory_permissions(path)
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if let Some(home) = dirs::home_dir() {
-            let harness_root = home.join(".open-agent-harness");
-            if path.starts_with(&harness_root) {
-                let mut current = harness_root.clone();
-                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700))?;
-                if let Ok(relative) = path.strip_prefix(&harness_root) {
-                    for component in relative.components() {
-                        current.push(component);
-                        if current.is_dir() {
-                            std::fs::set_permissions(
-                                &current,
-                                std::fs::Permissions::from_mode(0o700),
-                            )?;
-                        }
-                    }
-                }
-                return Ok(());
-            }
-        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeSet, time::Duration};
 
     use tokio::{sync::Barrier, time::timeout};
 
     use super::*;
-    use crate::permissions::PermissionMode;
+    use crate::permissions::{PermissionDecision, PermissionMode};
+
+    #[test]
+    fn windows_native_namespace_strings_are_rejected_before_path_conversion() {
+        for path in [
+            r"\??\C:\secret.txt",
+            r"\Device\Mup\server\share\secret.txt",
+            r"\DosDevices\C:\secret.txt",
+            r"\GLOBAL??\C:\secret.txt",
+            r"\device\harddiskvolume1\secret.txt",
+        ] {
+            let error = reject_windows_network_or_device_path(path)
+                .expect_err("native namespace path must be rejected on every host platform");
+            assert!(error.to_string().contains("device namespace"), "{path}");
+        }
+        for path in [r"C:\Users\user\file.txt", "C:/Users/user/file.txt"] {
+            assert!(
+                reject_windows_network_or_device_path(path).is_ok(),
+                "ordinary drive path was rejected: {path}"
+            );
+        }
+    }
 
     struct BarrierTool {
         barrier: Arc<Barrier>,
+    }
+
+    struct NamedReadTool(&'static str);
+
+    struct DeletePathTool;
+
+    #[async_trait]
+    impl Tool for NamedReadTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "Test-only named deferred read"
+        }
+
+        fn input_schema(&self) -> Value {
+            object_schema(json!({}), &[])
+        }
+
+        fn read_only(&self, _: &Value) -> bool {
+            true
+        }
+
+        fn summary(&self, _: &Value) -> String {
+            self.0.to_owned()
+        }
+
+        async fn execute(&self, _: &ToolContext, _: Value) -> Result<ToolOutput> {
+            Ok(ToolOutput::success("done"))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DeletePathTool {
+        fn name(&self) -> &str {
+            "DeletePathForTest"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only path-aware file deletion"
+        }
+
+        fn input_schema(&self) -> Value {
+            object_schema(
+                json!({"file_path":{"type":"string","maxLength":4096}}),
+                &["file_path"],
+            )
+        }
+
+        fn read_only(&self, _: &Value) -> bool {
+            false
+        }
+
+        fn destructive(&self, _: &Value) -> bool {
+            true
+        }
+
+        fn path_fields(&self) -> &'static [&'static str] {
+            &["file_path"]
+        }
+
+        fn summary(&self, input: &Value) -> String {
+            input["file_path"].as_str().unwrap_or_default().to_owned()
+        }
+
+        async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+            let path = context.resolve_path(
+                input["file_path"]
+                    .as_str()
+                    .context("test delete 缺少 file_path")?,
+            )?;
+            context.track_before_edit(&path)?;
+            std::fs::remove_file(&path)?;
+            Ok(ToolOutput::success(format!(
+                "Deleted {}",
+                context.display_path(&path)
+            )))
+        }
     }
 
     #[async_trait]
@@ -1444,6 +5057,266 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn permission_updates_use_the_original_id_and_recheck_deny_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PermissionManager::new(
+            PermissionMode::Default,
+            false,
+            Vec::new(),
+            vec!["Write(denied.txt)".to_owned()],
+        );
+        manager.set_prompt_handler(Some(Arc::new(|request| {
+            assert_eq!(request.tool, "Write");
+            assert_eq!(request.tool_use_id, "call-1");
+            assert_eq!(request.input["file_path"], "original.txt");
+            Ok(PermissionDecision::AllowWithUpdatedInput(json!({
+                "file_path":"updated.txt", "content":"updated"
+            })))
+        })));
+        let context = ToolContext::new(temp.path().to_owned(), manager);
+        let registry = ToolRegistry::default();
+        let calls = vec![(
+            "Write".to_owned(),
+            json!({"file_path":"original.txt", "content":"original"}),
+        )];
+        let outputs = registry
+            .execute_batch_observed_with_ids(&context, &calls, &["call-1".to_owned()], None)
+            .await;
+        assert!(!outputs[0].is_error, "{}", outputs[0].content);
+        assert!(!temp.path().join("original.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("updated.txt")).unwrap(),
+            "updated"
+        );
+
+        context.permissions.set_prompt_handler(Some(Arc::new(|_| {
+            Ok(PermissionDecision::AllowWithUpdatedInput(json!({
+                "file_path":"denied.txt", "content":"blocked"
+            })))
+        })));
+        let denied = registry
+            .execute_batch_observed_with_ids(&context, &calls, &["call-2".to_owned()], None)
+            .await;
+        assert!(denied[0].is_error);
+        assert!(!temp.path().join("denied.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_and_file_change_hooks_run_at_real_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks = Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{
+                    "PermissionRequest":[{"matcher":"Write", "hooks":[{
+                        "type":"command",
+                        "command":"printf '%s' '{\"additionalContext\":\"permission-request-seen\"}'"
+                    }]}],
+                    "PermissionDenied":[{"matcher":"Write", "hooks":[{
+                        "type":"command",
+                        "command":"printf '%s' '{\"additionalContext\":\"permission-denied-seen\"}'"
+                    }]}],
+                    "FileChanged":[{"matcher":"Write", "hooks":[{
+                        "type":"command",
+                        "command":"printf '%s' '{\"additionalContext\":\"file-change-seen\"}'"
+                    }]}]
+                }}),
+            })
+            .unwrap(),
+        );
+        let mut denied_context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::Default,
+                false,
+                Vec::new(),
+                vec!["Write(blocked.txt)".to_owned()],
+            ),
+        );
+        denied_context.set_hooks(Arc::clone(&hooks));
+        let registry = ToolRegistry::default();
+        let denied = registry
+            .execute(
+                &denied_context,
+                "Write",
+                json!({"file_path":"blocked.txt", "content":"blocked"}),
+            )
+            .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("permission-request-seen"));
+        assert!(denied.content.contains("permission-denied-seen"));
+        assert!(!temp.path().join("blocked.txt").exists());
+
+        let mut allowed_context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        allowed_context.set_hooks(hooks);
+        let changed = registry
+            .execute(
+                &allowed_context,
+                "Write",
+                json!({"file_path":"changed.txt", "content":"changed"}),
+            )
+            .await;
+        assert!(!changed.is_error, "{}", changed.content);
+        assert!(changed.content.contains("file-change-seen"));
+    }
+
+    #[tokio::test]
+    async fn team_mailbox_notification_is_once_restorable_and_non_consuming() {
+        use crate::agents::team::{MemberSpec, TeamLimits, TeamService};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let service = TeamService::create_in(
+            workspace.path(),
+            storage.path(),
+            "notification-team",
+            "coordinator",
+            TeamLimits::default(),
+        )
+        .unwrap();
+        let coordinator = service.coordinator_id();
+        let member = service
+            .add_member(
+                coordinator,
+                MemberSpec {
+                    name: "worker".to_owned(),
+                    custom_agent: None,
+                    depth: 1,
+                    requested_policy: AgentToolPolicy::default(),
+                },
+                &AgentToolPolicy::default(),
+            )
+            .unwrap();
+        let assignment = service.assign(coordinator, member.id, "audit").unwrap();
+        assert_eq!(assignment.member.id, member.id);
+        service
+            .mark_running(coordinator, member.id, uuid::Uuid::new_v4())
+            .unwrap();
+
+        let context = ToolContext::new(
+            workspace.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.track_team_mailbox(service.clone(), coordinator);
+        let checkpoint = context.team_notification_checkpoint();
+        service
+            .finish(coordinator, member.id, true, "team-result")
+            .unwrap();
+
+        let first = context.drain_background_notifications().await;
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("team-result"));
+        assert!(context.drain_background_notifications().await.is_empty());
+        let still_readable = service
+            .read_mailbox(coordinator, coordinator, 0, 16)
+            .unwrap();
+        assert_eq!(still_readable.len(), 1);
+
+        context.restore_team_notification_checkpoint(&checkpoint);
+        let retried = context.drain_background_notifications().await;
+        assert_eq!(retried.len(), 1);
+        assert!(retried[0].contains("team-result"));
+    }
+
+    #[tokio::test]
+    async fn failed_turn_removes_consumed_preexisting_bash_capture_only_when_cleanup_was_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let armed = temp.path().join("armed-capture.log");
+        let retained = temp.path().join("retained-capture.log");
+        std::fs::write(&armed, "discard after rollback").unwrap();
+        std::fs::write(&retained, "explicitly retained before turn").unwrap();
+        let mut checkpoint = context.background_notification_checkpoint().await;
+        checkpoint.bash_tasks.insert(
+            "consumed-armed".to_owned(),
+            BashTaskCheckpoint {
+                notification_delivered: false,
+                output_path: armed.clone(),
+                output_cleanup_armed: true,
+            },
+        );
+        checkpoint.bash_tasks.insert(
+            "consumed-retained".to_owned(),
+            BashTaskCheckpoint {
+                notification_delivered: false,
+                output_path: retained.clone(),
+                output_cleanup_armed: false,
+            },
+        );
+
+        context
+            .restore_background_notification_checkpoint(&checkpoint)
+            .await;
+        assert!(!armed.exists());
+        assert!(retained.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instructions_loaded_hook_runs_only_for_newly_discovered_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AGENTS.md"), "workspace rule").unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let hooks = crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+            raw: json!({"hooks":{"InstructionsLoaded":[{"matcher":"*", "hooks":[{
+                "type":"command", "command":"true"
+            }]}]}}),
+        })
+        .unwrap()
+        .with_observer(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event.clone());
+        })));
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_hooks(Arc::new(hooks));
+        context.reload_workspace_context().await.unwrap();
+        context.reload_workspace_context().await.unwrap();
+
+        let starts = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::hooks::HookExecutionEvent::HookStarted { event, .. }
+                        if event == "InstructionsLoaded"
+                )
+            })
+            .count();
+        assert_eq!(starts, 1);
+    }
+
     #[test]
     fn tool_results_have_a_global_size_ceiling() {
         let output = ToolOutput::success("x".repeat(MAX_TOOL_RESULT_BYTES + 1024)).bounded();
@@ -1497,10 +5370,304 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_context_file_writes_hot_refresh_instructions_and_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".open-agent-harness/skills/hot/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(temp.path().join("AGENTS.md"), "agent-rule-before-refresh").unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: hot\ndescription: skill-before-refresh\n---\nold workflow",
+        )
+        .unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        let registry = ToolRegistry::default();
+
+        let read_agents = registry
+            .execute(
+                &context,
+                "Read",
+                json!({"file_path":temp.path().join("AGENTS.md")}),
+            )
+            .await;
+        assert!(!read_agents.is_error, "{}", read_agents.content);
+        let write_agents = registry
+            .execute(
+                &context,
+                "Write",
+                json!({
+                    "file_path":temp.path().join("AGENTS.md"),
+                    "content":"agent-rule-after-refresh"
+                }),
+            )
+            .await;
+        assert!(!write_agents.is_error, "{}", write_agents.content);
+        assert!(!write_agents.rollback_turn);
+        let refreshed_agents = context.workspace_system_context();
+        assert!(refreshed_agents.contains("agent-rule-after-refresh"));
+        assert!(!refreshed_agents.contains("agent-rule-before-refresh"));
+
+        let read_skill = registry
+            .execute(&context, "Read", json!({"file_path":&skill}))
+            .await;
+        assert!(!read_skill.is_error, "{}", read_skill.content);
+        let write_skill = registry
+            .execute(
+                &context,
+                "Write",
+                json!({
+                    "file_path":&skill,
+                    "content":"---\nname: hot\ndescription: skill-after-refresh\n---\nnew workflow"
+                }),
+            )
+            .await;
+        assert!(!write_skill.is_error, "{}", write_skill.content);
+        assert!(!write_skill.rollback_turn);
+        assert_eq!(
+            context.skill("hot").unwrap().description,
+            "skill-after-refresh"
+        );
+        let refreshed_skills = context.workspace_system_context();
+        assert!(refreshed_skills.contains("skill-after-refresh"));
+        assert!(!refreshed_skills.contains("skill-before-refresh"));
+    }
+
+    #[tokio::test]
+    async fn transient_context_transaction_rolls_back_existing_and_new_files_across_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(additional.join(".open-agent-harness/skills/new")).unwrap();
+        let agents = launch.join("AGENTS.md");
+        let skill = additional.join(".open-agent-harness/skills/new/SKILL.md");
+        std::fs::write(&agents, "original-agent-rule").unwrap();
+        let context = ToolContext::new(
+            launch.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .switch_workspace(additional.clone(), additional)
+            .await
+            .unwrap();
+        assert!(context.begin_hot_refresh_file_transaction().unwrap());
+
+        context.track_before_edit(&agents).unwrap();
+        context
+            .expect_after_edit(&agents, b"changed-agent-rule")
+            .unwrap();
+        atomic_write(&agents, "changed-agent-rule").unwrap();
+        context.track_before_edit(&skill).unwrap();
+        context
+            .expect_after_edit(&skill, b"---\nname: new\ndescription: new\n---\nbody")
+            .unwrap();
+        atomic_write(&skill, "---\nname: new\ndescription: new\n---\nbody").unwrap();
+
+        context
+            .rollback_hot_refresh_file_transaction()
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "original-agent-rule"
+        );
+        assert!(!skill.exists());
+    }
+
+    #[tokio::test]
+    async fn parent_context_transaction_cannot_write_child_owned_path_and_absorbs_child_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        std::fs::write(&agents, "original-rule").unwrap();
+        let parent = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert!(parent.begin_hot_refresh_file_transaction().unwrap());
+        parent.track_before_edit(&agents).unwrap();
+        parent.expect_after_edit(&agents, b"parent-rule").unwrap();
+        atomic_write(&agents, "parent-rule").unwrap();
+
+        let child = parent.fork_for_agent();
+        assert!(child.begin_hot_refresh_file_transaction().unwrap());
+        child.track_before_edit(&agents).unwrap();
+        child.expect_after_edit(&agents, b"child-rule").unwrap();
+        atomic_write(&agents, "child-rule").unwrap();
+
+        let error = parent.track_before_edit(&agents).unwrap_err();
+        assert!(error.to_string().contains("活跃子事务"));
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "child-rule");
+
+        child.finish_hot_refresh_file_transaction().unwrap();
+        parent
+            .rollback_hot_refresh_file_transaction()
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "original-rule");
+    }
+
+    #[tokio::test]
+    async fn path_aware_deletes_remove_stale_instructions_and_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        let skill = temp
+            .path()
+            .join(".open-agent-harness/skills/removable/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&agents, "agent-rule-to-delete").unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: removable\ndescription: skill-to-delete\n---\nworkflow",
+        )
+        .unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        let registry =
+            ToolRegistry::with_extensions(vec![Arc::new(DeletePathTool)], Vec::new()).unwrap();
+
+        let delete_agents = registry
+            .execute(&context, "DeletePathForTest", json!({"file_path":&agents}))
+            .await;
+        assert!(!delete_agents.is_error, "{}", delete_agents.content);
+        assert!(
+            !context
+                .workspace_system_context()
+                .contains("agent-rule-to-delete")
+        );
+
+        let delete_skill = registry
+            .execute(&context, "DeletePathForTest", json!({"file_path":&skill}))
+            .await;
+        assert!(!delete_skill.is_error, "{}", delete_skill.content);
+        assert!(context.skill("removable").is_none());
+        assert!(
+            !context
+                .workspace_system_context()
+                .contains("skill-to-delete")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_refresh_hook_failure_is_transaction_fatal_and_context_is_restorable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        std::fs::write(&agents, "hook-rule-before-refresh").unwrap();
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        context.set_file_history(
+            FileHistory::create_in(temp.path(), uuid::Uuid::new_v4(), storage.path(), true)
+                .unwrap(),
+        );
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"InstructionsLoaded":[{"matcher":"*","hooks":[{
+                    "type":"command", "command":"false"
+                }]}]}}),
+            })
+            .unwrap(),
+        ));
+        let memory_checkpoint = context.workspace_context_checkpoint();
+        let file_checkpoint = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 0)
+            .unwrap()
+            .unwrap();
+        let registry = ToolRegistry::default();
+        let read = registry
+            .execute(&context, "Read", json!({"file_path":&agents}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let write = registry
+            .execute(
+                &context,
+                "Write",
+                json!({
+                    "file_path":&agents,
+                    "content":"hook-rule-after-refresh"
+                }),
+            )
+            .await;
+        assert!(write.is_error);
+        assert!(write.rollback_turn);
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "hook-rule-after-refresh"
+        );
+        assert!(
+            context
+                .workspace_system_context()
+                .contains("hook-rule-before-refresh")
+        );
+        assert!(
+            !context
+                .workspace_system_context()
+                .contains("hook-rule-after-refresh")
+        );
+
+        context
+            .rollback_file_checkpoint(file_checkpoint.id, 0)
+            .unwrap();
+        context.finish_file_checkpoint(file_checkpoint.id).unwrap();
+        context.restore_workspace_context_checkpoint(&memory_checkpoint);
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "hook-rule-before-refresh"
+        );
+        assert!(
+            context
+                .workspace_system_context()
+                .contains("hook-rule-before-refresh")
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_relocation_refreshes_instructions_and_skills() {
         let temp = tempfile::tempdir().unwrap();
         let launch = temp.path().join("launch");
         let current = temp.path().join("current");
+        let extension_root = temp.path().join("extension-skills");
+        std::fs::create_dir_all(extension_root.join("persistent")).unwrap();
+        std::fs::write(
+            extension_root.join("persistent/SKILL.md"),
+            "---\nname: persistent\ndescription: extension\n---\nextension workflow",
+        )
+        .unwrap();
         for (root, marker) in [(&launch, "launch-rule"), (&current, "current-rule")] {
             std::fs::create_dir_all(root.join(".open-agent-harness/skills/demo")).unwrap();
             std::fs::write(root.join("AGENTS.md"), marker).unwrap();
@@ -1524,6 +5691,9 @@ mod tests {
                 Vec::new(),
             ),
         );
+        context.set_extension_skills(
+            crate::skills::discover_skill_root(&extension_root, temp.path()).unwrap(),
+        );
         context.reload_workspace_context().await.unwrap();
         let launch_task_store = context.task_store_path();
         assert_eq!(
@@ -1535,6 +5705,10 @@ mod tests {
         );
         assert!(context.workspace_system_context().contains("launch-rule"));
         assert_eq!(context.skill("demo").unwrap().description, "launch-rule");
+        assert_eq!(
+            context.skill("persistent").unwrap().description,
+            "extension"
+        );
 
         context
             .switch_workspace(current.clone(), current.clone())
@@ -1554,6 +5728,10 @@ mod tests {
         assert!(moved.contains("current-rule"));
         assert!(moved.contains("take precedence"));
         assert_eq!(context.skill("demo").unwrap().description, "current-rule");
+        assert_eq!(
+            context.skill("persistent").unwrap().description,
+            "extension"
+        );
 
         context
             .switch_workspace(launch.clone(), launch)
@@ -1576,16 +5754,813 @@ mod tests {
         assert_eq!(context.skill("demo").unwrap().description, "launch-rule");
     }
 
+    #[tokio::test]
+    async fn forked_context_keeps_workspace_deny_roots_and_recorders_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_root = temp.path().join("parent");
+        let child_root = temp.path().join("child");
+        let child_explicit_root = temp.path().join("child-explicit");
+        for (root, deny) in [(&parent_root, "ParentOnly"), (&child_root, "ChildOnly")] {
+            std::fs::create_dir_all(root.join(".open-agent-harness")).unwrap();
+            std::fs::write(root.join("AGENTS.md"), format!("{deny} instructions")).unwrap();
+            std::fs::write(
+                root.join(".open-agent-harness/settings.json"),
+                format!(r#"{{"permissions":{{"deny":["{deny}"]}}}}"#),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(&child_explicit_root).unwrap();
+        std::fs::write(
+            child_explicit_root.join("AGENTS.md"),
+            "child-explicit-only instructions",
+        )
+        .unwrap();
+        let parent = ToolContext::new(
+            parent_root.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        parent.reload_workspace_context().await.unwrap();
+        let parent_checkpoint = parent.workspace_context_checkpoint();
+        let recorder_calls = Arc::new(AtomicUsize::new(0));
+        for current_cwd in [false, true] {
+            let calls = Arc::clone(&recorder_calls);
+            let recorder: WorkspaceStateRecorder = Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            if current_cwd {
+                parent.set_current_cwd_state_recorder(Some(recorder));
+            } else {
+                parent.set_workspace_state_recorder(Some(recorder));
+            }
+        }
+
+        let child = parent.fork_for_agent();
+        child
+            .switch_workspace(child_root.clone(), child_root.clone())
+            .await
+            .unwrap();
+        child
+            .add_trusted_roots(std::slice::from_ref(&child_explicit_root))
+            .unwrap();
+        child.reload_workspace_context().await.unwrap();
+        parent.reload_workspace_context().await.unwrap();
+        child.record_workspace_transition().unwrap();
+        child.record_current_cwd_transition().unwrap();
+        let registry = ToolRegistry::default();
+        let child_agents = child_root.join("AGENTS.md");
+        let read = registry
+            .execute(&child, "Read", json!({"file_path":&child_agents}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let write = registry
+            .execute(
+                &child,
+                "Write",
+                json!({"file_path":&child_agents,"content":"ChildOnly refreshed instructions"}),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.content);
+
+        assert_eq!(recorder_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            parent.trusted_roots(),
+            vec![parent_root.canonicalize().unwrap()]
+        );
+        assert!(
+            child
+                .trusted_roots()
+                .contains(&child_root.canonicalize().unwrap())
+        );
+        assert!(
+            child
+                .workspace_system_context()
+                .contains("child-explicit-only")
+        );
+        assert!(
+            !parent
+                .workspace_system_context()
+                .contains("child-explicit-only")
+        );
+        assert_eq!(
+            parent
+                .permissions
+                .decide("ParentOnly", "", false, false, false)
+                .unwrap(),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            parent
+                .permissions
+                .decide("ChildOnly", "", false, false, false)
+                .unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            child
+                .permissions
+                .decide("ChildOnly", "", false, false, false)
+                .unwrap(),
+            PermissionDecision::Deny
+        );
+
+        let (child_ready_tx, child_ready_rx) = tokio::sync::oneshot::channel();
+        let (parent_restored_tx, parent_restored_rx) = tokio::sync::oneshot::channel();
+        let child_observer = child.clone();
+        let observation = tokio::spawn(async move {
+            child_ready_tx.send(()).unwrap();
+            parent_restored_rx.await.unwrap();
+            child_observer
+                .permissions
+                .decide("ChildOnly", "", false, false, false)
+                .unwrap()
+        });
+        child_ready_rx.await.unwrap();
+        parent.restore_workspace_context_checkpoint(&parent_checkpoint);
+        parent_restored_tx.send(()).unwrap();
+        assert_eq!(
+            observation.await.unwrap(),
+            PermissionDecision::Deny,
+            "parent rollback must not replace the child's workspace deny rules"
+        );
+        parent
+            .permissions
+            .set_session_mode(PermissionMode::DontAsk)
+            .unwrap();
+        assert_eq!(child.permissions.effective_mode(), PermissionMode::DontAsk);
+    }
+
+    #[tokio::test]
+    async fn foreground_and_background_forks_refresh_parent_context_before_next_round() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        let skill = temp
+            .path()
+            .join(".open-agent-harness/skills/shared/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&agents, "foreground-before").unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: shared\ndescription: background-before\n---\nold workflow",
+        )
+        .unwrap();
+        let parent = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        parent.reload_workspace_context().await.unwrap();
+        let registry = ToolRegistry::default();
+
+        let foreground = parent.fork_for_agent();
+        let read = registry
+            .execute(&foreground, "Read", json!({"file_path":&agents}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let write = registry
+            .execute(
+                &foreground,
+                "Write",
+                json!({"file_path":&agents,"content":"foreground-after"}),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.content);
+        assert!(
+            parent
+                .workspace_system_context()
+                .contains("foreground-before")
+        );
+        assert!(!parent.refresh_workspace_context_if_stale().await.unwrap());
+        foreground.commit_workspace_context_changes_to_parent();
+        assert!(parent.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(
+            parent
+                .workspace_system_context()
+                .contains("foreground-after")
+        );
+
+        let background = parent.fork_for_agent();
+        let background_registry = registry.clone();
+        let background_skill = skill.clone();
+        let completion = tokio::spawn(async move {
+            let read = background_registry
+                .execute(
+                    &background,
+                    "Read",
+                    json!({"file_path":&background_skill}),
+                )
+                .await;
+            assert!(!read.is_error, "{}", read.content);
+            let output = background_registry
+                .execute(
+                    &background,
+                    "Write",
+                    json!({
+                        "file_path":&background_skill,
+                        "content":"---\nname: shared\ndescription: background-after\n---\nnew workflow"
+                    }),
+                )
+                .await;
+            if !output.is_error {
+                background.commit_workspace_context_changes_to_parent();
+            }
+            output
+        })
+        .await
+        .unwrap();
+        assert!(!completion.is_error, "{}", completion.content);
+        assert_eq!(
+            parent.skill("shared").unwrap().description,
+            "background-before"
+        );
+        assert!(parent.refresh_workspace_context_if_stale().await.unwrap());
+        assert_eq!(
+            parent.skill("shared").unwrap().description,
+            "background-after"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_additional_root_is_scoped_and_loads_nested_agents_on_first_touch() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        let nested = additional.join("crates/core");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(launch.join("AGENTS.md"), "launch-only").unwrap();
+        std::fs::write(additional.join("AGENTS.md"), "additional-root").unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "core-only").unwrap();
+        std::fs::write(nested.join("lib.rs"), "fn demo() {}\n").unwrap();
+
+        let context = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert_eq!(
+            context
+                .add_trusted_roots(std::slice::from_ref(&additional))
+                .unwrap(),
+            [std::fs::canonicalize(&additional).unwrap()]
+        );
+        context.reload_workspace_context().await.unwrap();
+        let initial = context.workspace_system_context();
+        assert!(initial.contains("launch-only"));
+        assert!(initial.contains("additional-root"));
+        assert!(!initial.contains("core-only"));
+        assert!(
+            !context
+                .is_outside_workspace(additional.to_str().unwrap())
+                .unwrap()
+        );
+
+        let read = ToolRegistry::default()
+            .execute(
+                &context,
+                "Read",
+                json!({"file_path":nested.join("lib.rs").display().to_string()}),
+            )
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let refreshed = context.workspace_system_context();
+        assert!(refreshed.contains("core-only"));
+        assert!(refreshed.contains("scope=\"crates/core/**\""));
+        assert_eq!(refreshed.matches("core-only").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bare_mode_honors_an_explicit_add_dir_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let explicit = launch.join("explicit");
+        std::fs::create_dir_all(&explicit).unwrap();
+        std::fs::write(launch.join("AGENTS.md"), "automatic-root").unwrap();
+        std::fs::write(explicit.join("AGENTS.md"), "explicit-root").unwrap();
+        let mut context = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_bare(true);
+        assert!(
+            context
+                .add_trusted_roots(std::slice::from_ref(&explicit))
+                .unwrap()
+                .is_empty()
+        );
+        context.reload_workspace_context().await.unwrap();
+        let rendered = context.workspace_system_context();
+        assert!(!rendered.contains("automatic-root"));
+        assert!(rendered.contains("explicit-root"));
+        assert!(rendered.contains("scope=\"explicit/**\""));
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn public_tool_surface_contains_the_documented_fifteen_tools() {
+    fn trusted_roots_still_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        let outside = temp.path().join("outside");
+        for directory in [&launch, &additional, &outside] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        symlink(&outside, additional.join("escape")).unwrap();
+        let context = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        assert!(
+            context
+                .is_outside_workspace(additional.join("escape/file").to_str().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_add_dir_cwd_restores_and_refreshes_nested_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        let nested = additional.join("nested/deep");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(additional.join("AGENTS.md"), "additional-root-rule").unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "resumed-nested-rule").unwrap();
+        let context = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        let root = std::fs::canonicalize(&additional).unwrap();
+        context
+            .restore_persisted_cwd(&workspace_key(&root), Path::new("nested/deep"))
+            .await
+            .unwrap();
+        context.reload_workspace_context().await.unwrap();
+
+        assert_eq!(context.workspace_root(), root);
+        assert_eq!(context.cwd(), std::fs::canonicalize(&nested).unwrap());
+        let rendered = context.workspace_system_context();
+        assert!(rendered.contains("additional-root-rule"));
+        assert!(rendered.contains("resumed-nested-rule"));
+    }
+
+    #[tokio::test]
+    async fn persisted_cwd_rejects_deleted_or_untrusted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        let nested = additional.join("nested");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = std::fs::canonicalize(&additional).unwrap();
+        let key = workspace_key(&root);
+
+        let untrusted = ToolContext::new(
+            launch.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert!(
+            untrusted
+                .restore_persisted_cwd(&key, Path::new("nested"))
+                .await
+                .is_err()
+        );
+
+        let trusted = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        trusted
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        std::fs::remove_dir(&nested).unwrap();
+        assert!(
+            trusted
+                .restore_persisted_cwd(&key, Path::new("nested"))
+                .await
+                .is_err()
+        );
+        assert!(
+            trusted
+                .restore_persisted_cwd(&key, Path::new("../outside"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_cwd_rejects_a_path_replaced_by_outside_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        let nested = additional.join("nested");
+        let outside = temp.path().join("outside");
+        for directory in [&launch, &nested, &outside] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let context = ToolContext::new(
+            launch,
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        let root = std::fs::canonicalize(&additional).unwrap();
+        std::fs::remove_dir(&nested).unwrap();
+        symlink(&outside, &nested).unwrap();
+        assert!(
+            context
+                .restore_persisted_cwd(&workspace_key(&root), Path::new("nested"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn one_checkpoint_tracks_and_rolls_back_every_trusted_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&additional).unwrap();
+        let context = ToolContext::new(
+            launch.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        let session = uuid::Uuid::new_v4();
+        context
+            .set_file_histories(vec![
+                FileHistory::create_in(&launch, session, storage.path(), true).unwrap(),
+                FileHistory::create_in(&additional, session, storage.path(), true).unwrap(),
+            ])
+            .unwrap();
+        let checkpoint = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 4)
+            .unwrap()
+            .unwrap();
+        for (root, after) in [
+            (&launch, b"launch-after".as_slice()),
+            (&additional, b"extra-after".as_slice()),
+        ] {
+            let path = root.join("owned.txt");
+            std::fs::write(&path, "before").unwrap();
+            context.track_before_edit(&path).unwrap();
+            context.expect_after_edit(&path, after).unwrap();
+            std::fs::write(path, after).unwrap();
+        }
+
+        let (report, message_count) = context.rollback_file_checkpoint(checkpoint.id, 4).unwrap();
+        assert_eq!(message_count, 4);
+        assert_eq!(report.restored, 2);
+        assert_eq!(
+            std::fs::read_to_string(launch.join("owned.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(additional.join("owned.txt")).unwrap(),
+            "before"
+        );
+        context.finish_file_checkpoint(checkpoint.id).unwrap();
+    }
+
+    #[test]
+    fn cross_root_rollback_preflights_all_roots_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let additional = temp.path().join("additional");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&additional).unwrap();
+        let context = ToolContext::new(
+            launch.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .add_trusted_roots(std::slice::from_ref(&additional))
+            .unwrap();
+        let session = uuid::Uuid::new_v4();
+        context
+            .set_file_histories(vec![
+                FileHistory::create_in(&launch, session, storage.path(), true).unwrap(),
+                FileHistory::create_in(&additional, session, storage.path(), true).unwrap(),
+            ])
+            .unwrap();
+        let checkpoint = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 0)
+            .unwrap()
+            .unwrap();
+        for root in [&launch, &additional] {
+            let path = root.join("owned.txt");
+            std::fs::write(&path, "before").unwrap();
+            context.track_before_edit(&path).unwrap();
+            context.expect_after_edit(&path, b"after").unwrap();
+            std::fs::write(path, "after").unwrap();
+        }
+        std::fs::write(additional.join("owned.txt"), "concurrent").unwrap();
+
+        assert!(context.rollback_file_checkpoint(checkpoint.id, 0).is_err());
+        assert_eq!(
+            std::fs::read_to_string(launch.join("owned.txt")).unwrap(),
+            "after"
+        );
+        assert!(
+            context
+                .file_histories
+                .read()
+                .unwrap()
+                .values()
+                .all(|history| history
+                    .checkpoints()
+                    .unwrap()
+                    .into_iter()
+                    .find(|info| info.id == checkpoint.id)
+                    .is_some_and(|info| info.status
+                        == crate::file_history::CheckpointStatus::RollbackConflict))
+        );
+        context.finish_file_checkpoint(checkpoint.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_transaction_rolls_back_every_workspace_visited_in_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch-transaction");
+        let alternate = temp.path().join("alternate-transaction");
+        let storage = temp.path().join("history-storage");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&alternate).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        let context = ToolContext::new(
+            launch.clone(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_file_history(
+            FileHistory::create_in(&launch, uuid::Uuid::new_v4(), &storage, true).unwrap(),
+        );
+        let checkpoint = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 0)
+            .unwrap()
+            .unwrap();
+
+        let launch_file = launch.join("owned.txt");
+        std::fs::write(&launch_file, "launch-before").unwrap();
+        context.track_before_edit(&launch_file).unwrap();
+        context
+            .expect_after_edit(&launch_file, b"launch-after")
+            .unwrap();
+        std::fs::write(&launch_file, "launch-after").unwrap();
+
+        context
+            .switch_workspace(alternate.clone(), alternate.clone())
+            .await
+            .unwrap();
+        let alternate_file = alternate.join("owned.txt");
+        std::fs::write(&alternate_file, "alternate-before").unwrap();
+        context.track_before_edit(&alternate_file).unwrap();
+        context
+            .expect_after_edit(&alternate_file, b"alternate-after")
+            .unwrap();
+        std::fs::write(&alternate_file, "alternate-after").unwrap();
+        context
+            .switch_workspace(launch.clone(), launch.clone())
+            .await
+            .unwrap();
+
+        let (report, _) = context.rollback_file_checkpoint(checkpoint.id, 0).unwrap();
+        assert_eq!(report.restored, 2);
+        assert_eq!(
+            std::fs::read_to_string(launch_file).unwrap(),
+            "launch-before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(alternate_file).unwrap(),
+            "alternate-before"
+        );
+        context.finish_file_checkpoint(checkpoint.id).unwrap();
+    }
+
+    #[test]
+    fn detached_agent_checkpoint_rolls_back_without_touching_the_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_file_history(
+            FileHistory::create_in(temp.path(), uuid::Uuid::new_v4(), storage.path(), true)
+                .unwrap(),
+        );
+        let parent = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 0)
+            .unwrap()
+            .unwrap();
+        let mut child = context.fork_for_agent();
+        let child_checkpoint = child.begin_detached_file_checkpoint().unwrap().unwrap();
+        assert_ne!(parent.id, child_checkpoint.id);
+        assert_eq!(child_checkpoint.ancestor_ids, vec![parent.id]);
+
+        let parent_file = temp.path().join("parent.txt");
+        let child_file = temp.path().join("child.txt");
+        std::fs::write(&parent_file, "parent-before").unwrap();
+        std::fs::write(&child_file, "child-before").unwrap();
+        context.track_before_edit(&parent_file).unwrap();
+        context
+            .expect_after_edit(&parent_file, b"parent-after")
+            .unwrap();
+        std::fs::write(&parent_file, "parent-after").unwrap();
+        child.track_before_edit(&child_file).unwrap();
+        child
+            .expect_after_edit(&child_file, b"child-after")
+            .unwrap();
+        std::fs::write(&child_file, "child-after").unwrap();
+
+        child
+            .rollback_file_checkpoint(child_checkpoint.id, 0)
+            .unwrap();
+        child.finish_file_checkpoint(child_checkpoint.id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&child_file).unwrap(),
+            "child-before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&parent_file).unwrap(),
+            "parent-after"
+        );
+        context.rollback_file_checkpoint(parent.id, 0).unwrap();
+        context.finish_file_checkpoint(parent.id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent_file).unwrap(),
+            "parent-before"
+        );
+    }
+
+    #[test]
+    fn parent_transaction_captures_detached_agent_writes_to_the_same_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_file_history(
+            FileHistory::create_in(temp.path(), uuid::Uuid::new_v4(), storage.path(), true)
+                .unwrap(),
+        );
+        let parent = context
+            .begin_file_checkpoint(CheckpointBoundary::UserMessage, 0)
+            .unwrap()
+            .unwrap();
+        let mut child = context.fork_for_agent();
+        let child_checkpoint = child.begin_detached_file_checkpoint().unwrap().unwrap();
+        let path = temp.path().join("shared.txt");
+        std::fs::write(&path, "before").unwrap();
+
+        child.track_before_edit(&path).unwrap();
+        child.expect_after_edit(&path, b"child-write").unwrap();
+        std::fs::write(&path, "child-write").unwrap();
+        context.track_before_edit(&path).unwrap();
+        context.expect_after_edit(&path, b"parent-write").unwrap();
+        std::fs::write(&path, "parent-write").unwrap();
+
+        assert!(
+            child
+                .rollback_file_checkpoint(child_checkpoint.id, 0)
+                .is_err()
+        );
+        child.finish_file_checkpoint(child_checkpoint.id).unwrap();
+        context.rollback_file_checkpoint(parent.id, 0).unwrap();
+        context.finish_file_checkpoint(parent.id).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn replayed_user_message_uuid_cannot_reuse_a_finished_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_file_history(
+            FileHistory::create_in(temp.path(), uuid::Uuid::new_v4(), storage.path(), true)
+                .unwrap(),
+        );
+        let id = uuid::Uuid::new_v4();
+        context
+            .begin_file_checkpoint_with_id(id, CheckpointBoundary::UserMessage, 0)
+            .unwrap();
+        context.finish_file_checkpoint(id).unwrap();
+        assert!(
+            context
+                .begin_file_checkpoint_with_id(id, CheckpointBoundary::UserMessage, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn public_tool_surface_contains_the_documented_generic_tools() {
         let names = ToolRegistry::default()
             .definitions()
             .into_iter()
             .filter_map(|definition| definition["name"].as_str().map(ToOwned::to_owned))
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 22);
         for required in [
+            "AskUserQuestion",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
             "Read",
+            "ScheduleWakeup",
             "Write",
             "Edit",
             "NotebookEdit",
@@ -1600,8 +6575,156 @@ mod tests {
             "TaskList",
             "TaskUpdate",
             "Skill",
+            "RunWorkflow",
+            "ToolSearch",
         ] {
             assert!(names.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn monitor_command_reuses_bash_permission_identity_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let command = "printf ok && printf done";
+        let targets = permission_targets_for(
+            &context,
+            &MonitorTool,
+            &json!({"command":command,"description":"test"}),
+            command,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].tool, "Bash");
+        assert_eq!(targets[0].candidates, vec![command]);
+
+        let ws = "wss://example.invalid/events";
+        let targets = permission_targets_for(
+            &context,
+            &MonitorTool,
+            &json!({"ws":ws,"description":"test"}),
+            ws,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].tool, "Monitor");
+        assert_eq!(targets[0].candidates, vec![ws]);
+    }
+
+    #[test]
+    fn tool_restriction_is_exact_and_rejects_invalid_requests() {
+        let registry = ToolRegistry::default();
+        registry.restrict_to(&["Read".to_owned()]).unwrap();
+        let names = registry
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Read"]);
+
+        let unknown = ToolRegistry::default();
+        assert!(unknown.restrict_to(&["Missing".to_owned()]).is_err());
+        let duplicate = ToolRegistry::default();
+        assert!(
+            duplicate
+                .restrict_to(&["Read".to_owned(), "Read".to_owned()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_agent_registry_activates_only_explicit_deferred_tools() {
+        let barrier: Arc<dyn Tool> = Arc::new(BarrierTool {
+            barrier: Arc::new(Barrier::new(1)),
+        });
+        let registry = ToolRegistry::with_extensions(Vec::new(), vec![barrier]).unwrap();
+        let scoped = registry
+            .scoped_for_agent(&AgentToolPolicy {
+                allowed_tools: Some(BTreeSet::from([
+                    "Read".to_owned(),
+                    "BarrierRead".to_owned(),
+                ])),
+                disallowed_tools: BTreeSet::new(),
+            })
+            .unwrap();
+        let names = scoped
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["BarrierRead".to_owned(), "Read".to_owned()])
+        );
+        assert_eq!(scoped.deferred_count(), 0);
+        assert!(
+            registry
+                .scoped_for_agent(&AgentToolPolicy {
+                    allowed_tools: Some(BTreeSet::from(["ToolSearch".to_owned()])),
+                    disallowed_tools: BTreeSet::new(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_agent_deny_only_policy_keeps_every_other_deferred_tool() {
+        let registry = ToolRegistry::with_extensions(
+            Vec::new(),
+            vec![
+                Arc::new(NamedReadTool("AllowedDeferred")),
+                Arc::new(NamedReadTool("DeniedDeferred")),
+            ],
+        )
+        .unwrap();
+        let scoped = registry
+            .scoped_for_agent(&AgentToolPolicy {
+                allowed_tools: None,
+                disallowed_tools: BTreeSet::from(["Bash".to_owned(), "DeniedDeferred".to_owned()]),
+            })
+            .unwrap();
+        let names = scoped
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+
+        assert!(names.contains("AllowedDeferred"));
+        assert!(!names.contains("DeniedDeferred"));
+        assert!(!names.contains("Bash"));
+        assert!(!names.contains("ToolSearch"));
+        assert_eq!(scoped.deferred_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_private_storage_rejects_every_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (index, (intermediate, suffix)) in [
+            ("agent-history", "workspace/agent.json"),
+            ("plans", "workspace/latest.md"),
+            ("worktrees", "agents/workspace/agent-id"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = temp.path().join(index.to_string());
+            let managed_root = case.join(".open-agent-harness");
+            let outside = case.join("outside");
+            std::fs::create_dir_all(&managed_root).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            symlink(&outside, managed_root.join(intermediate)).unwrap();
+
+            let requested = managed_root.join(intermediate).join(suffix);
+            let directory = requested.parent().unwrap();
+            let error = ensure_private_managed_directory(&managed_root, directory).unwrap_err();
+            assert!(format!("{error:#}").contains("不能是 symlink"));
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         }
     }
 }
