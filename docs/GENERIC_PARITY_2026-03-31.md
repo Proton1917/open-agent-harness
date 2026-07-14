@@ -135,6 +135,10 @@ is accurate; “complete parity with the proprietary product” is not.
   task/team, subagent, instruction, file, compaction, worktree, and cwd
   boundaries. Root `Stop` feedback is bounded and may request another round;
   `StopFailure` cannot replace the original failure.
+- File mutations match `FileChanged` rules by normalized workspace path and
+  report `add` versus `change`. Project Skill hot refresh emits a blockable
+  `ConfigChange(source=skills)` before replacing the in-process catalog; hook
+  failure leaves the prior catalog active and marks the turn for file rollback.
 - Hooks additionally support one post-batch boundary, user prompt expansion,
   a display-only final message transform, and schema-checked calls to an
   already connected MCP tool. MCP hook input interpolation, time, output,
@@ -181,6 +185,11 @@ is accurate; “complete parity with the proprietary product” is not.
   coalesced so only the latest pending turn is extracted. Conversation and
   existing memory are treated as untrusted data; likely secrets are rejected
   and accepted entries are committed atomically.
+- Configured LSP clients synchronize successful `Edit`, `Write`, and
+  `NotebookEdit` mutations through `didOpen`/`didChange`/`didSave` without an
+  explicit LSP query. Version-checked, workspace-confined diagnostics are
+  attached to that file-tool result; integration failure is visible but does
+  not silently reverse a successful file mutation.
 
 ## Honest remaining boundaries
 
@@ -201,9 +210,13 @@ is accurate; “complete parity with the proprietary product” is not.
   Its options are explicit trusted configuration plus the active model.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
-- `ConfigChange` is intentionally not emitted because this runtime rejects
-  in-process environment/config mutation; there is no accepted configuration
-  mutation boundary to observe.
+- `ConfigChange` covers the accepted project-Skill hot-refresh boundary only.
+  Trusted user settings and installed plugin manifests remain startup
+  snapshots; plugin lifecycle changes are deliberately applied by a later
+  process rather than mutating executable/network authority in place.
+- `FileChanged` currently observes harness file-tool commits. It does not run a
+  general background filesystem watcher, and hook-returned dynamic
+  `watchPaths` are not registered.
 - Explicit `TaskStop` is intentionally immediate; a stopped OS process cannot
   be recreated by later turn rollback. New-task rollback, notification cursors,
   and unretained capture cleanup remain transactional.

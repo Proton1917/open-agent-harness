@@ -16,6 +16,100 @@ use serde_json::Value;
 
 const SESSION_END_MARKER: &str = ".session-end-cleanup-marker";
 
+#[cfg(unix)]
+#[test]
+fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args([
+            "--print",
+            "--bare",
+            "--no-session-persistence",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", "http://127.0.0.1:9")
+        .env("HARNESS_MESSAGES_PATH", "/v1/messages")
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for request in [
+        serde_json::json!({
+            "type":"control_request", "requestId":"init-camel",
+            "request":{"subtype":"initialize"}
+        }),
+        serde_json::json!({
+            "type":"control_request", "request_id":"mcp-status",
+            "request":{"subtype":"mcp_status"}
+        }),
+        serde_json::json!({
+            "type":"control_request", "request_id":"settings-status",
+            "request":{"subtype":"get_settings"}
+        }),
+    ] {
+        writeln!(input, "{request}").unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let init = lines
+        .iter()
+        .find(|line| line["type"] == "system" && line["subtype"] == "init")
+        .unwrap();
+    for expected in ["diff", "resume", "rewind", "status"] {
+        assert!(
+            init["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == expected),
+            "missing {expected}"
+        );
+    }
+    assert!(
+        init["command_descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                command["name"] == "mcp" && command["argumentHint"].as_str().is_some()
+            })
+    );
+    assert_eq!(init["commandDescriptors"], init["command_descriptors"]);
+    let response = |id: &str| {
+        lines
+            .iter()
+            .find(|line| line["type"] == "control_response" && line["response"]["request_id"] == id)
+            .unwrap()
+    };
+    assert_eq!(response("init-camel")["response"]["subtype"], "success");
+    assert_eq!(
+        response("mcp-status")["response"]["response"]["servers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        response("settings-status")["response"]["response"]["memory_enabled"],
+        false
+    );
+}
+
 #[test]
 fn print_text_json_and_stream_json_contracts_are_stable() {
     let text = run_cli("text", json_response("plain response"));
@@ -482,7 +576,7 @@ fn trusted_turn_end_memory_extraction_runs_after_a_completed_print_turn() {
 
 #[cfg(unix)]
 #[test]
-fn stream_json_rewind_dry_run_does_not_modify_files() {
+fn stream_json_rewind_dry_run_previews_then_rewinds_files_and_conversation() {
     let workspace = tempfile::tempdir().unwrap();
     let session_state = tempfile::tempdir().unwrap();
     make_private_directory(workspace.path());
@@ -610,11 +704,31 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
         "{}",
         serde_json::json!({
             "type":"control_request", "request_id":"dry-run-1",
-            "request":{"subtype":"rewind_files", "user_message_id":user_id, "dry_run":true}
+            "request":{"subtype":"rewind_files", "userMessageId":user_id, "dryRun":true}
         })
     )
     .unwrap();
     stdin.flush().unwrap();
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "control_response" && line["response"]["request_id"] == "dry-run-1"
+    });
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), "changed");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type":"control_request", "request_id":"rewind-1",
+            "request":{
+                "subtype":"rewind", "user_message_id":user_id,
+                "files":true, "conversation":true
+            }
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "control_response" && line["response"]["request_id"] == "rewind-1"
+    });
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     let stdout = stdout_reader.join().unwrap();
@@ -631,7 +745,10 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
         stdout.join("\n"),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read_to_string(written).unwrap(), "changed");
+    assert!(
+        !written.exists(),
+        "confirmed rewind must restore file absence"
+    );
     let lines = stdout
         .iter()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -645,6 +762,16 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
     assert_eq!(response["response"]["subtype"], "success");
     assert_eq!(response["response"]["response"]["canRewind"], true);
     assert_eq!(response["response"]["response"]["deletions"], 1);
+    let rewind = lines
+        .iter()
+        .find(|line| {
+            line["type"] == "control_response" && line["response"]["request_id"] == "rewind-1"
+        })
+        .unwrap();
+    assert_eq!(rewind["response"]["subtype"], "success");
+    assert_eq!(rewind["response"]["response"]["conversationRewound"], true);
+    assert_eq!(rewind["response"]["response"]["filesRewound"], true);
+    assert_eq!(rewind["response"]["response"]["deleted"], 1);
 }
 
 #[test]

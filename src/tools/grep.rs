@@ -8,10 +8,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
+use ignore::{DirEntry, Walk, WalkBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use walkdir::{DirEntry, WalkDir};
 
 use super::{
     Tool, ToolContext, ToolOutput, normalize_path_for_display, object_schema, parse_input,
@@ -183,11 +183,7 @@ fn search(root: PathBuf, cwd: PathBuf, input: Input, context: &ToolContext) -> R
             &mut budget,
         )?;
     } else {
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| include_entry(entry) && !context.read_path_denied(entry.path()))
-        {
+        for entry in search_walker(&root, context) {
             budget.check_time()?;
             let entry = match entry {
                 Ok(entry) => entry,
@@ -196,7 +192,7 @@ fn search(root: PathBuf, cwd: PathBuf, input: Input, context: &ToolContext) -> R
                     continue;
                 }
             };
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
             if budget.files >= MAX_FILES {
@@ -218,6 +214,25 @@ fn search(root: PathBuf, cwd: PathBuf, input: Input, context: &ToolContext) -> R
         }
     }
     collector.finish(input.offset, limit, budget.limited)
+}
+
+fn search_walker(root: &Path, context: &ToolContext) -> Walk {
+    let safety_context = context.clone();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        // Reference search includes hidden files. Ignore rules still apply to
+        // hidden paths, and VCS metadata is excluded explicitly below.
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(move |entry| {
+            include_entry(entry) && !safety_context.read_path_denied(entry.path())
+        });
+    builder.build()
 }
 
 struct SearchOptions {
@@ -570,12 +585,17 @@ impl Collector {
         }
         let mut output = self.entries.join("\n");
         if self.truncated {
-            output.push_str(&format!(
+            let marker = format!(
                 "\n\n[Showing bounded results with pagination = limit: {}, offset: {}]",
                 if limit == usize::MAX { 0 } else { limit },
                 offset
-            ));
+            );
+            if output.len().saturating_add(marker.len()) > MAX_RESULT_BYTES {
+                truncate_utf8(&mut output, MAX_RESULT_BYTES.saturating_sub(marker.len()));
+            }
+            output.push_str(&marker);
         }
+        debug_assert!(output.len() <= MAX_RESULT_BYTES);
         Ok(output)
     }
 }
@@ -618,6 +638,33 @@ fn display_path(path: &Path, cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::{PermissionManager, PermissionMode};
+
+    fn test_context(root: &Path) -> ToolContext {
+        ToolContext::new(
+            root.to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        )
+    }
+
+    fn files_input(pattern: &str) -> Input {
+        Input {
+            pattern: pattern.to_owned(),
+            path: None,
+            glob: None,
+            output_mode: OutputMode::FilesWithMatches,
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: true,
+            case_insensitive: false,
+            r#type: None,
+            head_limit: Some(0),
+            offset: 0,
+            multiline: false,
+        }
+    }
 
     #[test]
     fn collector_applies_offset_limit_and_utf8_safe_bounds() {
@@ -631,9 +678,93 @@ mod tests {
     }
 
     #[test]
+    fn collector_preserves_match_order_and_total_byte_ceiling() {
+        let mut ordered = Collector::new(0, usize::MAX);
+        assert!(ordered.push("first-match".into()));
+        assert!(ordered.push("second-match".into()));
+        let output = ordered.finish(0, usize::MAX, false).unwrap();
+        assert!(output.find("first-match").unwrap() < output.find("second-match").unwrap());
+
+        let mut bounded = Collector::new(0, usize::MAX);
+        let record = "界".repeat(MAX_RECORD_BYTES / '界'.len_utf8());
+        while bounded.push(record.clone()) {}
+        let output = bounded.finish(0, usize::MAX, false).unwrap();
+        assert!(output.len() <= MAX_RESULT_BYTES);
+        assert!(output.contains("Showing bounded results"));
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn type_filters_cover_common_rust_and_text_files() {
         assert!(matches_type(Path::new("src/main.rs"), "rust"));
         assert!(matches_type(Path::new("notes.txt"), "text"));
         assert!(!matches_type(Path::new("src/main.rs"), "python"));
+    }
+
+    #[test]
+    fn walker_respects_ignore_negation_git_exclude_and_includes_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "build/\n*.cache\n!important.cache\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".ignore"), "cache/\n").unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "excluded.txt\n").unwrap();
+        for path in [
+            "visible.txt",
+            "important.cache",
+            "discard.cache",
+            "build/artifact.txt",
+            "cache/index.txt",
+            "excluded.txt",
+            ".hidden/visible.txt",
+        ] {
+            std::fs::write(root.join(path), "search-needle\n").unwrap();
+        }
+        let context = test_context(root);
+        let output = search(
+            root.to_owned(),
+            root.to_owned(),
+            files_input("search-needle"),
+            &context,
+        )
+        .unwrap();
+        assert!(output.contains("visible.txt"));
+        assert!(output.contains("important.cache"));
+        assert!(output.contains(".hidden/visible.txt"));
+        assert!(!output.contains("discard.cache"));
+        assert!(!output.contains("build/artifact.txt"));
+        assert!(!output.contains("cache/index.txt"));
+        assert!(!output.contains("excluded.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_does_not_follow_symlinks_outside_the_search_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("outside.txt"),
+            "outside-secret-needle\n",
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("linked-outside")).unwrap();
+        let context = test_context(root.path());
+        let output = search(
+            root.path().to_owned(),
+            root.path().to_owned(),
+            files_input("outside-secret-needle"),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(output, "No matches found");
     }
 }

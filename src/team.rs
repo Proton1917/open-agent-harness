@@ -227,6 +227,12 @@ struct TeamMember {
     status: MemberStatus,
     assignment: Option<String>,
     runtime_agent_id: Option<Uuid>,
+    /// Identifies the harness process that owns `runtime_agent_id`. Advisory
+    /// file locks disappear on process death, while this generation lets the
+    /// next opener distinguish an orphaned persisted Running state from a
+    /// second handle in the same still-live process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_owner_id: Option<Uuid>,
     tool_policy: AgentToolPolicy,
 }
 
@@ -412,11 +418,25 @@ impl TeamService {
         let transaction = transaction_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = read_state(&file)?;
+        let mut state = read_state(&file)?;
         if state.id != team_id {
             bail!("team state id 不匹配")
         }
+        let mut recovered = false;
+        for member in state.members.values_mut() {
+            if member.status == MemberStatus::Running
+                && member.runtime_owner_id != Some(process_instance_id())
+            {
+                member.status = MemberStatus::Assigned;
+                member.runtime_agent_id = None;
+                member.runtime_owner_id = None;
+                recovered = true;
+            }
+        }
         validate_state(&state, &workspace)?;
+        if recovered {
+            write_state(&file, &state)?;
+        }
         drop(transaction);
         Ok(Self {
             workspace,
@@ -494,6 +514,7 @@ impl TeamService {
                 status: MemberStatus::Idle,
                 assignment: None,
                 runtime_agent_id: None,
+                runtime_owner_id: None,
                 tool_policy: AgentToolPolicy::narrow(parent_policy, &spec.requested_policy),
             };
             let view = member_view(&member);
@@ -545,6 +566,7 @@ impl TeamService {
             }
             member.assignment = Some(task.to_owned());
             member.runtime_agent_id = None;
+            member.runtime_owner_id = None;
             member.status = MemberStatus::Assigned;
             state.total_assignments += 1;
             push_message(state, actor, member_id, TeamMessageKind::Assignment, task)?;
@@ -594,6 +616,7 @@ impl TeamService {
             }
             member.status = MemberStatus::Running;
             member.runtime_agent_id = Some(runtime_agent_id);
+            member.runtime_owner_id = Some(process_instance_id());
             Ok(member_view(member))
         })
     }
@@ -610,6 +633,7 @@ impl TeamService {
             }
             member.status = MemberStatus::Failed;
             member.runtime_agent_id = None;
+            member.runtime_owner_id = None;
             Ok(member_view(member))
         })
     }
@@ -644,6 +668,7 @@ impl TeamService {
                 MemberStatus::Failed
             };
             member.runtime_agent_id = None;
+            member.runtime_owner_id = None;
             push_message(
                 state,
                 member_id,
@@ -711,6 +736,7 @@ impl TeamService {
                 .get_mut(&member_id)
                 .context("team member 不存在")?;
             let runtime = member.runtime_agent_id.take();
+            member.runtime_owner_id = None;
             member.status = MemberStatus::Stopped;
             Ok(runtime)
         })
@@ -728,6 +754,7 @@ impl TeamService {
                 if let Some(runtime) = member.runtime_agent_id.take() {
                     runtime_ids.push(runtime);
                 }
+                member.runtime_owner_id = None;
                 member.status = MemberStatus::Stopped;
             }
             Ok(runtime_ids)
@@ -1148,6 +1175,11 @@ fn member_view(member: &TeamMember) -> TeamMemberView {
     }
 }
 
+fn process_instance_id() -> Uuid {
+    static PROCESS_INSTANCE_ID: OnceLock<Uuid> = OnceLock::new();
+    *PROCESS_INSTANCE_ID.get_or_init(Uuid::new_v4)
+}
+
 fn push_message(
     state: &mut TeamState,
     from: Uuid,
@@ -1298,11 +1330,14 @@ fn validate_state(state: &TeamState, workspace: &Path) -> Result<()> {
         }
         validate_policy(&member.tool_policy)?;
         if let Some(runtime_id) = member.runtime_agent_id {
-            if member.status != MemberStatus::Running || !runtime_ids.insert(runtime_id) {
+            if member.status != MemberStatus::Running
+                || member.runtime_owner_id.is_none()
+                || !runtime_ids.insert(runtime_id)
+            {
                 bail!("team runtime agent binding 损坏")
             }
-        } else if member.status == MemberStatus::Running {
-            bail!("running member 缺少 runtime agent id")
+        } else if member.status == MemberStatus::Running || member.runtime_owner_id.is_some() {
+            bail!("running member 缺少 runtime agent id 或存在孤立 owner")
         }
         if state.closed && member.status != MemberStatus::Stopped {
             bail!("closed team 含未停止 member")
@@ -2400,6 +2435,42 @@ mod tests {
         assert_eq!(service.shutdown(coordinator).unwrap(), vec![runtime]);
         assert!(service.shutdown(coordinator).unwrap().is_empty());
         assert!(service.send(coordinator, member.id, "closed").is_err());
+    }
+
+    #[test]
+    fn reopen_reclaims_running_member_owned_by_a_dead_process_generation() {
+        let (workspace, storage, service) = service();
+        let coordinator = service.coordinator_id();
+        let member = add_member(&service, "recoverable");
+        service.assign(coordinator, member.id, "retry me").unwrap();
+        service
+            .mark_running(coordinator, member.id, Uuid::new_v4())
+            .unwrap();
+
+        let mut persisted = read_state(service.storage_path()).unwrap();
+        let persisted_member = persisted.members.get_mut(&member.id).unwrap();
+        persisted_member.runtime_owner_id = Some(Uuid::new_v4());
+        assert_ne!(
+            persisted_member.runtime_owner_id,
+            Some(process_instance_id())
+        );
+        write_state(service.storage_path(), &persisted).unwrap();
+
+        let reopened =
+            TeamService::open_in(workspace.path(), storage.path(), service.id()).unwrap();
+        let recovered = reopened.member(coordinator, member.id).unwrap();
+        assert_eq!(recovered.status, MemberStatus::Assigned);
+        assert_eq!(recovered.assignment.as_deref(), Some("retry me"));
+        assert_eq!(recovered.runtime_agent_id, None);
+
+        reopened
+            .assign(coordinator, member.id, "retry safely")
+            .unwrap();
+        let on_disk = read_state(reopened.storage_path()).unwrap();
+        assert_eq!(
+            on_disk.members.get(&member.id).unwrap().runtime_owner_id,
+            None
+        );
     }
 
     #[test]

@@ -96,6 +96,7 @@ pub struct QueryEngine {
     pub compaction_count: usize,
     max_tool_rounds: usize,
     structured_output_required: bool,
+    last_checkpoint: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +157,7 @@ impl QueryEngine {
             compaction_count: 0,
             max_tool_rounds: MAX_TOOL_ROUNDS,
             structured_output_required: false,
+            last_checkpoint: None,
         }
     }
 
@@ -339,6 +341,7 @@ impl QueryEngine {
             Some(Ok(result)) => {
                 if let Some(checkpoint) = &file_checkpoint {
                     self.tool_context.finish_file_checkpoint(checkpoint.id)?;
+                    self.last_checkpoint = Some(checkpoint.id);
                 }
                 if hot_refresh_file_transaction {
                     self.tool_context.finish_hot_refresh_file_transaction()?;
@@ -490,6 +493,22 @@ impl QueryEngine {
     /// before the tool can mutate scheduler state.
     pub async fn execute_command_tool(&self, name: &str, input: Value) -> ToolOutput {
         self.registry.execute(&self.tool_context, name, input).await
+    }
+
+    /// Resolves an explicit user file mention only when it names an existing regular file inside
+    /// the current trusted workspace set. This is a discovery check; the subsequent `Read` still
+    /// traverses normal schema, permission, hook, size, and media validation.
+    pub fn explicit_workspace_file(&self, value: &str) -> Option<String> {
+        if value.is_empty()
+            || value.len() > 4096
+            || value.contains(['\0', '\n', '\r'])
+            || self.tool_context.is_outside_workspace(value).ok()?
+        {
+            return None;
+        }
+        let path = self.tool_context.resolve_path(value).ok()?;
+        let canonical = std::fs::canonicalize(path).ok()?;
+        canonical.is_file().then(|| value.to_owned())
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -1111,6 +1130,7 @@ impl QueryEngine {
 
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.last_checkpoint = None;
     }
 
     pub fn estimated_tokens(&self) -> usize {
@@ -1190,6 +1210,13 @@ impl QueryEngine {
     pub fn diff_files(&self, checkpoint: uuid::Uuid) -> Result<(DiffStats, usize)> {
         self.tool_context
             .diff_file_checkpoint(checkpoint, self.messages.len())
+    }
+
+    /// Returns the latest successfully committed top-level checkpoint created
+    /// during this process. Older persisted checkpoints remain addressable by
+    /// explicit UUID after a resumed session.
+    pub fn last_checkpoint(&self) -> Option<uuid::Uuid> {
+        self.last_checkpoint
     }
 
     pub async fn compact(&mut self, custom_instructions: Option<&str>) -> Result<CompactStats> {

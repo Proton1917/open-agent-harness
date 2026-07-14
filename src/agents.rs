@@ -1588,9 +1588,16 @@ impl AgentRuntime {
                 bail!("background agent 不存在: {id}")
             };
             ensure_agent_access(context, id, job)?;
+            if job.result.borrow().is_some() || job.handle.is_finished() {
+                bail!("background agent 已经结束: {id}；请用 AgentOutput 读取最终结果")
+            }
             jobs.remove(&id)
                 .expect("checked background agent must exist")
         };
+        if job.result.borrow().is_some() || job.handle.is_finished() {
+            self.jobs.lock().await.insert(id, job);
+            bail!("background agent 已经结束: {id}；请用 AgentOutput 读取最终结果")
+        }
         cancel_background_job(job).await;
         Ok(ToolOutput::success(format!("Stopped agent {id}")))
     }
@@ -2803,6 +2810,36 @@ mod tests {
         assert!(runtime.jobs.lock().await.contains_key(&id));
         let stopped = runtime.stop(&context, id).await.unwrap();
         assert!(!stopped.is_error, "{}", stopped.content);
+    }
+
+    #[tokio::test]
+    async fn stop_does_not_discard_a_completed_agent_result() {
+        let runtime = test_runtime(AgentLimits::default());
+        let context = test_context();
+        let owner = context.async_owner();
+        let id = Uuid::new_v4();
+        runtime.jobs.lock().await.insert(
+            id,
+            completed_background_agent(&runtime, &owner, id, "already done", "final result"),
+        );
+
+        let error = runtime.stop(&context, id).await.unwrap_err();
+        assert!(format!("{error:#}").contains("AgentOutput"));
+        assert!(runtime.jobs.lock().await.contains_key(&id));
+
+        let output = runtime
+            .output(
+                &context,
+                AgentOutputInput {
+                    agent_id: id.to_string(),
+                    wait: false,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content, "final result");
+        assert!(!runtime.jobs.lock().await.contains_key(&id));
     }
 
     #[tokio::test]

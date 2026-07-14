@@ -9,12 +9,14 @@ use std::{
         unix::process::CommandExt,
     },
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
 
 #[test]
 fn composer_handles_mode_help_and_double_interrupt_exit() {
+    let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
     let mut output = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
     assert!(output.contains("open-agent-harness"));
@@ -62,7 +64,7 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     terminal.write_all(b"/help\r").unwrap();
     output.push_str(&read_until(
         &mut terminal,
-        "/help  /init",
+        "Available commands:",
         Duration::from_secs(3),
     ));
     thread::sleep(Duration::from_millis(250));
@@ -79,15 +81,57 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
 }
 
 #[test]
+fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all("a界b".as_bytes()).unwrap();
+    let _ = read_until(&mut terminal, "a界b", Duration::from_secs(3));
+    terminal.write_all(b"\x01\x06").unwrap();
+    let _ = read_until(&mut terminal, "a界b", Duration::from_secs(3));
+    terminal.write_all(b"\x04").unwrap();
+    let deleted = read_until(&mut terminal, "› ab", Duration::from_secs(3));
+    assert!(deleted.contains("› ab"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    terminal.write_all(b"\x04").unwrap();
+    let first = read_until(
+        &mut terminal,
+        "Press Ctrl-D again to exit",
+        Duration::from_secs(3),
+    );
+    assert!(first.contains("Press Ctrl-D again to exit"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    thread::sleep(Duration::from_millis(1_700));
+    let expired = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    assert!(!expired.contains("Press Ctrl-D again to exit"));
+    terminal.write_all(b"\x04").unwrap();
+    let rearmed = read_until(
+        &mut terminal,
+        "Press Ctrl-D again to exit",
+        Duration::from_secs(3),
+    );
+    assert!(rearmed.contains("Press Ctrl-D again to exit"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"\x04").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
 fn slash_palette_and_model_picker_follow_interactive_command_flow() {
+    let _serial = serial_terminal_test();
     let settings = r#"{"models":[{"value":"model-a","displayName":"Model A","description":"Primary"},{"value":"model-b","displayName":"Model B","description":"Fallback"}]}"#;
     let (mut child, mut terminal) =
         spawn_terminal_with_args(&[], &["--model", "model-b", "--settings", settings]);
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
-
-    terminal.write_all(b"/").unwrap();
-    let palette = read_until(&mut terminal, "/clear", Duration::from_secs(3));
-    assert!(palette.contains("/clear"));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    let palette = open_slash_palette(&mut terminal);
     assert_no_bare_line_feeds(palette.as_bytes());
     terminal.write_all(b"\x0e").unwrap();
     let next = read_until(&mut terminal, "› /compact", Duration::from_secs(3));
@@ -115,6 +159,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
         Duration::from_secs(3),
     );
     assert_no_bare_line_feeds(selected.as_bytes());
+    thread::sleep(Duration::from_millis(100));
 
     terminal.write_all(b"/model current\r").unwrap();
     let current = read_until(
@@ -124,8 +169,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
     );
     assert!(current.contains("Current model: model-a"));
 
-    terminal.write_all(b"/").unwrap();
-    let _ = read_until(&mut terminal, "/clear", Duration::from_secs(3));
+    let _ = open_slash_palette(&mut terminal);
     terminal.write_all(b"\x1b").unwrap();
     let dismissed = read_until(
         &mut terminal,
@@ -142,7 +186,36 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
 }
 
 #[test]
+fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"inspect @src/ter").unwrap();
+    let palette = read_until(&mut terminal, "@src/terminal.rs", Duration::from_secs(5));
+    assert!(palette.contains("@src/terminal.rs"));
+    assert_no_bare_line_feeds(palette.as_bytes());
+
+    terminal.write_all(b"\r").unwrap();
+    let accepted = read_until(
+        &mut terminal,
+        "File reference inserted",
+        Duration::from_secs(3),
+    );
+    assert!(accepted.contains("inspect @src/terminal.rs"));
+    assert!(!accepted.contains("› inspect @src/terminal.rs\r\n\r\n"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
 fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
+    let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -184,6 +257,7 @@ fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
 
 #[test]
 fn exact_session_permission_is_reused_without_a_second_prompt() {
+    let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -231,6 +305,14 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
 
 fn spawn_terminal(extra_env: &[&str]) -> (Child, File) {
     spawn_terminal_with_args(extra_env, &[])
+}
+
+fn serial_terminal_test() -> MutexGuard<'static, ()> {
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn spawn_terminal_with_args(extra_env: &[&str], extra_args: &[&str]) -> (Child, File) {
@@ -318,6 +400,38 @@ fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
     )
 }
 
+fn read_available(terminal: &mut File, timeout: Duration) -> String {
+    let started = Instant::now();
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while started.elapsed() < timeout {
+        match terminal.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn open_slash_palette(terminal: &mut File) -> String {
+    let mut output = String::new();
+    for _ in 0..5 {
+        // Synthetic PTYs can race an injected byte with a termios transition
+        // between prompt-boundary raw-mode guards. Clear before retrying.
+        terminal.write_all(b"\x15/").unwrap();
+        output.push_str(&read_available(terminal, Duration::from_millis(500)));
+        if output.contains("/clear") {
+            return output;
+        }
+    }
+    panic!("slash palette did not open: {output}")
+}
+
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -328,6 +442,22 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
     }
     let _ = child.kill();
     panic!("terminal child did not exit")
+}
+
+fn wait_for_raw_mode(terminal: &File, timeout: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
+        let result = unsafe { libc::tcgetattr(terminal.as_raw_fd(), state.as_mut_ptr()) };
+        if result == 0 {
+            let state = unsafe { state.assume_init() };
+            if state.c_lflag & (libc::ICANON | libc::ECHO) == 0 {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("PTY did not enter raw mode before injected input")
 }
 
 fn assert_no_bare_line_feeds(output: &[u8]) {

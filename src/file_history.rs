@@ -215,6 +215,7 @@ impl FileHistory {
             transaction_lock: Arc::new(Mutex::new(())),
         };
         let _ = history.load_manifest()?;
+        history.recover_orphaned_transactions()?;
         Ok(history)
     }
 
@@ -231,6 +232,39 @@ impl FileHistory {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// A persisted active transaction has no owner after this history is
+    /// reopened. Recover newest-first so nested/detached checkpoints restore
+    /// their own writes before an ancestor is examined. Ownership validation
+    /// remains fail-closed: a later external edit is never overwritten.
+    fn recover_orphaned_transactions(&self) -> Result<()> {
+        let active = {
+            let _transaction = self
+                .transaction_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.load_manifest()?
+                .checkpoints
+                .iter()
+                .rev()
+                .filter(|checkpoint| checkpoint.transaction_active)
+                .map(|checkpoint| checkpoint.id)
+                .collect::<Vec<_>>()
+        };
+        // Preflight every orphan before the first workspace mutation so a
+        // later conflict cannot leave startup recovery half-applied.
+        for checkpoint in &active {
+            self.validate_rollback(*checkpoint).with_context(|| {
+                format!("无法安全预检遗留 file-history transaction {checkpoint}")
+            })?;
+        }
+        for checkpoint in active {
+            self.rollback_checkpoint(checkpoint).with_context(|| {
+                format!("无法安全恢复遗留 file-history transaction {checkpoint}")
+            })?;
+        }
+        Ok(())
     }
 
     pub fn workspace(&self) -> &Path {
@@ -1623,6 +1657,94 @@ mod tests {
     }
 
     #[test]
+    fn reopen_rolls_back_an_orphaned_active_transaction() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let path = workspace.path().join("crash.txt");
+        fs::write(&path, "before").unwrap();
+        let history =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap();
+        let checkpoint = Uuid::new_v4();
+        history
+            .checkpoint(checkpoint, CheckpointBoundary::UserMessage, 1)
+            .unwrap();
+        history.track_before_edit(checkpoint, &path).unwrap();
+        history
+            .expect_after_edit(checkpoint, &path, b"written-before-crash")
+            .unwrap();
+        fs::write(&path, "written-before-crash").unwrap();
+        drop(history);
+
+        let reopened =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert_eq!(
+            checkpoint_status(&reopened, checkpoint),
+            CheckpointStatus::RolledBack
+        );
+    }
+
+    #[test]
+    fn reopen_never_rolls_back_a_committed_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let path = workspace.path().join("committed.txt");
+        fs::write(&path, "before").unwrap();
+        let history =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap();
+        let checkpoint = Uuid::new_v4();
+        history
+            .checkpoint(checkpoint, CheckpointBoundary::UserMessage, 1)
+            .unwrap();
+        history.track_before_edit(checkpoint, &path).unwrap();
+        history
+            .expect_after_edit(checkpoint, &path, b"committed")
+            .unwrap();
+        fs::write(&path, "committed").unwrap();
+        history.finish_transaction(checkpoint).unwrap();
+        drop(history);
+
+        let reopened =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
+        assert_eq!(
+            checkpoint_status(&reopened, checkpoint),
+            CheckpointStatus::Committed
+        );
+    }
+
+    #[test]
+    fn reopen_refuses_to_overwrite_an_external_edit_after_a_crash() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let path = workspace.path().join("conflict.txt");
+        fs::write(&path, "before").unwrap();
+        let history =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap();
+        let checkpoint = Uuid::new_v4();
+        history
+            .checkpoint(checkpoint, CheckpointBoundary::UserMessage, 1)
+            .unwrap();
+        history.track_before_edit(checkpoint, &path).unwrap();
+        history
+            .expect_after_edit(checkpoint, &path, b"transaction-write")
+            .unwrap();
+        fs::write(&path, "external-write").unwrap();
+
+        let error =
+            FileHistory::create_in(workspace.path(), session_id, storage.path(), true).unwrap_err();
+        assert!(error.to_string().contains("无法安全"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external-write");
+        assert_eq!(
+            checkpoint_status(&history, checkpoint),
+            CheckpointStatus::RollbackConflict
+        );
+    }
+
+    #[test]
     fn rewind_uses_first_later_snapshot_for_preexisting_file() {
         let (workspace, _storage, history) = history();
         let path = workspace.path().join("later-tracked.txt");
@@ -1948,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_ancestry_and_conflict_status_survive_reopen() {
+    fn transaction_ancestry_and_conflict_status_survive_failed_recovery() {
         let workspace = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let session = Uuid::new_v4();
@@ -1973,11 +2095,9 @@ mod tests {
         }
         fs::write(&path, "second").unwrap();
         history.validate_rollback(second).unwrap_err();
-        drop(history);
 
-        let reopened =
-            FileHistory::create_in(workspace.path(), session, storage.path(), true).unwrap();
-        let checkpoints = reopened.checkpoints().unwrap();
+        assert!(FileHistory::create_in(workspace.path(), session, storage.path(), true).is_err());
+        let checkpoints = history.checkpoints().unwrap();
         let second = checkpoints
             .iter()
             .find(|checkpoint| checkpoint.id == second)

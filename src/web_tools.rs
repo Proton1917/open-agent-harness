@@ -196,11 +196,15 @@ impl Tool for WebFetchTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn concurrency_safe(&self, _: &Value) -> bool {
-        false
+        true
+    }
+
+    fn explicit_permission_for(&self, _: &ToolContext, _: &Value) -> bool {
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -270,11 +274,15 @@ impl Tool for WebSearchTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn concurrency_safe(&self, _: &Value) -> bool {
-        false
+        true
+    }
+
+    fn explicit_permission_for(&self, _: &ToolContext, _: &Value) -> bool {
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -1012,6 +1020,49 @@ mod tests {
         };
         let integration = configure_web(&settings).unwrap();
         assert_eq!(integration.deferred_tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn web_reads_are_concurrency_safe_but_still_require_open_world_permission() {
+        let runtime = Arc::new(WebRuntime {
+            allow_private_network: false,
+            max_bytes: DEFAULT_MAX_BYTES,
+            search: None,
+        });
+        let fetch = WebFetchTool {
+            runtime: Arc::clone(&runtime),
+        };
+        let search = WebSearchTool { runtime };
+        assert!(fetch.read_only(&json!({})));
+        assert!(fetch.concurrency_safe(&json!({})));
+        assert!(fetch.explicit_permission_for(
+            &ToolContext::new(
+                std::env::current_dir().unwrap(),
+                PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new(),),
+            ),
+            &json!({})
+        ));
+        assert!(search.read_only(&json!({})));
+        assert!(search.concurrency_safe(&json!({})));
+
+        let registry = ToolRegistry::with_extensions(vec![Arc::new(fetch)], Vec::new()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let output = registry
+            .execute(
+                &context,
+                "WebFetch",
+                json!({
+                    "url":"https://example.invalid/",
+                    "prompt":"summarize"
+                }),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("权限"), "{}", output.content);
     }
 
     #[test]

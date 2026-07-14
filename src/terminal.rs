@@ -24,9 +24,54 @@ use crate::{config::ModelOption, permissions::PermissionMode, query::QueryEvent}
 const EXIT_WINDOW: Duration = Duration::from_millis(1_500);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_VISIBLE_INPUT_LINES: usize = 10;
+const MAX_FILE_CANDIDATES_SCANNED: usize = 4_096;
+const MAX_FILE_SUGGESTIONS: usize = 100;
 const RAW_LINE_END: &str = "\r\n";
 const SYNC_OUTPUT_START: &[u8] = b"\x1b[?2026h";
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitKey {
+    CtrlC,
+    CtrlD,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExitPending {
+    key: ExitKey,
+    armed_at: Instant,
+}
+
+impl ExitPending {
+    fn new(key: ExitKey, now: Instant) -> Self {
+        Self { key, armed_at: now }
+    }
+
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        EXIT_WINDOW
+            .checked_sub(now.saturating_duration_since(self.armed_at))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn active_for(self, key: ExitKey, now: Instant) -> bool {
+        self.key == key && self.remaining(now).is_some()
+    }
+
+    fn hint(self) -> &'static str {
+        match self.key {
+            ExitKey::CtrlC => "Press Ctrl-C again to exit",
+            ExitKey::CtrlD => "Press Ctrl-D again to exit",
+        }
+    }
+}
+
+fn arm_or_confirm_exit(pending: &mut Option<ExitPending>, key: ExitKey, now: Instant) -> bool {
+    if pending.is_some_and(|armed| armed.active_for(key, now)) {
+        return true;
+    }
+    *pending = Some(ExitPending::new(key, now));
+    false
+}
 
 #[derive(Clone)]
 pub struct ConversationUi {
@@ -277,6 +322,151 @@ pub struct SlashCommandSuggestion {
     pub description: String,
     pub argument_hint: Option<String>,
     pub execute_on_enter: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSuggestion {
+    pub display_path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileToken {
+    start: usize,
+    query: String,
+    quoted: bool,
+}
+
+fn file_token_at_cursor(buffer: &str, cursor_byte: usize) -> Option<FileToken> {
+    let before_cursor = buffer.get(..cursor_byte)?;
+    for (start, _) in before_cursor.rmatch_indices("@\"") {
+        if !file_reference_boundary(before_cursor[..start].chars().next_back()) {
+            continue;
+        }
+        let raw_query = &before_cursor[start + 2..];
+        if let Some(query) = unescape_open_quoted_path(raw_query) {
+            return Some(FileToken {
+                start,
+                query,
+                quoted: true,
+            });
+        }
+    }
+
+    let start = before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace() || is_open_bracket(*character))
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let query = before_cursor[start..].strip_prefix('@')?;
+    if query.contains('"') {
+        return None;
+    }
+    Some(FileToken {
+        start,
+        query: query.to_owned(),
+        quoted: false,
+    })
+}
+
+fn file_reference_boundary(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| character.is_whitespace() || is_open_bracket(character))
+}
+
+fn is_open_bracket(character: char) -> bool {
+    matches!(character, '(' | '[' | '{')
+}
+
+fn unescape_open_quoted_path(value: &str) -> Option<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return None,
+            '\\' => match characters.next() {
+                Some('"') => output.push('"'),
+                Some('\\') => output.push('\\'),
+                Some(next) => {
+                    output.push('\\');
+                    output.push(next);
+                }
+                None => output.push('\\'),
+            },
+            _ => output.push(character),
+        }
+    }
+    Some(output)
+}
+
+fn file_matches<'a>(token: &FileToken, files: &'a [FileSuggestion]) -> Vec<&'a FileSuggestion> {
+    files
+        .iter()
+        .take(MAX_FILE_CANDIDATES_SCANNED)
+        .filter(|file| {
+            file.display_path.starts_with(&token.query)
+                && if file.is_dir {
+                    format!("{}/", file.display_path.trim_end_matches('/')) != token.query
+                } else {
+                    file.display_path != token.query
+                }
+        })
+        .take(MAX_FILE_SUGGESTIONS)
+        .collect()
+}
+
+fn common_file_prefix(files: &[&FileSuggestion]) -> String {
+    let Some(first) = files.first() else {
+        return String::new();
+    };
+    let mut common = first.display_path.clone();
+    for file in &files[1..] {
+        let mut bytes = 0usize;
+        for (left, right) in common
+            .graphemes(true)
+            .zip(file.display_path.graphemes(true))
+        {
+            if left != right {
+                break;
+            }
+            bytes += left.len();
+        }
+        common.truncate(bytes);
+        if common.is_empty() {
+            break;
+        }
+    }
+    common
+}
+
+fn replace_file_token(
+    buffer: &mut String,
+    cursor_byte: usize,
+    token: &FileToken,
+    path: &str,
+    is_dir: bool,
+    partial: bool,
+) -> usize {
+    let mut path = path.to_owned();
+    if is_dir && !path.ends_with('/') {
+        path.push('/');
+    }
+    let quote = token.quoted || path.chars().any(char::is_whitespace);
+    let replacement = if quote {
+        format!("@\"{}\"", escape_file_reference(&path))
+    } else {
+        format!("@{path}")
+    };
+    buffer.replace_range(token.start..cursor_byte, &replacement);
+    let end = token.start + replacement.len();
+    if quote && (partial || is_dir) {
+        end - 1
+    } else {
+        end
+    }
+}
+
+fn escape_file_reference(path: &str) -> String {
+    path.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn command_matches<'a>(
@@ -698,6 +888,7 @@ impl InputEditor {
         initial_mode: PermissionMode,
         mode_locked: bool,
         commands: &[SlashCommandSuggestion],
+        files: &[FileSuggestion],
     ) -> Result<Option<PromptRead>> {
         let _raw = RawModeGuard::enter()?;
         let mut out = io::stdout();
@@ -707,14 +898,20 @@ impl InputEditor {
         let mut history_index = self.history.len();
         let mut draft = String::new();
         let mut mode = initial_mode;
-        let mut exit_armed = false;
+        let mut exit_pending: Option<ExitPending> = None;
         let mut last_escape: Option<Instant> = None;
         let mut hint = String::new();
         let mut kill_buffer = String::new();
         let mut selected_suggestion = 0usize;
         let mut dismissed_suggestions_for: Option<String> = None;
+        let mut selected_file_suggestion = 0usize;
+        let mut dismissed_file_suggestions_for: Option<(String, usize)> = None;
 
         loop {
+            if exit_pending.is_some_and(|pending| pending.remaining(Instant::now()).is_none()) {
+                exit_pending = None;
+                hint.clear();
+            }
             let suggestions = if dismissed_suggestions_for.as_deref() == Some(buffer.as_str()) {
                 Vec::new()
             } else {
@@ -724,6 +921,22 @@ impl InputEditor {
                 selected_suggestion = 0;
             } else {
                 selected_suggestion = selected_suggestion.min(suggestions.len() - 1);
+            }
+            let file_token = if dismissed_file_suggestions_for
+                .as_ref()
+                .is_some_and(|(dismissed, cursor)| dismissed == &buffer && *cursor == cursor_byte)
+            {
+                None
+            } else {
+                file_token_at_cursor(&buffer, cursor_byte)
+            };
+            let file_suggestions = file_token
+                .as_ref()
+                .map_or_else(Vec::new, |token| file_matches(token, files));
+            if file_suggestions.is_empty() {
+                selected_file_suggestion = 0;
+            } else {
+                selected_file_suggestion = selected_file_suggestion.min(file_suggestions.len() - 1);
             }
             let argument_hint = command_argument_hint(&buffer, commands);
             rendered.redraw(
@@ -735,15 +948,35 @@ impl InputEditor {
                     hint: &hint,
                     suggestions: &suggestions,
                     selected_suggestion,
+                    file_suggestions: &file_suggestions,
+                    selected_file_suggestion,
                     argument_hint,
                 },
             )?;
 
-            let event = event::read()?;
+            let event = if let Some(pending) = exit_pending {
+                let Some(remaining) = pending.remaining(Instant::now()) else {
+                    exit_pending = None;
+                    hint.clear();
+                    continue;
+                };
+                if !event::poll(remaining)? {
+                    exit_pending = None;
+                    hint.clear();
+                    continue;
+                }
+                event::read()?
+            } else {
+                event::read()?
+            };
             let previous_buffer = buffer.clone();
+            let previous_cursor_byte = cursor_byte;
             let previous_selected_name = suggestions
                 .get(selected_suggestion)
                 .map(|suggestion| suggestion.name.clone());
+            let previous_selected_file = file_suggestions
+                .get(selected_file_suggestion)
+                .map(|suggestion| suggestion.display_path.clone());
             match event {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -756,11 +989,102 @@ impl InputEditor {
                             modifiers: KeyModifiers::CONTROL,
                             ..
                         }
-                    );
+                    ) || (buffer.is_empty()
+                        && matches!(
+                            key,
+                            KeyEvent {
+                                code: KeyCode::Char('d'),
+                                modifiers: KeyModifiers::CONTROL,
+                                ..
+                            }
+                        ));
                     if !is_exit_key {
-                        exit_armed = false;
+                        exit_pending = None;
                     }
                     match key {
+                        KeyEvent {
+                            code: KeyCode::Up,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !file_suggestions.is_empty() => {
+                            selected_file_suggestion = if selected_file_suggestion == 0 {
+                                file_suggestions.len() - 1
+                            } else {
+                                selected_file_suggestion - 1
+                            };
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('n'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !file_suggestions.is_empty() => {
+                            selected_file_suggestion =
+                                (selected_file_suggestion + 1) % file_suggestions.len();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if !file_suggestions.is_empty() => {
+                            let token = file_token.as_ref().expect("file suggestions have a token");
+                            let common = common_file_prefix(&file_suggestions);
+                            if file_suggestions.len() > 1 && common.len() > token.query.len() {
+                                cursor_byte = replace_file_token(
+                                    &mut buffer,
+                                    cursor_byte,
+                                    token,
+                                    &common,
+                                    false,
+                                    true,
+                                );
+                                hint = "Completed common file prefix".to_owned();
+                            } else {
+                                let suggestion = file_suggestions[selected_file_suggestion];
+                                cursor_byte = replace_file_token(
+                                    &mut buffer,
+                                    cursor_byte,
+                                    token,
+                                    &suggestion.display_path,
+                                    suggestion.is_dir,
+                                    false,
+                                );
+                                hint = "File reference inserted".to_owned();
+                            }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if !file_suggestions.is_empty() => {
+                            let token = file_token.as_ref().expect("file suggestions have a token");
+                            let suggestion = file_suggestions[selected_file_suggestion];
+                            cursor_byte = replace_file_token(
+                                &mut buffer,
+                                cursor_byte,
+                                token,
+                                &suggestion.display_path,
+                                suggestion.is_dir,
+                                false,
+                            );
+                            hint = "File reference inserted".to_owned();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } if !file_suggestions.is_empty() => {
+                            dismissed_file_suggestions_for = Some((buffer.clone(), cursor_byte));
+                            hint = "File suggestions dismissed".to_owned();
+                            last_escape = None;
+                        }
                         KeyEvent {
                             code: KeyCode::Up,
                             modifiers: KeyModifiers::NONE,
@@ -830,16 +1154,18 @@ impl InputEditor {
                                 suggestion.execute_on_enter
                             };
                             if suggestions.is_empty() || execute_suggestion {
-                                rendered.erase(&mut out)?;
                                 let text = buffer.trim_end().to_owned();
-                                if !text.trim().is_empty() {
+                                if text.trim().is_empty() {
+                                    hint = "Type a message or / for commands".to_owned();
+                                } else {
+                                    rendered.erase(&mut out)?;
                                     self.push_history(text.clone());
                                     print_committed_prompt(&mut out, &text)?;
+                                    return Ok(Some(PromptRead {
+                                        text,
+                                        permission_mode: mode,
+                                    }));
                                 }
-                                return Ok(Some(PromptRead {
-                                    text,
-                                    permission_mode: mode,
-                                }));
                             }
                         }
                         KeyEvent {
@@ -880,13 +1206,17 @@ impl InputEditor {
                                 buffer.clear();
                                 cursor_byte = 0;
                                 hint = "Input cleared; press Ctrl-C again to exit".to_owned();
-                                exit_armed = true;
-                            } else if exit_armed {
+                                exit_pending =
+                                    Some(ExitPending::new(ExitKey::CtrlC, Instant::now()));
+                            } else if arm_or_confirm_exit(
+                                &mut exit_pending,
+                                ExitKey::CtrlC,
+                                Instant::now(),
+                            ) {
                                 rendered.erase(&mut out)?;
                                 return Ok(None);
                             } else {
-                                hint = "Press Ctrl-C again to exit".to_owned();
-                                exit_armed = true;
+                                hint = exit_pending.expect("exit was armed").hint().to_owned();
                             }
                         }
                         KeyEvent {
@@ -894,8 +1224,15 @@ impl InputEditor {
                             modifiers: KeyModifiers::CONTROL,
                             ..
                         } if buffer.is_empty() => {
-                            rendered.erase(&mut out)?;
-                            return Ok(None);
+                            if arm_or_confirm_exit(
+                                &mut exit_pending,
+                                ExitKey::CtrlD,
+                                Instant::now(),
+                            ) {
+                                rendered.erase(&mut out)?;
+                                return Ok(None);
+                            }
+                            hint = exit_pending.expect("exit was armed").hint().to_owned();
                         }
                         KeyEvent {
                             code: KeyCode::Esc, ..
@@ -1136,8 +1473,9 @@ impl InputEditor {
                 Event::Resize(_, _) => rendered.reset_viewport(&mut out)?,
                 _ => {}
             }
-            if buffer != previous_buffer {
+            if buffer != previous_buffer || cursor_byte != previous_cursor_byte {
                 dismissed_suggestions_for = None;
+                dismissed_file_suggestions_for = None;
                 let updated_suggestions = command_matches(&buffer, commands);
                 selected_suggestion = previous_selected_name
                     .as_deref()
@@ -1145,6 +1483,16 @@ impl InputEditor {
                         updated_suggestions
                             .iter()
                             .position(|suggestion| suggestion.name == name)
+                    })
+                    .unwrap_or(0);
+                let updated_file_suggestions = file_token_at_cursor(&buffer, cursor_byte)
+                    .map_or_else(Vec::new, |token| file_matches(&token, files));
+                selected_file_suggestion = previous_selected_file
+                    .as_deref()
+                    .and_then(|path| {
+                        updated_file_suggestions
+                            .iter()
+                            .position(|suggestion| suggestion.display_path == path)
                     })
                     .unwrap_or(0);
             }
@@ -1176,6 +1524,8 @@ struct InputRenderState<'a> {
     hint: &'a str,
     suggestions: &'a [&'a SlashCommandSuggestion],
     selected_suggestion: usize,
+    file_suggestions: &'a [&'a FileSuggestion],
+    selected_file_suggestion: usize,
     argument_hint: Option<&'a str>,
 }
 
@@ -1254,6 +1604,8 @@ impl RenderedInput {
             hint,
             suggestions,
             selected_suggestion,
+            file_suggestions,
+            selected_file_suggestion,
             argument_hint,
         } = state;
         let (width, height) = terminal::size()
@@ -1269,7 +1621,11 @@ impl RenderedInput {
         let active_column = buffer[active_start..cursor_byte].graphemes(true).count();
         let mut rendered_cursor_column = active_column;
         let color = std::env::var_os("NO_COLOR").is_none();
-        let suggestion_limit = suggestions.len().min(6);
+        let suggestion_limit = if file_suggestions.is_empty() {
+            suggestions.len().min(6)
+        } else {
+            file_suggestions.len().min(6)
+        };
         let visible_limit =
             MAX_VISIBLE_INPUT_LINES.min(height.saturating_sub(4 + suggestion_limit).max(1));
         let visible_start = if lines.len() <= visible_limit {
@@ -1347,7 +1703,34 @@ impl RenderedInput {
                 mode_label(mode)
             )
         };
-        let rendered_suggestions = if suggestions.is_empty() {
+        let rendered_suggestions = if !file_suggestions.is_empty() {
+            let count = suggestion_limit.min(height.saturating_sub(3).max(1));
+            let start = selected_file_suggestion
+                .saturating_sub(count / 2)
+                .min(file_suggestions.len().saturating_sub(count));
+            let end = (start + count).min(file_suggestions.len());
+            for (index, file) in file_suggestions.iter().enumerate().take(end).skip(start) {
+                let selected = index == selected_file_suggestion;
+                if color && selected {
+                    queue!(out, SetForegroundColor(Color::Cyan))?;
+                }
+                let path = if file.is_dir {
+                    format!("@{}/", file.display_path.trim_end_matches('/'))
+                } else {
+                    format!("@{}", file.display_path)
+                };
+                let kind = if file.is_dir { "directory" } else { "file" };
+                let line = visible_line(
+                    &format!("{}{}  {kind}", if selected { "› " } else { "  " }, path),
+                    width.saturating_sub(1),
+                );
+                queue!(out, Print(line), Print(RAW_LINE_END))?;
+                if color && selected {
+                    queue!(out, ResetColor)?;
+                }
+            }
+            end.saturating_sub(start)
+        } else if suggestions.is_empty() {
             queue!(
                 out,
                 Print(visible_line(&footer, width.saturating_sub(1))),
@@ -2134,6 +2517,39 @@ mod tests {
     }
 
     #[test]
+    fn exit_confirmation_is_key_specific_and_bounded() {
+        let started = Instant::now();
+        for key in [ExitKey::CtrlC, ExitKey::CtrlD] {
+            let mut pending = None;
+            assert!(!arm_or_confirm_exit(&mut pending, key, started));
+            assert!(arm_or_confirm_exit(
+                &mut pending,
+                key,
+                started + EXIT_WINDOW - Duration::from_millis(1)
+            ));
+
+            pending = Some(ExitPending::new(key, started));
+            assert!(!arm_or_confirm_exit(
+                &mut pending,
+                key,
+                started + EXIT_WINDOW
+            ));
+            assert_eq!(
+                pending.expect("re-armed after timeout").armed_at,
+                started + EXIT_WINDOW
+            );
+        }
+
+        let mut pending = Some(ExitPending::new(ExitKey::CtrlC, started));
+        assert!(!arm_or_confirm_exit(
+            &mut pending,
+            ExitKey::CtrlD,
+            started + Duration::from_millis(1)
+        ));
+        assert_eq!(pending.expect("re-armed").key, ExitKey::CtrlD);
+    }
+
+    #[test]
     fn long_status_is_bounded() {
         assert_eq!(visible_line("abcdefgh", 5), "abcd…");
         assert_eq!(visible_line("你好世界", 5), "你好…");
@@ -2190,6 +2606,143 @@ mod tests {
     }
 
     #[test]
+    fn file_tokens_respect_boundaries_quotes_and_unicode() {
+        assert!(file_token_at_cursor("x@src", "x@src".len()).is_none());
+        assert_eq!(
+            file_token_at_cursor("see (@src/模", "see (@src/模".len()),
+            Some(FileToken {
+                start: "see (".len(),
+                query: "src/模".to_owned(),
+                quoted: false,
+            })
+        );
+        assert_eq!(
+            file_token_at_cursor("open @\"目录/含 空", "open @\"目录/含 空".len()),
+            Some(FileToken {
+                start: "open ".len(),
+                query: "目录/含 空".to_owned(),
+                quoted: true,
+            })
+        );
+        assert_eq!(
+            file_token_at_cursor("open @\"a\\\"b", "open @\"a\\\"b".len())
+                .expect("escaped quote remains open")
+                .query,
+            "a\"b"
+        );
+        assert!(file_token_at_cursor("open @\"closed\"", "open @\"closed\"".len()).is_none());
+        let before_closing_quote = "open @\"closed".len();
+        assert_eq!(
+            file_token_at_cursor("open @\"closed\"", before_closing_quote)
+                .expect("cursor before closing quote")
+                .query,
+            "closed"
+        );
+    }
+
+    #[test]
+    fn file_matching_completion_and_references_are_bounded() {
+        let files = (0..4_200)
+            .map(|index| FileSuggestion {
+                display_path: format!("src/file-{index:04}.rs"),
+                is_dir: false,
+            })
+            .collect::<Vec<_>>();
+        let token = FileToken {
+            start: 0,
+            query: "src/".to_owned(),
+            quoted: false,
+        };
+        let matches = file_matches(&token, &files);
+        assert_eq!(matches.len(), MAX_FILE_SUGGESTIONS);
+        assert_eq!(matches.last().unwrap().display_path, "src/file-0099.rs");
+
+        let unicode = [
+            FileSuggestion {
+                display_path: "目录/模型.rs".to_owned(),
+                is_dir: false,
+            },
+            FileSuggestion {
+                display_path: "目录/模块.rs".to_owned(),
+                is_dir: false,
+            },
+        ];
+        assert_eq!(
+            common_file_prefix(&unicode.iter().collect::<Vec<_>>()),
+            "目录/模"
+        );
+
+        let mut plain = "inspect @src/ma later".to_owned();
+        let cursor = "inspect @src/ma".len();
+        let token = file_token_at_cursor(&plain, cursor).unwrap();
+        let cursor = replace_file_token(&mut plain, cursor, &token, "src/main.rs", false, false);
+        assert_eq!(plain, "inspect @src/main.rs later");
+        assert_eq!(cursor, "inspect @src/main.rs".len());
+
+        let mut quoted_dir = "open @\"my d".to_owned();
+        let cursor = quoted_dir.len();
+        let token = file_token_at_cursor(&quoted_dir, cursor).unwrap();
+        let cursor = replace_file_token(&mut quoted_dir, cursor, &token, "my dir", true, false);
+        assert_eq!(quoted_dir, "open @\"my dir/\"");
+        assert_eq!(cursor, quoted_dir.len() - 1);
+
+        let mut spaced_file = "open @my".to_owned();
+        let cursor = spaced_file.len();
+        let token = file_token_at_cursor(&spaced_file, cursor).unwrap();
+        let cursor = replace_file_token(
+            &mut spaced_file,
+            cursor,
+            &token,
+            "my file.txt",
+            false,
+            false,
+        );
+        assert_eq!(spaced_file, "open @\"my file.txt\"");
+        assert_eq!(cursor, spaced_file.len());
+    }
+
+    #[test]
+    fn file_suggestions_render_as_a_bounded_typeahead() {
+        let files = [
+            FileSuggestion {
+                display_path: "src".to_owned(),
+                is_dir: true,
+            },
+            FileSuggestion {
+                display_path: "src/main.rs".to_owned(),
+                is_dir: false,
+            },
+        ];
+        let suggestions = files.iter().collect::<Vec<_>>();
+        let mut frame = Vec::new();
+        let mut rendered = RenderedInput::default();
+        rendered
+            .draw(
+                &mut frame,
+                InputRenderState {
+                    buffer: "@s",
+                    cursor_byte: 2,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    file_suggestions: &suggestions,
+                    selected_file_suggestion: 0,
+                    argument_hint: None,
+                },
+            )
+            .unwrap();
+        let rendered_text = String::from_utf8_lossy(&frame);
+        assert!(rendered_text.contains("› @src/  directory"));
+        assert!(rendered_text.contains("@src/main.rs  file"));
+        for (index, byte) in frame.iter().enumerate() {
+            if *byte == b'\n' {
+                assert_eq!(frame.get(index.wrapping_sub(1)), Some(&b'\r'));
+            }
+        }
+    }
+
+    #[test]
     fn model_picker_focuses_current_and_wraps_like_select() {
         let options = (0..12)
             .map(|index| ModelOption {
@@ -2237,6 +2790,8 @@ mod tests {
                     hint: "",
                     suggestions: &[],
                     selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
                     argument_hint: None,
                 },
             )
@@ -2257,6 +2812,8 @@ mod tests {
                     hint: "",
                     suggestions: &suggestions,
                     selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
                     argument_hint: None,
                 },
             )
@@ -2286,6 +2843,8 @@ mod tests {
                     hint: "",
                     suggestions: &[],
                     selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
                     argument_hint: None,
                 },
             )
@@ -2308,6 +2867,8 @@ mod tests {
                     hint: "",
                     suggestions: &[],
                     selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
                     argument_hint: None,
                 },
             )
@@ -2323,6 +2884,8 @@ mod tests {
                     hint: "",
                     suggestions: &[],
                     selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
                     argument_hint: None,
                 },
             )

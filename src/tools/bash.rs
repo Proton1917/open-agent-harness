@@ -24,7 +24,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::process::{ProcessTreeGuard, spawn_managed};
+use crate::{
+    permissions::static_shell_pipeline,
+    process::{ProcessTreeGuard, spawn_managed},
+};
 
 use super::{
     BackgroundTask, Tool, ToolContext, ToolOutput, ensure_private_directory, object_schema,
@@ -87,6 +90,21 @@ enum ForegroundCapturePolicy {
 
 pub struct BashTool;
 
+#[derive(Debug)]
+struct SafeQueryPlan {
+    script: String,
+    operands: Vec<SafeReadOperand>,
+}
+
+#[derive(Debug)]
+struct SafeReadOperand {
+    path: PathBuf,
+    directory: bool,
+}
+
+const MAX_SAFE_QUERY_OPERANDS: usize = 64;
+const SAFE_QUERY_FD_BASE: i32 = 64;
+
 impl BashTool {
     /// Workflow reports are independently bounded and cannot expose the tail marker that points
     /// at a retained foreground capture. Run those commands with an ephemeral capture so a large
@@ -126,6 +144,14 @@ impl Tool for BashTool {
         false
     }
 
+    fn read_only_for(&self, context: &ToolContext, input: &Value) -> bool {
+        safe_query_plan(context, input).is_some()
+    }
+
+    fn concurrency_safe_for(&self, context: &ToolContext, input: &Value) -> bool {
+        safe_query_plan(context, input).is_some()
+    }
+
     fn destructive(&self, input: &Value) -> bool {
         let command = input.get("command").and_then(Value::as_str).unwrap_or("");
         command_is_destructive(command)
@@ -144,11 +170,406 @@ impl Tool for BashTool {
     }
 }
 
+fn safe_query_plan(context: &ToolContext, input: &Value) -> Option<SafeQueryPlan> {
+    #[cfg(windows)]
+    {
+        let _ = (context, input);
+        return None;
+    }
+    if input
+        .get("run_in_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let command = input.get("command")?.as_str()?;
+    let commands = static_shell_pipeline(command)?;
+    let mut rendered = Vec::with_capacity(commands.len());
+    let mut operands = Vec::new();
+    let mut has_git = false;
+    for (index, words) in commands.into_iter().enumerate() {
+        has_git |= words.first().is_some_and(|word| word == "git");
+        let normalized = normalize_safe_query(context, &words, index > 0, &mut operands)?;
+        rendered.push(format!(
+            "command {}",
+            normalized
+                .iter()
+                .map(|word| shell_quote(word))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if has_git && !operands.is_empty()
+        || !operands.is_empty() && context.sandbox_runtime().enabled()
+    {
+        return None;
+    }
+    Some(SafeQueryPlan {
+        script: rendered.join(" | "),
+        operands,
+    })
+}
+
+fn normalize_safe_query(
+    context: &ToolContext,
+    words: &[String],
+    allow_stdin: bool,
+    operands: &mut Vec<SafeReadOperand>,
+) -> Option<Vec<String>> {
+    let executable = words.first()?.as_str();
+    match executable {
+        "pwd" => {
+            let arguments = words.get(1..).unwrap_or_default();
+            (arguments.is_empty() || matches!(arguments, [flag] if flag == "-L" || flag == "-P"))
+                .then(|| words.to_vec())
+        }
+        "git" => normalize_safe_git_query(context, words),
+        "cat" => normalize_file_query(context, words, FileQueryKind::Cat, allow_stdin, operands),
+        "head" => normalize_file_query(context, words, FileQueryKind::Head, allow_stdin, operands),
+        "tail" => normalize_file_query(context, words, FileQueryKind::Tail, allow_stdin, operands),
+        "wc" => normalize_file_query(context, words, FileQueryKind::Wc, allow_stdin, operands),
+        "ls" => normalize_file_query(context, words, FileQueryKind::Ls, false, operands),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FileQueryKind {
+    Cat,
+    Head,
+    Tail,
+    Wc,
+    Ls,
+}
+
+fn normalize_file_query(
+    context: &ToolContext,
+    words: &[String],
+    kind: FileQueryKind,
+    allow_stdin: bool,
+    operands: &mut Vec<SafeReadOperand>,
+) -> Option<Vec<String>> {
+    let mut normalized = vec![words.first()?.clone()];
+    let mut paths = Vec::new();
+    let mut index = 1;
+    let mut options_done = false;
+    while index < words.len() {
+        let word = &words[index];
+        if !options_done && word == "--" {
+            options_done = true;
+            normalized.push(word.clone());
+            index += 1;
+            continue;
+        }
+        if !options_done && word.starts_with('-') && word != "-" {
+            let consumes_value = match kind {
+                FileQueryKind::Cat => {
+                    if !matches!(
+                        word.as_str(),
+                        "-A" | "-b"
+                            | "-E"
+                            | "-n"
+                            | "-s"
+                            | "-T"
+                            | "-v"
+                            | "--show-all"
+                            | "--number-nonblank"
+                            | "--show-ends"
+                            | "--number"
+                            | "--squeeze-blank"
+                            | "--show-tabs"
+                            | "--show-nonprinting"
+                    ) {
+                        return None;
+                    }
+                    false
+                }
+                FileQueryKind::Head | FileQueryKind::Tail => {
+                    if matches!(
+                        word.as_str(),
+                        "-q" | "-v" | "--quiet" | "--silent" | "--verbose"
+                    ) || is_compact_count_flag(word)
+                    {
+                        false
+                    } else if let Some(value) = word
+                        .strip_prefix("--lines=")
+                        .or_else(|| word.strip_prefix("--bytes="))
+                    {
+                        if !safe_count(value) {
+                            return None;
+                        }
+                        false
+                    } else if matches!(word.as_str(), "-n" | "-c" | "--lines" | "--bytes") {
+                        true
+                    } else {
+                        return None;
+                    }
+                }
+                FileQueryKind::Wc => {
+                    if !(matches!(
+                        word.as_str(),
+                        "-c" | "-m"
+                            | "-l"
+                            | "-L"
+                            | "-w"
+                            | "--bytes"
+                            | "--chars"
+                            | "--lines"
+                            | "--max-line-length"
+                            | "--words"
+                    ) || (word.len() > 2
+                        && word[1..]
+                            .bytes()
+                            .all(|byte| matches!(byte, b'c' | b'm' | b'l' | b'L' | b'w'))))
+                    {
+                        return None;
+                    }
+                    false
+                }
+                FileQueryKind::Ls => {
+                    if !safe_ls_flag(word) {
+                        return None;
+                    }
+                    false
+                }
+            };
+            normalized.push(word.clone());
+            if consumes_value {
+                index += 1;
+                let value = words.get(index)?;
+                if !safe_count(value) {
+                    return None;
+                }
+                normalized.push(value.clone());
+            }
+        } else {
+            paths.push(word.as_str());
+            if word == "-" && allow_stdin {
+                normalized.push(word.clone());
+            } else {
+                let path =
+                    canonical_read_operand(context, word, matches!(kind, FileQueryKind::Ls))?;
+                if operands.len() >= MAX_SAFE_QUERY_OPERANDS {
+                    return None;
+                }
+                let marker = format!("__OAH_SAFE_READ_FD_{}__", operands.len());
+                operands.push(path);
+                normalized.push(marker);
+            }
+        }
+        index += 1;
+    }
+    if paths.is_empty() {
+        if matches!(kind, FileQueryKind::Ls) {
+            if context.permissions.has_read_deny_rules() || context.read_path_denied(&context.cwd())
+            {
+                return None;
+            }
+        } else if !allow_stdin {
+            return None;
+        }
+    }
+    Some(normalized)
+}
+
+fn normalize_safe_git_query(context: &ToolContext, words: &[String]) -> Option<Vec<String>> {
+    if context.permissions.has_read_deny_rules() || context.read_path_denied(&context.cwd()) {
+        return None;
+    }
+    let mut index = 1;
+    let mut normalized = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.fsmonitor=false".to_owned(),
+        "--no-pager".to_owned(),
+    ];
+    if words.get(index).is_some_and(|word| word == "--no-pager") {
+        index += 1;
+    }
+    let subcommand = words.get(index)?;
+    if !matches!(subcommand.as_str(), "status" | "diff") {
+        return None;
+    }
+    normalized.push(subcommand.clone());
+    if subcommand == "diff" {
+        normalized.extend(["--no-ext-diff".to_owned(), "--no-textconv".to_owned()]);
+    }
+    index += 1;
+    while index < words.len() {
+        let word = &words[index];
+        if word == "--" {
+            // Git re-resolves pathspecs and repository metadata after the
+            // permission decision. Keep auto-classification to repository
+            // queries without user-controlled filesystem operands.
+            return None;
+        } else if subcommand == "status" {
+            if !safe_git_status_flag(word) {
+                return None;
+            }
+            normalized.push(word.clone());
+        } else if word.starts_with('-') {
+            if !safe_git_diff_flag(word) {
+                return None;
+            }
+            normalized.push(word.clone());
+        } else if safe_git_revision(word) {
+            normalized.push(word.clone());
+        } else {
+            return None;
+        }
+        index += 1;
+    }
+    Some(normalized)
+}
+
+fn canonical_read_operand(
+    context: &ToolContext,
+    value: &str,
+    may_list_directory: bool,
+) -> Option<SafeReadOperand> {
+    if value == "-" || value.contains('\0') {
+        return None;
+    }
+    let path = context.resolve_path(value).ok()?;
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let metadata = std::fs::symlink_metadata(&canonical).ok()?;
+    if (!metadata.is_file() && !metadata.is_dir())
+        || metadata.is_dir() && !may_list_directory
+        || !context
+            .trusted_roots()
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        || context.read_path_denied(&canonical)
+        || may_list_directory && metadata.is_dir() && context.permissions.has_read_deny_rules()
+    {
+        return None;
+    }
+    Some(SafeReadOperand {
+        path: canonical,
+        directory: metadata.is_dir(),
+    })
+}
+
+fn safe_git_status_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-s" | "--short"
+            | "--porcelain"
+            | "--porcelain=v1"
+            | "--porcelain=v2"
+            | "-b"
+            | "--branch"
+            | "--show-stash"
+            | "--ahead-behind"
+            | "--no-ahead-behind"
+            | "-u"
+            | "--untracked-files"
+            | "-z"
+            | "--null"
+            | "--renames"
+            | "--no-renames"
+    ) || flag.starts_with("--untracked-files=")
+        || flag.starts_with("--ignored=")
+        || flag.starts_with("--find-renames=")
+}
+
+fn safe_git_diff_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--cached"
+            | "--staged"
+            | "--stat"
+            | "--numstat"
+            | "--shortstat"
+            | "--name-only"
+            | "--name-status"
+            | "--summary"
+            | "--check"
+            | "--exit-code"
+            | "--quiet"
+            | "--binary"
+            | "--full-index"
+            | "--abbrev"
+            | "-p"
+            | "-u"
+            | "--patch"
+            | "--no-patch"
+            | "-U0"
+            | "-U1"
+            | "-U2"
+            | "-U3"
+    ) || flag.starts_with("--unified=")
+        || flag.starts_with("--stat=")
+        || flag.starts_with("--diff-filter=")
+}
+
+fn safe_git_revision(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['.', '/', '~'])
+        && !value.contains("..")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'/' | b'^' | b'~' | b':' | b'.')
+        })
+}
+
+fn safe_ls_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-a" | "-A"
+            | "-l"
+            | "-h"
+            | "-n"
+            | "-1"
+            | "-d"
+            | "-F"
+            | "-p"
+            | "-R"
+            | "-r"
+            | "-S"
+            | "-t"
+            | "-u"
+            | "-U"
+            | "-x"
+            | "-X"
+            | "--all"
+            | "--almost-all"
+            | "--directory"
+            | "--human-readable"
+            | "--inode"
+            | "--numeric-uid-gid"
+            | "--reverse"
+            | "--recursive"
+            | "--size"
+    ) || flag.len() > 2
+        && flag[1..]
+            .bytes()
+            .all(|byte| b"aAlhn1dFprStuxX".contains(&byte))
+}
+
+fn is_compact_count_flag(flag: &str) -> bool {
+    flag.strip_prefix('-').is_some_and(safe_count)
+        || flag.len() > 2
+            && matches!(flag.as_bytes().get(1), Some(b'n' | b'c'))
+            && safe_count(&flag[2..])
+}
+
+fn safe_count(value: &str) -> bool {
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 async fn execute_bash(
     context: &ToolContext,
     input: Value,
     capture_policy: ForegroundCapturePolicy,
 ) -> Result<ToolOutput> {
+    let safe_query = safe_query_plan(context, &input);
     let input: Input = parse_input(input)?;
     if input.command.trim().is_empty() {
         bail!("command 不能为空")
@@ -165,17 +586,31 @@ async fn execute_bash(
         }
         return spawn_background(context, &shell, input.command, timeout_ms).await;
     }
-    let (cwd_path, cwd_file) = create_private_cwd_marker(context)?;
-    let _cwd_marker_guard = CwdMarkerGuard(cwd_path.clone());
-    drop(cwd_file);
-    let (mut command, sandbox_warning) =
-        match shell_command(context, &shell, &input.command, Some(&cwd_path)) {
-            Ok(command) => command,
-            Err(error) => {
-                let _ = std::fs::remove_file(&cwd_path);
-                return Err(error);
+    let cwd_marker = if safe_query.is_none() {
+        let (path, file) = create_private_cwd_marker(context)?;
+        drop(file);
+        Some((path.clone(), CwdMarkerGuard(path)))
+    } else {
+        None
+    };
+    let command_result = match &safe_query {
+        Some(plan) => safe_shell_query_command(context, plan),
+        None => shell_command(
+            context,
+            &shell,
+            &input.command,
+            cwd_marker.as_ref().map(|(path, _)| path.as_path()),
+        ),
+    };
+    let (mut command, sandbox_warning) = match command_result {
+        Ok(command) => command,
+        Err(error) => {
+            if let Some((path, _)) = &cwd_marker {
+                let _ = std::fs::remove_file(path);
             }
-        };
+            return Err(error);
+        }
+    };
     let (output_path, output_file) = create_private_output(context, "foreground")?;
     let mut output_guard = OutputFileGuard::new(output_path.clone());
     let (mut child, process_guard, drains, capture_truncated) =
@@ -183,7 +618,9 @@ async fn execute_bash(
             Ok(spawned) => spawned,
             Err(error) => {
                 let _ = std::fs::remove_file(&output_path);
-                let _ = std::fs::remove_file(&cwd_path);
+                if let Some((path, _)) = &cwd_marker {
+                    let _ = std::fs::remove_file(path);
+                }
                 return Err(error);
             }
         };
@@ -210,9 +647,13 @@ async fn execute_bash(
         .as_ref()
         .is_some_and(std::process::ExitStatus::success)
     {
-        append_cwd_update(context, &cwd_path, &mut preview).await;
+        if let Some((path, _)) = &cwd_marker {
+            append_cwd_update(context, path, &mut preview).await;
+        }
     }
-    let _ = std::fs::remove_file(&cwd_path);
+    if let Some((path, _)) = &cwd_marker {
+        let _ = std::fs::remove_file(path);
+    }
     let keep_output = retain_long_output && (preview_truncated || capture_was_truncated);
     if keep_output {
         output_guard.keep();
@@ -382,6 +823,180 @@ pub(crate) fn shell_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     Ok((command, warning))
+}
+
+fn safe_shell_query_command(
+    context: &ToolContext,
+    plan: &SafeQueryPlan,
+) -> Result<(Command, Option<String>)> {
+    #[cfg(windows)]
+    {
+        let _ = (context, plan);
+        bail!("Windows 尚未启用固定 argv 的 Bash 只读分类")
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
+
+        let cwd = open_safe_query_directory(context, &context.cwd())?;
+        let mut operands = Vec::with_capacity(plan.operands.len());
+        let mut script = plan.script.clone();
+        for (index, operand) in plan.operands.iter().enumerate() {
+            let file = open_safe_query_operand(context, operand)?;
+            let descriptor = SAFE_QUERY_FD_BASE
+                .checked_add(i32::try_from(index).ok().context("只读查询 fd 数量溢出")?)
+                .context("只读查询 fd 编号溢出")?;
+            let marker = format!("__OAH_SAFE_READ_FD_{index}__");
+            let suffix = if operand.directory { "/" } else { "" };
+            script = script.replace(&marker, &format!("/dev/fd/{descriptor}{suffix}"));
+            operands.push(file);
+        }
+        let args = [OsString::from("-c"), OsString::from(script)];
+        let prepared = context.sandbox_runtime().command(
+            &context.cwd(),
+            std::ffi::OsStr::new("/bin/sh"),
+            &args,
+        )?;
+        let (mut command, warning) = prepared.into_parts();
+        context.scrub_child_environment(&mut command);
+        let cwd_fd = cwd.as_raw_fd();
+        let operand_fds = operands
+            .iter()
+            .map(|file| file.as_raw_fd())
+            .collect::<Vec<_>>();
+        // SAFETY: only async-signal-safe descriptor operations run between
+        // fork and exec. The captured File handles keep every source fd live.
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                let _keep_alive = (&cwd, &operands);
+                if libc::fchdir(cwd_fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let temporary_base = SAFE_QUERY_FD_BASE
+                    .checked_add(i32::try_from(operand_fds.len()).unwrap_or(i32::MAX))
+                    .and_then(|value| value.checked_add(16))
+                    .ok_or_else(|| std::io::Error::other("safe query fd range overflow"))?;
+                let mut temporary = Vec::with_capacity(operand_fds.len());
+                for (index, source) in operand_fds.iter().copied().enumerate() {
+                    let minimum = temporary_base
+                        .checked_add(i32::try_from(index).unwrap_or(i32::MAX))
+                        .ok_or_else(|| std::io::Error::other("safe query fd range overflow"))?;
+                    let duplicated = libc::fcntl(source, libc::F_DUPFD_CLOEXEC, minimum);
+                    if duplicated == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    temporary.push(duplicated);
+                }
+                for (index, source) in temporary.iter().copied().enumerate() {
+                    let target = SAFE_QUERY_FD_BASE + i32::try_from(index).unwrap_or(i32::MAX);
+                    if libc::dup2(source, target) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(target, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for descriptor in temporary {
+                    libc::close(descriptor);
+                }
+                Ok(())
+            });
+        }
+        command
+            // A classified query must not inherit shell startup variables,
+            // exported functions, Git repository overrides, alternate object
+            // stores, config paths, pager commands, or executable search
+            // paths from the harness process.
+            .env_clear()
+            .current_dir(context.cwd())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LC_ALL", "C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Ok((command, warning))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_safe_query_directory(context: &ToolContext, path: &Path) -> Result<File> {
+    let operand = SafeReadOperand {
+        path: path.to_owned(),
+        directory: true,
+    };
+    open_safe_query_operand(context, &operand)
+}
+
+#[cfg(not(windows))]
+fn open_safe_query_operand(context: &ToolContext, operand: &SafeReadOperand) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    if operand.directory {
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    let file = options
+        .open(&operand.path)
+        .with_context(|| format!("只读查询路径无法安全打开: {}", operand.path.display()))?;
+    let metadata = file.metadata()?;
+    if metadata.is_dir() != operand.directory || !metadata.is_file() && !metadata.is_dir() {
+        bail!(
+            "只读查询路径类型在授权后发生变化: {}",
+            operand.path.display()
+        )
+    }
+    let final_path = opened_safe_query_path(&file)?;
+    if !context
+        .trusted_roots()
+        .iter()
+        .any(|root| final_path.starts_with(root))
+        || context.read_path_denied(&final_path)
+        || operand.directory && context.permissions.has_read_deny_rules()
+    {
+        bail!("只读查询已打开路径越过可信或 Read 权限边界")
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn opened_safe_query_path(file: &File) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .context("无法从已打开句柄复核只读查询最终路径")
+}
+
+#[cfg(target_os = "macos")]
+fn opened_safe_query_path(file: &File) -> Result<PathBuf> {
+    use std::{
+        ffi::CStr,
+        os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+    };
+
+    let mut buffer = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path into this live buffer.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("无法从已打开句柄复核只读查询最终路径");
+    }
+    // SAFETY: successful F_GETPATH guarantees NUL termination.
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn opened_safe_query_path(_: &File) -> Result<PathBuf> {
+    bail!("当前 Unix 平台不支持从句柄复核只读查询最终路径")
 }
 
 async fn append_cwd_update(context: &ToolContext, marker: &Path, output: &mut String) {
@@ -707,7 +1322,8 @@ mod tests {
     use super::*;
     use crate::{
         permissions::{PermissionManager, PermissionMode},
-        tools::TaskOutputTool,
+        sandbox::{SandboxConfig, SandboxRuntime},
+        tools::{TaskOutputTool, ToolExecutionObserver, ToolRegistry},
     };
 
     fn test_context(workspace: &Path) -> ToolContext {
@@ -734,6 +1350,182 @@ mod tests {
             .and_then(|line| line.strip_prefix("Command running in background with ID: "))
             .expect("background task id")
             .to_owned()
+    }
+
+    fn context_with_mode(workspace: &Path, mode: PermissionMode, deny: Vec<String>) -> ToolContext {
+        let context = ToolContext::new(
+            workspace.to_owned(),
+            PermissionManager::new(mode, false, Vec::new(), deny),
+        );
+        context
+            .set_task_capture_root(workspace.join(".test-task-captures"))
+            .unwrap();
+        context
+    }
+
+    #[test]
+    fn read_only_classifier_is_static_path_aware_and_fail_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("public.txt"), "public").unwrap();
+        std::fs::write(workspace.path().join("secret.txt"), "secret").unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        let context = context_with_mode(
+            workspace.path(),
+            PermissionMode::Plan,
+            vec!["Read(secret.txt)".to_owned()],
+        );
+
+        for command in [
+            "pwd",
+            "pwd -P",
+            "cat public.txt",
+            "head -n 1 public.txt",
+            "tail -1 public.txt",
+            "wc -l public.txt",
+            "cat public.txt | head -n 1",
+        ] {
+            assert!(
+                BashTool.read_only_for(&context, &json!({"command":command})),
+                "expected safe: {command}"
+            );
+        }
+        let outside_command = format!("cat {}", outside.path().join("outside.txt").display());
+        for command in [
+            "cat secret.txt".to_owned(),
+            outside_command,
+            "git status".to_owned(),
+            "git -C . status".to_owned(),
+            "sh -c 'pwd'".to_owned(),
+            "cat $(pwd)/public.txt".to_owned(),
+            "cat <(printf public)".to_owned(),
+            "cat public.txt > copy.txt".to_owned(),
+            "alias cat=false; cat public.txt".to_owned(),
+            "cd . && pwd".to_owned(),
+            "cat public.txt | tee copy.txt".to_owned(),
+            "cat public.txt | rm public.txt".to_owned(),
+            "git diff -- public.txt".to_owned(),
+        ] {
+            assert!(
+                !BashTool.read_only_for(&context, &json!({"command":command})),
+                "expected unsafe: {command}"
+            );
+        }
+        assert!(!BashTool.read_only_for(
+            &context,
+            &json!({"command":"cat public.txt", "run_in_background":true})
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan_and_dont_ask_execute_only_classified_queries() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("data.txt"), "safe-data\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let registry = ToolRegistry::default();
+        let plan = context_with_mode(workspace.path(), PermissionMode::Plan, Vec::new());
+        for command in [
+            "pwd",
+            "cat data.txt",
+            "git status --short",
+            "git diff --stat",
+        ] {
+            let output = registry
+                .execute(&plan, "Bash", json!({"command":command}))
+                .await;
+            assert!(!output.is_error, "{command}: {}", output.content);
+        }
+        let denied = registry
+            .execute(
+                &plan,
+                "Bash",
+                json!({"command":"printf mutation > data.txt"}),
+            )
+            .await;
+        assert!(denied.is_error);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("data.txt")).unwrap(),
+            "safe-data\n"
+        );
+
+        let dont_ask = context_with_mode(workspace.path(), PermissionMode::DontAsk, Vec::new());
+        let allowed = registry
+            .execute(&dont_ask, "Bash", json!({"command":"cat data.txt"}))
+            .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
+        let denied = registry
+            .execute(&dont_ask, "Bash", json!({"command":"touch denied.txt"}))
+            .await;
+        assert!(denied.is_error);
+        assert!(!workspace.path().join("denied.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classified_file_query_rejects_symlink_swap_before_execution() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("public.txt"), "public").unwrap();
+        std::fs::write(outside.path().join("public.txt"), "outside-secret").unwrap();
+        let context = context_with_mode(workspace.path(), PermissionMode::Plan, Vec::new());
+        let plan = safe_query_plan(&context, &json!({"command":"cat nested/public.txt"}))
+            .expect("initial path is classifiable");
+
+        std::fs::rename(&nested, workspace.path().join("nested-original")).unwrap();
+        symlink(outside.path(), &nested).unwrap();
+        let error = safe_shell_query_command(&context, &plan).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("越过可信") || format!("{error:#}").contains("安全打开")
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_fails_closed_for_fd_backed_file_queries() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("public.txt"), "public").unwrap();
+        let context = context_with_mode(workspace.path(), PermissionMode::Plan, Vec::new());
+        let config = SandboxConfig {
+            enabled: true,
+            ..SandboxConfig::default()
+        };
+        context.set_sandbox_runtime(SandboxRuntime::new(config).unwrap());
+
+        assert!(!BashTool.read_only_for(&context, &json!({"command":"cat public.txt"})));
+        assert!(BashTool.read_only_for(&context, &json!({"command":"pwd"})));
+    }
+
+    #[tokio::test]
+    async fn classified_bash_queries_share_the_parallel_batch_lane() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("one.txt"), "one").unwrap();
+        std::fs::write(workspace.path().join("two.txt"), "two").unwrap();
+        let context = context_with_mode(workspace.path(), PermissionMode::Plan, Vec::new());
+        let registry = ToolRegistry::default();
+        let calls = vec![
+            ("Bash".to_owned(), json!({"command":"cat one.txt"})),
+            ("Bash".to_owned(), json!({"command":"cat two.txt"})),
+        ];
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = Arc::clone(&events);
+        let finished = Arc::clone(&events);
+        let observer = ToolExecutionObserver::new(
+            Arc::new(move |index| started.lock().unwrap().push(("start", index))),
+            Arc::new(move |index, _, _| finished.lock().unwrap().push(("finish", index))),
+        );
+        let outputs = registry
+            .execute_batch_observed(&context, &calls, Some(&observer))
+            .await;
+        assert!(outputs.iter().all(|output| !output.is_error));
+        let events = events.lock().unwrap();
+        assert_eq!(&events[..2], &[("start", 0), ("start", 1)]);
     }
 
     #[tokio::test]

@@ -8,8 +8,9 @@ const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_SYSTEM_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use ignore::{DirEntry, WalkBuilder};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
@@ -22,11 +23,11 @@ use open_agent_harness::{
     commands::{self, CommandOutcome, CustomCommandCatalog},
     config::{DEFAULT_MODEL, EndpointConfig, ModelOption, Settings, endpoint_config},
     control::{ControlHandle, ControlSession, InboundMessage},
-    file_history::FileHistory,
+    file_history::{CheckpointInfo, CheckpointStatus, FileHistory, RewindReport},
     hooks::{HookExecutionEvent, HookObserver, HookRunner},
     interactions::UserInteractionHandler,
     lsp::configure_lsp,
-    mcp::{McpHookInvoker, connect_mcp},
+    mcp::{McpControl, McpHookInvoker, connect_mcp},
     permissions::{PermissionManager, PermissionMode},
     plan::plan_tools,
     plugin_manager::run_plugin_command,
@@ -36,7 +37,8 @@ use open_agent_harness::{
     session::{SessionStateRoot, SessionStore},
     structured_output::StructuredOutputTool,
     terminal::{
-        ConversationUi, InputEditor, ModelPickerOutcome, SlashCommandSuggestion, select_model,
+        ConversationUi, FileSuggestion, InputEditor, ModelPickerOutcome, SlashCommandSuggestion,
+        select_model,
     },
     tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
     web_tools::configure_web,
@@ -244,12 +246,14 @@ async fn run(
         .into_iter()
         .map(|root| open_file_history(&cli, &root, store.id, session_state_root.as_ref()))
         .collect::<Result<Vec<_>>>()?;
+    let session_file_histories = file_histories.clone();
     tool_context.set_file_histories(file_histories)?;
     let mut active_tools = Vec::new();
     let mut deferred_tools = Vec::new();
     let mut services = Vec::new();
     let mut discoveries = Vec::new();
     let mut mcp_hook_invoker: Option<Arc<dyn McpHookInvoker>> = None;
+    let mut mcp_control: Option<Arc<dyn McpControl>> = None;
     if let Some(schema) = parse_json_schema(cli.json_schema.as_deref())? {
         active_tools.push(StructuredOutputTool::new(schema)?.into_tool());
     }
@@ -261,6 +265,7 @@ async fn run(
     deferred_tools.extend(plan_tools());
     if let Some(integration) = connect_mcp(&settings, &active_cwd, cli.debug).await? {
         mcp_hook_invoker = Some(Arc::clone(&integration.hook_invoker));
+        mcp_control = Some(Arc::clone(&integration.control));
         if cli.debug {
             eprintln!(
                 "[debug] configured {} MCP server(s), {} deferred tool(s)",
@@ -410,7 +415,7 @@ async fn run(
             return Err(error);
         }
     };
-    let memory_extractor = AutoMemoryExtractor::new(memory, client.clone(), cli.debug);
+    let memory_extractor = AutoMemoryExtractor::new(memory.clone(), client.clone(), cli.debug);
     let mut engine = QueryEngine::new(
         client,
         registry,
@@ -435,6 +440,10 @@ async fn run(
         output_style: &output_style,
         available_output_styles: &available_output_styles,
         model_options: &model_options,
+        memory: &memory,
+        mcp_control: mcp_control.as_ref(),
+        session_state_root: session_state_root.as_ref(),
+        file_histories: &session_file_histories,
     };
     let engine_setup = (|| -> Result<()> {
         engine.install_custom_agents(agents.custom_agents)?;
@@ -535,8 +544,9 @@ async fn run(
                 &hooks,
             )
             .await?;
+            let content = expand_explicit_file_mentions(&engine, prompt).await?;
             let result = engine
-                .run_turn_interruptible(prompt)
+                .run_turn_content_interruptible(content)
                 .await?
                 .ok_or(CliInterrupted)?;
             persist_turn(&store, &engine, &result)?;
@@ -604,11 +614,13 @@ async fn run(
                         // always reflects the current command catalog.
                         let slash_commands =
                             available_command_suggestions(&command_context, &custom_commands);
+                        let file_suggestions = workspace_file_suggestions(&command_context);
                         let Some(read) = editor
                             .read(
                                 engine.permission_mode(),
                                 engine.permission_mode_locked(),
                                 &slash_commands,
+                                &file_suggestions,
                             )?
                         else {
                             break;
@@ -749,10 +761,104 @@ async fn run(
                     }
                     continue;
                 }
+                CommandOutcome::ShowHelp => {
+                    print_command_help(&command_context, &custom_commands);
+                    continue;
+                }
+                CommandOutcome::ShowStatus => {
+                    print_session_status(&engine, &session_metadata);
+                    continue;
+                }
+                CommandOutcome::ShowTasks => {
+                    print_task_status(&command_context).await?;
+                    continue;
+                }
+                CommandOutcome::ShowDiff(argument) => {
+                    if let Err(error) = print_checkpoint_diff(
+                        &engine,
+                        session_metadata.file_histories,
+                        &argument,
+                    ) {
+                        eprintln!("Diff unavailable: {error:#}");
+                    }
+                    continue;
+                }
+                CommandOutcome::Rewind(argument) => {
+                    if let Err(error) = handle_rewind_command(
+                        &mut engine,
+                        &store,
+                        session_metadata.file_histories,
+                        &argument,
+                    ) {
+                        eprintln!("Rewind failed: {error:#}");
+                    }
+                    continue;
+                }
+                CommandOutcome::Resume(argument) => {
+                    if let Err(error) = print_resume_sessions(&session_metadata, &argument) {
+                        eprintln!("Resume unavailable: {error:#}");
+                    }
+                    continue;
+                }
+                CommandOutcome::ShowSkills => {
+                    print_skill_status(&command_context);
+                    continue;
+                }
+                CommandOutcome::ShowHooks => {
+                    println!(
+                        "Hooks: {}",
+                        if hooks.is_empty() { "none" } else { "configured" }
+                    );
+                    continue;
+                }
+                CommandOutcome::ShowMemory => {
+                    print_memory_status(&memory)?;
+                    continue;
+                }
+                CommandOutcome::ManageMcp(argument) => {
+                    if argument.is_empty() || argument == "status" || argument == "list" {
+                        print_mcp_status(mcp_control.as_deref());
+                    } else if let Some(server) = argument.strip_prefix("reconnect ") {
+                        let server = server.trim();
+                        let control = mcp_control
+                            .as_deref()
+                            .context("当前没有配置 MCP server")?;
+                        control.reconnect(server).await?;
+                        let refresh = engine
+                            .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                            .await;
+                        if refresh.is_error {
+                            bail!("MCP 已重连但工具刷新失败: {}", refresh.content)
+                        }
+                        println!("Reconnected MCP server {server}.");
+                        print_mcp_status(Some(control));
+                    } else {
+                        eprintln!("Usage: /mcp [status|list|reconnect <server>]");
+                    }
+                    continue;
+                }
+                CommandOutcome::ShowSandbox => {
+                    print_sandbox_status(&command_context);
+                    continue;
+                }
+                CommandOutcome::ShowPlugins => {
+                    println!(
+                        "Plugins: {} loaded; lifecycle commands: open-agent-harness plugin --help",
+                        plugin_count
+                    );
+                    continue;
+                }
                 CommandOutcome::Submit(prompt) => prompt,
                 CommandOutcome::NotCommand => input,
             };
-            let turn = engine.run_turn_interruptible(input).await;
+            let content = match expand_explicit_file_mentions(&engine, input).await {
+                Ok(content) => content,
+                Err(error) => {
+                    eprintln!("Attachment failed: {error:#}");
+                    continue;
+                }
+            };
+            let turn = engine.run_turn_content_interruptible(content).await;
             match turn {
                 Ok(Some(result)) => {
                     persist_turn(&store, &engine, &result)?;
@@ -876,8 +982,9 @@ async fn drain_print_scheduled_prompts(
         };
         let prompt =
             resolve_extension_input(prompt, context, metadata.commands, metadata.hooks).await?;
+        let content = expand_explicit_file_mentions(engine, prompt).await?;
         let result = engine
-            .run_turn_interruptible(prompt)
+            .run_turn_content_interruptible(content)
             .await?
             .ok_or(CliInterrupted)?;
         persist_turn(store, engine, &result)?;
@@ -1369,6 +1476,8 @@ fn emit_stream_init(
             "cwd":".",
             "tools":engine.registered_tool_names(),
             "commands":available_command_names(metadata.command_context, metadata.commands),
+            "command_descriptors":command_descriptors(metadata.command_context, metadata.commands),
+            "commandDescriptors":command_descriptors(metadata.command_context, metadata.commands),
             "skills":metadata.command_context.skill_catalog().iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
             "agents":metadata.custom_agents,
             "plugin_count":metadata.plugin_count,
@@ -1378,8 +1487,11 @@ fn emit_stream_init(
                 "cancel_async_message_v1",
                 "command_lifecycle_v1",
                 "interrupt_receipt_v1",
+                "mcp_reconnect_v1",
                 "queue_priority_v1",
-                "replay_user_messages_v1"
+                "replay_user_messages_v1",
+                "rewind_conversation_v1",
+                "stop_task_v1"
             ],
         }),
     )
@@ -1546,7 +1658,7 @@ async fn run_control_session(
             InboundMessage::ControlRequest {
                 request_id,
                 request,
-            } => handle_control_request(&handle, &request_id, &request, engine, metadata)?,
+            } => handle_control_request(&handle, &request_id, &request, engine, metadata).await?,
             InboundMessage::UpdateEnvironmentVariables { variables } => {
                 emit_json_line(
                     Some(&handle),
@@ -1660,9 +1772,13 @@ struct SessionMetadata<'a> {
     output_style: &'a str,
     available_output_styles: &'a [String],
     model_options: &'a [ModelOption],
+    memory: &'a AutoMemory,
+    mcp_control: Option<&'a Arc<dyn McpControl>>,
+    session_state_root: Option<&'a SessionStateRoot>,
+    file_histories: &'a [FileHistory],
 }
 
-fn handle_control_request(
+async fn handle_control_request(
     handle: &ControlHandle,
     request_id: &str,
     request: &Value,
@@ -1678,6 +1794,8 @@ fn handle_control_request(
         "initialize" => Ok(json!({
             "session_id":store.id,
             "commands":available_command_names(metadata.command_context, metadata.commands),
+            "command_descriptors":command_descriptors(metadata.command_context, metadata.commands),
+            "commandDescriptors":command_descriptors(metadata.command_context, metadata.commands),
             "agents":metadata.custom_agents,
             "models":metadata.model_options.iter().map(|option| json!({
                 "value":option.value,
@@ -1691,8 +1809,11 @@ fn handle_control_request(
                 "cancel_async_message_v1",
                 "command_lifecycle_v1",
                 "interrupt_receipt_v1",
+                "mcp_reconnect_v1",
                 "queue_priority_v1",
-                "replay_user_messages_v1"
+                "replay_user_messages_v1",
+                "rewind_conversation_v1",
+                "stop_task_v1"
             ],
         })),
         "interrupt" => Ok(json!({
@@ -1731,15 +1852,135 @@ fn handle_control_request(
                 "gridRows":[], "model":engine.model, "memoryFiles":[]
             }))
         }
+        "mcp_status" => Ok(json!({
+            "servers": metadata
+                .mcp_control
+                .map(|control| control.status())
+                .unwrap_or_default()
+        })),
+        "mcp_reconnect" => {
+            async {
+                let server = request
+                    .get("server")
+                    .or_else(|| request.get("name"))
+                    .and_then(Value::as_str)
+                    .context("mcp_reconnect 需要 server")?;
+                let control = metadata.mcp_control.context("当前没有配置 MCP server")?;
+                control.reconnect(server).await?;
+                let refresh = engine
+                    .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                    .await;
+                if refresh.is_error {
+                    bail!("MCP 已重连但工具刷新失败: {}", refresh.content)
+                }
+                Ok(json!({"server":server, "reconnected":true, "servers":control.status()}))
+            }
+            .await
+        }
+        "stop_task" => {
+            async {
+                let task_id = request
+                    .get("task_id")
+                    .or_else(|| request.get("taskId"))
+                    .and_then(Value::as_str)
+                    .context("stop_task 需要 task_id")?;
+                let output = engine
+                    .execute_command_tool("TaskStop", json!({"task_id":task_id}))
+                    .await;
+                if output.interrupted {
+                    bail!("stop_task 被中断")
+                }
+                if output.is_error {
+                    bail!("stop_task 失败: {}", output.content)
+                }
+                Ok(json!({"task_id":task_id, "stopped":true, "result":output.content}))
+            }
+            .await
+        }
+        "get_settings" => {
+            let sandbox = metadata.command_context.sandbox_runtime();
+            Ok(json!({
+                "model":engine.model,
+                "permission_mode":permission_mode_name(engine.permission_mode()),
+                "output_style":metadata.output_style,
+                "available_output_styles":metadata.available_output_styles,
+                "plugin_count":metadata.plugin_count,
+                "memory_enabled":metadata.memory.enabled(),
+                "hooks_configured":!metadata.hooks.is_empty(),
+                "sandbox":{"enabled":sandbox.enabled(), "available":sandbox.available()},
+                "trusted_root_count":metadata.command_context.trusted_roots().len(),
+                "mcp_servers":metadata.mcp_control.map(|control| control.status()).unwrap_or_default(),
+            }))
+        }
+        "rewind" => (|| -> Result<Value> {
+            let checkpoint = request
+                .get("checkpoint_id")
+                .or_else(|| request.get("checkpointId"))
+                .or_else(|| request.get("user_message_id"))
+                .or_else(|| request.get("userMessageId"))
+                .and_then(Value::as_str)
+                .context("rewind 需要 user_message_id 或 checkpoint_id")?
+                .parse::<Uuid>()
+                .context("rewind id 必须是 UUID")?;
+            let dry_run = request
+                .get("dry_run")
+                .or_else(|| request.get("dryRun"))
+                .map(|value| value.as_bool().context("dry_run 必须是 boolean"))
+                .transpose()?
+                .unwrap_or(false);
+            let rewind_files = request
+                .get("files")
+                .map(|value| value.as_bool().context("files 必须是 boolean"))
+                .transpose()?
+                .unwrap_or(true);
+            let rewind_conversation = request
+                .get("conversation")
+                .map(|value| value.as_bool().context("conversation 必须是 boolean"))
+                .transpose()?
+                .unwrap_or(true);
+            if !rewind_files && !rewind_conversation {
+                bail!("rewind 至少需要 files 或 conversation")
+            }
+            let (stats, message_count) = engine.diff_files(checkpoint)?;
+            if dry_run {
+                return Ok(json!({
+                    "canRewind":true,
+                    "messageCount":message_count,
+                    "filesChanged":stats.files_changed,
+                    "insertions":stats.insertions,
+                    "deletions":stats.deletions,
+                }));
+            }
+            let (report, applied_message_count) = apply_rewind(
+                engine,
+                metadata.store,
+                checkpoint,
+                rewind_files,
+                rewind_conversation,
+            )?;
+            Ok(json!({
+                "canRewind":true,
+                "messageCount":applied_message_count,
+                "conversationRewound":rewind_conversation,
+                "filesRewound":rewind_files,
+                "filesChanged":report
+                    .as_ref()
+                    .map_or(0, |report| report.files_changed.len()),
+                "restored":report.as_ref().map_or(0, |report| report.restored),
+                "deleted":report.as_ref().map_or(0, |report| report.deleted),
+            }))
+        })(),
         "rewind_files" => (|| -> Result<Value> {
             let checkpoint = request
                 .get("checkpoint_id")
+                .or_else(|| request.get("checkpointId"))
                 .or_else(|| request.get("user_message_id"))
+                .or_else(|| request.get("userMessageId"))
                 .and_then(Value::as_str)
                 .context("rewind_files 需要 user_message_id 或 checkpoint_id")?
                 .parse::<Uuid>()
                 .context("rewind_files id 必须是 UUID")?;
-            let dry_run = match request.get("dry_run") {
+            let dry_run = match request.get("dry_run").or_else(|| request.get("dryRun")) {
                 Some(value) => value.as_bool().context("dry_run 必须是 boolean")?,
                 None => false,
             };
@@ -1774,18 +2015,331 @@ fn handle_control_request(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewindCommandOptions {
+    checkpoint: Uuid,
+    files: bool,
+    conversation: bool,
+    confirm: bool,
+}
+
+fn checkpoint_catalog(histories: &[FileHistory]) -> Result<Vec<CheckpointInfo>> {
+    let mut by_id = std::collections::BTreeMap::<Uuid, CheckpointInfo>::new();
+    for history in histories {
+        for checkpoint in history.checkpoints()? {
+            if !matches!(checkpoint.status, CheckpointStatus::Committed) {
+                continue;
+            }
+            match by_id.entry(checkpoint.id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(checkpoint);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    if existing.message_count != checkpoint.message_count {
+                        bail!("跨 workspace checkpoint message_count 不一致")
+                    }
+                    existing.timestamp_ms = existing.timestamp_ms.max(checkpoint.timestamp_ms);
+                    existing.tracked_files = existing
+                        .tracked_files
+                        .saturating_add(checkpoint.tracked_files);
+                }
+            }
+        }
+    }
+    let mut checkpoints = by_id.into_values().collect::<Vec<_>>();
+    checkpoints.sort_by(|left, right| {
+        right
+            .timestamp_ms
+            .cmp(&left.timestamp_ms)
+            .then_with(|| right.message_count.cmp(&left.message_count))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(checkpoints)
+}
+
+fn print_checkpoint_catalog(histories: &[FileHistory]) -> Result<()> {
+    let checkpoints = checkpoint_catalog(histories)?;
+    if checkpoints.is_empty() {
+        println!("No committed checkpoints are available for this session.");
+        return Ok(());
+    }
+    println!("Committed checkpoints (newest first):");
+    for (index, checkpoint) in checkpoints.iter().take(100).enumerate() {
+        println!(
+            "  {}. {} — message {} · {} tracked file(s)",
+            index + 1,
+            checkpoint.id,
+            checkpoint.message_count,
+            checkpoint.tracked_files
+        );
+    }
+    println!("Use the list number or UUID with /diff and /rewind.");
+    Ok(())
+}
+
+fn resolve_checkpoint(
+    engine: &QueryEngine,
+    histories: &[FileHistory],
+    value: Option<&str>,
+) -> Result<Uuid> {
+    let checkpoints = checkpoint_catalog(histories)?;
+    match value {
+        Some(value) => {
+            if let Ok(id) = value.parse::<Uuid>() {
+                return Ok(id);
+            }
+            let index = value
+                .parse::<usize>()
+                .context("checkpoint 必须是 UUID 或 /diff list 显示的序号")?;
+            if index == 0 {
+                bail!("checkpoint 序号从 1 开始")
+            }
+            checkpoints
+                .get(index - 1)
+                .map(|checkpoint| checkpoint.id)
+                .context("checkpoint 序号超出当前列表")
+        }
+        None => checkpoints
+            .first()
+            .map(|checkpoint| checkpoint.id)
+            .or_else(|| engine.last_checkpoint())
+            .context("当前会话没有可用的 committed checkpoint"),
+    }
+}
+
+fn parse_rewind_options(
+    engine: &QueryEngine,
+    histories: &[FileHistory],
+    argument: &str,
+) -> Result<RewindCommandOptions> {
+    let mut checkpoint = None;
+    let mut files = true;
+    let mut conversation = true;
+    let mut confirm = false;
+    for token in argument.split_whitespace() {
+        match token {
+            "--confirm" => confirm = true,
+            "--files-only" if files && conversation => conversation = false,
+            "--conversation-only" if files && conversation => files = false,
+            "--files-only" | "--conversation-only" => {
+                bail!("--files-only 与 --conversation-only 不能同时使用")
+            }
+            _ if token.starts_with('-') => bail!("未知 rewind 参数: {token}"),
+            _ if checkpoint.is_none() => checkpoint = Some(token),
+            _ => bail!("rewind 只能指定一个 checkpoint id"),
+        }
+    }
+    Ok(RewindCommandOptions {
+        checkpoint: resolve_checkpoint(engine, histories, checkpoint)?,
+        files,
+        conversation,
+        confirm,
+    })
+}
+
+fn print_checkpoint_diff(
+    engine: &QueryEngine,
+    histories: &[FileHistory],
+    argument: &str,
+) -> Result<()> {
+    let argument = argument.trim();
+    if argument == "list" {
+        return print_checkpoint_catalog(histories);
+    }
+    if argument.split_whitespace().count() > 1 {
+        bail!("Usage: /diff [checkpoint-id]")
+    }
+    let checkpoint = resolve_checkpoint(
+        engine,
+        histories,
+        (!argument.is_empty()).then_some(argument),
+    )?;
+    let (stats, message_count) = engine.diff_files(checkpoint)?;
+    println!("Checkpoint {checkpoint}");
+    println!(
+        "  workspace: {} file(s), +{} -{}",
+        stats.files_changed.len(),
+        stats.insertions,
+        stats.deletions
+    );
+    println!(
+        "  conversation: {} -> {} message(s)",
+        engine.messages.len(),
+        message_count
+    );
+    for path in stats.files_changed.iter().take(50) {
+        println!("  {}", path.display());
+    }
+    if stats.files_changed.len() > 50 {
+        println!("  … {} more", stats.files_changed.len() - 50);
+    }
+    Ok(())
+}
+
+fn handle_rewind_command(
+    engine: &mut QueryEngine,
+    store: &SessionStore,
+    histories: &[FileHistory],
+    argument: &str,
+) -> Result<()> {
+    if argument.trim() == "list" {
+        return print_checkpoint_catalog(histories);
+    }
+    let options = parse_rewind_options(engine, histories, argument)?;
+    let (stats, message_count) = engine.diff_files(options.checkpoint)?;
+    if !options.confirm {
+        println!("Rewind preview for {}", options.checkpoint);
+        if options.files {
+            println!(
+                "  workspace: {} file(s), +{} -{}",
+                stats.files_changed.len(),
+                stats.insertions,
+                stats.deletions
+            );
+        } else {
+            println!("  workspace: unchanged");
+        }
+        if options.conversation {
+            println!(
+                "  conversation: {} -> {} message(s)",
+                engine.messages.len(),
+                message_count
+            );
+        } else {
+            println!("  conversation: unchanged");
+        }
+        let scope = if !options.conversation {
+            " --files-only"
+        } else if !options.files {
+            " --conversation-only"
+        } else {
+            ""
+        };
+        println!(
+            "  confirm with: /rewind {}{} --confirm",
+            options.checkpoint, scope
+        );
+        return Ok(());
+    }
+
+    let (report, _) = apply_rewind(
+        engine,
+        store,
+        options.checkpoint,
+        options.files,
+        options.conversation,
+    )?;
+    println!("Rewound checkpoint {}.", options.checkpoint);
+    if let Some(report) = report {
+        println!(
+            "  workspace: {} file(s), {} restored, {} deleted",
+            report.files_changed.len(),
+            report.restored,
+            report.deleted
+        );
+    }
+    if options.conversation {
+        println!("  conversation: {} message(s)", engine.messages.len());
+    }
+    Ok(())
+}
+
+fn apply_rewind(
+    engine: &mut QueryEngine,
+    store: &SessionStore,
+    checkpoint: Uuid,
+    files: bool,
+    conversation: bool,
+) -> Result<(Option<RewindReport>, usize)> {
+    let (_, message_count) = engine.diff_files(checkpoint)?;
+    let old_messages = engine.messages.clone();
+    if conversation {
+        if store.persistence_enabled() {
+            engine.messages = store.truncate_history(message_count)?;
+        } else {
+            if message_count > engine.messages.len() {
+                bail!("rewind message_count 超过当前内存会话")
+            }
+            engine.messages.truncate(message_count);
+        }
+    }
+    let report = if files {
+        match engine.rewind_files(checkpoint) {
+            Ok((report, _)) => Some(report),
+            Err(error) => {
+                if conversation {
+                    engine.messages = old_messages.clone();
+                    if let Err(restore) = store.replace_history(&old_messages) {
+                        return Err(error
+                            .context(format!("文件 rewind 失败，且会话恢复也失败: {restore:#}")));
+                    }
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    Ok((report, message_count))
+}
+
+fn print_resume_sessions(metadata: &SessionMetadata<'_>, argument: &str) -> Result<()> {
+    if !metadata.store.persistence_enabled() {
+        bail!("当前使用 --no-session-persistence，无法 resume")
+    }
+    let argument = argument.trim();
+    if !argument.is_empty() {
+        let id = argument.parse::<Uuid>().context("session id 必须是 UUID")?;
+        println!("A live session cannot safely replace its tool and file-history runtime.");
+        println!("Exit this session, then run:");
+        println!("  oah --resume {id}");
+        return Ok(());
+    }
+    let sessions = match metadata.session_state_root {
+        Some(root) => SessionStore::list_in(metadata.store.cwd(), root, 20)?,
+        None => SessionStore::list(metadata.store.cwd(), 20)?,
+    };
+    if sessions.is_empty() {
+        println!("No persisted sessions are available for this workspace.");
+        return Ok(());
+    }
+    println!("Recent sessions (newest first):");
+    for session in sessions {
+        let current = if session.id == metadata.store.id {
+            " (current)"
+        } else {
+            ""
+        };
+        println!("  {}{} — {} bytes", session.id, current, session.bytes);
+    }
+    println!("Use /resume <session-id> to print the safe restart command.");
+    Ok(())
+}
+
 fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalog) -> Vec<String> {
     let mut names = [
         "compact",
         "clear",
         "context",
         "cost",
+        "diff",
         "exit",
         "help",
+        "hooks",
         "init",
         "loop",
+        "memory",
+        "mcp",
         "model",
         "permissions",
+        "plugin",
+        "resume",
+        "rewind",
+        "sandbox",
+        "skills",
+        "status",
+        "tasks",
     ]
     .into_iter()
     .map(ToOwned::to_owned)
@@ -1795,6 +2349,464 @@ fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalo
     names.sort();
     names.dedup();
     names
+}
+
+fn command_descriptors(context: &ToolContext, commands: &CustomCommandCatalog) -> Vec<Value> {
+    available_command_suggestions(context, commands)
+        .into_iter()
+        .map(|command| {
+            json!({
+                "name":command.name,
+                "aliases":command.aliases,
+                "description":command.description,
+                "argumentHint":command.argument_hint,
+            })
+        })
+        .collect()
+}
+
+fn print_command_help(context: &ToolContext, commands: &CustomCommandCatalog) {
+    println!("Available commands:");
+    for suggestion in available_command_suggestions(context, commands) {
+        let aliases = if suggestion.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" (aliases: {})", suggestion.aliases.join(", "))
+        };
+        let argument = suggestion
+            .argument_hint
+            .as_deref()
+            .map(|hint| format!(" {hint}"))
+            .unwrap_or_default();
+        println!(
+            "  /{}{}{} — {}",
+            suggestion.name, argument, aliases, suggestion.description
+        );
+    }
+}
+
+const MAX_EXPLICIT_FILE_MENTIONS: usize = 8;
+const MAX_EXPLICIT_FILE_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_EXPLICIT_FILE_MEDIA_BYTES: usize = 12 * 1024 * 1024;
+const MAX_FILE_SUGGESTIONS: usize = 20_000;
+const MAX_FILE_SUGGESTION_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplicitFileMention {
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+fn workspace_file_suggestions(context: &ToolContext) -> Vec<FileSuggestion> {
+    let mut suggestions = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut retained_bytes = 0usize;
+    'roots: for root in context.trusted_roots() {
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .follow_links(false)
+            .max_depth(Some(32))
+            .hidden(false)
+            .ignore(true)
+            .parents(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .filter_entry(indexable_workspace_entry);
+        for entry in builder.build().filter_map(Result::ok).skip(1) {
+            if suggestions.len() >= MAX_FILE_SUGGESTIONS {
+                break 'roots;
+            }
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !(file_type.is_file() || file_type.is_dir()) {
+                continue;
+            }
+            let display_path = context.display_path(entry.path());
+            if display_path.is_empty()
+                || display_path.len() > 4096
+                || !seen.insert(display_path.clone())
+            {
+                continue;
+            }
+            let Some(next_bytes) = retained_bytes.checked_add(display_path.len()) else {
+                break 'roots;
+            };
+            if next_bytes > MAX_FILE_SUGGESTION_BYTES {
+                break 'roots;
+            }
+            retained_bytes = next_bytes;
+            suggestions.push(FileSuggestion {
+                display_path,
+                is_dir: file_type.is_dir(),
+            });
+        }
+    }
+    suggestions.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.display_path.cmp(&right.display_path))
+    });
+    suggestions
+}
+
+fn indexable_workspace_entry(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+        return true;
+    }
+    !matches!(
+        entry.file_name().to_str(),
+        Some(
+            ".git"
+                | ".hg"
+                | ".svn"
+                | ".venv"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | "__pycache__"
+        )
+    )
+}
+
+fn explicit_file_mentions(input: &str, engine: &QueryEngine) -> Vec<ExplicitFileMention> {
+    let mut mentions = Vec::new();
+    let mut cursor = 0;
+    while mentions.len() < MAX_EXPLICIT_FILE_MENTIONS {
+        let Some(relative) = input[cursor..].find('@') else {
+            break;
+        };
+        let at = cursor + relative;
+        let boundary = input[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|character| character.is_whitespace() || "([{'\"".contains(character));
+        if !boundary {
+            cursor = at + 1;
+            continue;
+        }
+        let start = at + 1;
+        let Some(first) = input[start..].chars().next() else {
+            break;
+        };
+        let (raw, end) = if first == '"' {
+            let quoted_start = start + first.len_utf8();
+            let Some((mut raw, quoted_end)) = parse_quoted_file_mention(input, quoted_start) else {
+                break;
+            };
+            let suffix_end = input[quoted_end..]
+                .strip_prefix("#L")
+                .and_then(|suffix| {
+                    let bytes = suffix
+                        .bytes()
+                        .take_while(|byte| byte.is_ascii_digit() || matches!(*byte, b'-' | b'L'))
+                        .count();
+                    (bytes > 0).then_some(quoted_end + 2 + bytes)
+                })
+                .unwrap_or(quoted_end);
+            raw.push_str(&input[quoted_end..suffix_end]);
+            (raw, suffix_end)
+        } else {
+            let end = input[start..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    (character.is_whitespace() || character.is_control()).then_some(start + offset)
+                })
+                .unwrap_or(input.len());
+            let raw = input[start..end]
+                .trim_end_matches([',', ';', ':', '!', '?', ')', ']', '}'])
+                .to_owned();
+            (raw, end)
+        };
+        cursor = end.max(at + 1);
+        if raw.is_empty() || raw.len() > 4096 {
+            continue;
+        }
+        let (path, offset, limit) = split_file_line_suffix(&raw);
+        let Some(path) = engine.explicit_workspace_file(path) else {
+            continue;
+        };
+        let mention = ExplicitFileMention {
+            path,
+            offset,
+            limit,
+        };
+        if !mentions.contains(&mention) {
+            mentions.push(mention);
+        }
+    }
+    mentions
+}
+
+fn parse_quoted_file_mention(input: &str, start: usize) -> Option<(String, usize)> {
+    let mut output = String::new();
+    let mut escaped = false;
+    for (offset, character) in input.get(start..)?.char_indices() {
+        if escaped {
+            match character {
+                '"' | '\\' => output.push(character),
+                other => {
+                    output.push('\\');
+                    output.push(other);
+                }
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some((output, start + offset + character.len_utf8()));
+        } else {
+            output.push(character);
+        }
+    }
+    None
+}
+
+fn split_file_line_suffix(raw: &str) -> (&str, Option<usize>, Option<usize>) {
+    let Some((path, suffix)) = raw.rsplit_once("#L") else {
+        return (raw, None, None);
+    };
+    let (first, last) = suffix
+        .split_once('-')
+        .map_or((suffix, None), |(first, last)| (first, Some(last)));
+    let Ok(first) = first.parse::<usize>() else {
+        return (raw, None, None);
+    };
+    if first == 0 || first > 10_000_000 {
+        return (raw, None, None);
+    }
+    let last = match last {
+        Some(last) => match last.strip_prefix('L').unwrap_or(last).parse::<usize>() {
+            Ok(last) if last >= first && last <= 10_000_000 => Some(last),
+            _ => return (raw, None, None),
+        },
+        None => Some(first),
+    };
+    let limit = last.and_then(|last| last.checked_sub(first)?.checked_add(1));
+    (path, Some(first), limit)
+}
+
+async fn expand_explicit_file_mentions(engine: &QueryEngine, input: String) -> Result<Value> {
+    let mentions = explicit_file_mentions(&input, engine);
+    if mentions.is_empty() {
+        return Ok(Value::String(input));
+    }
+    let mut blocks = vec![json!({"type":"text", "text":input})];
+    let mut text_bytes = 0usize;
+    let mut media_bytes = 0usize;
+    for mention in mentions {
+        let mut read_input = json!({"file_path":mention.path});
+        if let Some(offset) = mention.offset {
+            read_input["offset"] = json!(offset);
+        }
+        if let Some(limit) = mention.limit {
+            read_input["limit"] = json!(limit);
+        }
+        let output = engine.execute_command_tool("Read", read_input).await;
+        if output.interrupted {
+            bail!("附加文件读取被中断")
+        }
+        if output.is_error {
+            bail!("无法附加 {}: {}", mention.path, output.content)
+        }
+        text_bytes = text_bytes
+            .checked_add(output.content.len())
+            .ok_or_else(|| anyhow!("附加文件文本大小溢出"))?;
+        if text_bytes > MAX_EXPLICIT_FILE_TEXT_BYTES {
+            bail!("附加文件文本总量超过 1 MiB")
+        }
+        blocks.push(json!({
+            "type":"text",
+            "text":format!("Attached file {:?}:\n{}", mention.path, output.content)
+        }));
+        if let Some(Value::Array(media)) = output.model_content {
+            for block in media
+                .into_iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) != Some("text"))
+            {
+                media_bytes = media_bytes
+                    .checked_add(serde_json::to_vec(&block)?.len())
+                    .ok_or_else(|| anyhow!("附加媒体大小溢出"))?;
+                if media_bytes > MAX_EXPLICIT_FILE_MEDIA_BYTES {
+                    bail!("附加媒体总量超过 12 MiB")
+                }
+                blocks.push(block);
+            }
+        }
+    }
+    Ok(Value::Array(blocks))
+}
+
+fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
+    let context = metadata.command_context;
+    let (used, threshold, window) = engine.context_status();
+    let sandbox = context.sandbox_runtime();
+    println!("Session status:");
+    println!("  session: {}", metadata.store.id);
+    println!("  model: {}", engine.model);
+    println!("  cwd: {}", context.cwd().display());
+    println!(
+        "  permission: {}",
+        permission_mode_name(engine.permission_mode())
+    );
+    println!("  context: {used}/{window} estimated tokens (auto-compact at {threshold})");
+    println!(
+        "  tools: {} registered",
+        engine.registered_tool_names().len()
+    );
+    println!("  trusted roots: {}", context.trusted_roots().len());
+    println!("  skills: {}", context.skill_catalog().len());
+    println!("  plugins: {}", metadata.plugin_count);
+    println!(
+        "  hooks: {}",
+        if metadata.hooks.is_empty() {
+            "none"
+        } else {
+            "configured"
+        }
+    );
+    println!(
+        "  memory: {}",
+        if metadata.memory.enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "  sandbox: {}",
+        if !sandbox.enabled() {
+            "disabled"
+        } else if sandbox.available() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+}
+
+async fn print_task_status(context: &ToolContext) -> Result<()> {
+    let mut task_ids = context
+        .background_task_ids()
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    task_ids.sort();
+    let cron = context.cron_service().list()?;
+    if task_ids.is_empty() && cron.is_empty() {
+        println!("No background tasks or cron jobs.");
+        return Ok(());
+    }
+    if !task_ids.is_empty() {
+        println!("Background tasks:");
+        for id in task_ids {
+            println!("  {id}");
+        }
+    }
+    if !cron.is_empty() {
+        println!("Cron jobs:");
+        for job in cron {
+            println!(
+                "  {}  {}  next={}  {}",
+                job.id,
+                job.human_schedule,
+                job.next_fire_at_ms,
+                if job.durable { "durable" } else { "session" }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_skill_status(context: &ToolContext) {
+    let catalog = context.skill_catalog();
+    if catalog.is_empty() {
+        println!("No Skills are available.");
+        return;
+    }
+    println!("Available Skills:");
+    for (name, skill) in catalog.iter() {
+        println!(
+            "  /{}{} — {}",
+            name,
+            skill
+                .argument_hint
+                .as_deref()
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default(),
+            skill.description
+        );
+    }
+}
+
+fn print_memory_status(memory: &AutoMemory) -> Result<()> {
+    if !memory.enabled() {
+        println!("Memory is disabled. Enable it in trusted user settings.");
+        return Ok(());
+    }
+    let entries = memory.index()?;
+    println!(
+        "Memory: {} {}{}",
+        entries.len(),
+        if entries.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        memory
+            .path()
+            .map(|path| format!(" at {}", path.display()))
+            .unwrap_or_default()
+    );
+    for entry in entries.iter().take(20) {
+        let tags = if entry.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", entry.tags.join(", "))
+        };
+        println!("  {}{}", entry.title, tags);
+    }
+    if entries.len() > 20 {
+        println!("  … {} more", entries.len() - 20);
+    }
+    Ok(())
+}
+
+fn print_mcp_status(control: Option<&dyn McpControl>) {
+    let Some(control) = control else {
+        println!("No MCP servers are configured.");
+        return;
+    };
+    let statuses = control.status();
+    if statuses.is_empty() {
+        println!("No MCP servers are configured.");
+        return;
+    }
+    println!("MCP servers:");
+    for server in statuses {
+        println!("  {} — {:?}", server.name, server.status);
+    }
+}
+
+fn print_sandbox_status(context: &ToolContext) {
+    let sandbox = context.sandbox_runtime();
+    if !sandbox.enabled() {
+        println!("Sandbox: disabled");
+    } else if sandbox.available() {
+        println!("Sandbox: enabled and available");
+    } else {
+        println!(
+            "Sandbox: enabled but unavailable{}",
+            sandbox
+                .unavailable_reason()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        );
+    }
 }
 
 fn available_command_suggestions(
@@ -1811,14 +2823,33 @@ fn available_command_suggestions(
         ),
         ("context", &[][..], "Show context usage", None),
         ("cost", &[][..], "Show token usage", None),
+        (
+            "diff",
+            &[][..],
+            "Preview workspace changes since a checkpoint",
+            Some("[list|checkpoint-id|number]"),
+        ),
         ("exit", &["quit"][..], "Exit the session", None),
         ("help", &[][..], "Show available commands", None),
+        ("hooks", &[][..], "Show hook configuration status", None),
         ("init", &[][..], "Create or improve AGENTS.md", None),
         (
             "loop",
             &[][..],
             "Schedule a recurring prompt",
             Some("[interval] <prompt>"),
+        ),
+        (
+            "memory",
+            &[][..],
+            "Show local memory status and index",
+            None,
+        ),
+        (
+            "mcp",
+            &[][..],
+            "Show or reconnect MCP servers",
+            Some("[status|reconnect <server>]"),
         ),
         (
             "model",
@@ -1830,6 +2861,28 @@ fn available_command_suggestions(
             "permissions",
             &[][..],
             "Show the current permission mode",
+            None,
+        ),
+        ("plugin", &[][..], "Show trusted plugin status", None),
+        (
+            "resume",
+            &[][..],
+            "List resumable sessions or print a safe restart command",
+            Some("[session-id]"),
+        ),
+        (
+            "rewind",
+            &[][..],
+            "Preview or confirm a workspace and conversation rewind",
+            Some("[list|checkpoint-id|number] [--files-only|--conversation-only] [--confirm]"),
+        ),
+        ("sandbox", &[][..], "Show sandbox status", None),
+        ("skills", &[][..], "List available Skills", None),
+        ("status", &[][..], "Show current session status", None),
+        (
+            "tasks",
+            &["bashes"][..],
+            "List background tasks and cron jobs",
             None,
         ),
     ]
@@ -1881,6 +2934,136 @@ fn permission_mode_name(mode: PermissionMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_status_commands_are_present_in_palette_and_control_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let commands = CustomCommandCatalog::default();
+        let names = available_command_names(&context, &commands);
+        let suggestions = available_command_suggestions(&context, &commands);
+        for expected in [
+            "diff", "hooks", "mcp", "memory", "plugin", "resume", "rewind", "sandbox", "skills",
+            "status", "tasks",
+        ] {
+            assert!(names.iter().any(|name| name == expected));
+            assert!(
+                suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.name == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_file_line_suffix_is_bounded_and_inclusive() {
+        assert_eq!(
+            split_file_line_suffix("src/main.rs#L10-20"),
+            ("src/main.rs", Some(10), Some(11))
+        );
+        assert_eq!(
+            split_file_line_suffix("src/main.rs#L7"),
+            ("src/main.rs", Some(7), Some(1))
+        );
+        assert_eq!(
+            split_file_line_suffix("src/main.rs#L20-10"),
+            ("src/main.rs#L20-10", None, None)
+        );
+        assert_eq!(
+            split_file_line_suffix("src/main.rs#L0"),
+            ("src/main.rs#L0", None, None)
+        );
+        let input = "@\"file name.md\"#L2-L4 trailing";
+        let (mut raw, end) = parse_quoted_file_mention(input, 2).unwrap();
+        let suffix = &input[end..end + "#L2-L4".len()];
+        raw.push_str(suffix);
+        assert_eq!(raw, "file name.md#L2-L4");
+        assert_eq!(
+            split_file_line_suffix(&raw),
+            ("file name.md", Some(2), Some(3))
+        );
+
+        let escaped = "@\"a\\\"b.md\"";
+        assert_eq!(parse_quoted_file_mention(escaped, 2).unwrap().0, "a\"b.md");
+    }
+
+    #[test]
+    fn workspace_file_suggestions_are_bounded_and_skip_build_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("target/debug")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/info")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(temp.path().join("target/debug/ignored"), "x").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "ignored-secret.txt\n").unwrap();
+        std::fs::write(temp.path().join(".ignore"), "ignored-local.txt\n").unwrap();
+        std::fs::write(temp.path().join(".git/info/exclude"), "ignored-git.txt\n").unwrap();
+        std::fs::write(temp.path().join("ignored-secret.txt"), "secret").unwrap();
+        std::fs::write(temp.path().join("ignored-local.txt"), "secret").unwrap();
+        std::fs::write(temp.path().join("ignored-git.txt"), "secret").unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let suggestions = workspace_file_suggestions(&context);
+        assert!(
+            suggestions
+                .iter()
+                .any(|entry| entry.display_path == "src/lib.rs" && !entry.is_dir)
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|entry| entry.display_path == "src" && entry.is_dir)
+        );
+        assert!(
+            suggestions
+                .iter()
+                .all(|entry| !entry.display_path.starts_with("target/")
+                    && entry.display_path != "ignored-secret.txt"
+                    && entry.display_path != "ignored-local.txt"
+                    && entry.display_path != "ignored-git.txt")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checkpoint_catalog_exposes_persisted_committed_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(storage.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let history =
+            FileHistory::create_in(workspace.path(), Uuid::new_v4(), storage.path(), true).unwrap();
+        let first = Uuid::new_v4();
+        history
+            .checkpoint(
+                first,
+                open_agent_harness::file_history::CheckpointBoundary::UserMessage,
+                2,
+            )
+            .unwrap();
+        history.finish_transaction(first).unwrap();
+        let second = Uuid::new_v4();
+        history
+            .checkpoint(
+                second,
+                open_agent_harness::file_history::CheckpointBoundary::UserMessage,
+                4,
+            )
+            .unwrap();
+        history.finish_transaction(second).unwrap();
+
+        let checkpoints = checkpoint_catalog(&[history]).unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].id, second);
+        assert_eq!(checkpoints[0].message_count, 4);
+        assert_eq!(checkpoints[1].id, first);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

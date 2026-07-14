@@ -12,6 +12,7 @@ const MAX_CONTENT_BLOCKS: usize = 4_096;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MEDIA_RAW_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEDIA_BASE64_BYTES: usize = MAX_MEDIA_RAW_BYTES.div_ceil(3) * 4;
+const MAX_MEDIA_TOTAL_RAW_BYTES: usize = 12 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ApiFormat {
@@ -81,6 +82,11 @@ pub fn encode_request(format: ApiFormat, request: RequestParts<'_>) -> Result<Va
 /// Validates rich content supplied directly by a user or SDK client. Internal
 /// tool-result/provider-state blocks are deliberately not accepted here.
 pub(crate) fn validate_direct_user_content(content: &Value) -> Result<()> {
+    let mut media_bytes = 0;
+    validate_direct_user_content_with_media(content, &mut media_bytes)
+}
+
+fn validate_direct_user_content_with_media(content: &Value, media_bytes: &mut usize) -> Result<()> {
     match content {
         Value::String(text) => {
             if text.trim().is_empty() {
@@ -96,7 +102,7 @@ pub(crate) fn validate_direct_user_content(content: &Value) -> Result<()> {
                 bail!("user message content 超过 {MAX_CONTENT_BLOCKS} 个 block 限制")
             }
             for (index, block) in blocks.iter().enumerate() {
-                validate_direct_user_block(block, index)?;
+                validate_direct_user_block(block, index, media_bytes)?;
             }
             Ok(())
         }
@@ -104,7 +110,7 @@ pub(crate) fn validate_direct_user_content(content: &Value) -> Result<()> {
     }
 }
 
-fn validate_direct_user_block(block: &Value, index: usize) -> Result<()> {
+fn validate_direct_user_block(block: &Value, index: usize, media_bytes: &mut usize) -> Result<()> {
     let object = block
         .as_object()
         .with_context(|| format!("user content block {index} 必须是 object"))?;
@@ -126,7 +132,7 @@ fn validate_direct_user_block(block: &Value, index: usize) -> Result<()> {
         "image" => {
             validate_exact_fields(object, &["type", "source"], &["type", "source"], index)?;
             validate_direct_media_source(object, index)?;
-            let _ = media_source(block)?;
+            account_media_source(block, media_bytes)?;
         }
         "document" => {
             validate_exact_fields(
@@ -144,7 +150,7 @@ fn validate_direct_user_block(block: &Value, index: usize) -> Result<()> {
                 }
             }
             validate_direct_media_source(object, index)?;
-            let _ = media_source(block)?;
+            account_media_source(block, media_bytes)?;
         }
         other => {
             bail!("user content block {index} type {other:?} 不受支持；只允许 text/image/document")
@@ -185,12 +191,13 @@ fn validate_exact_fields(
 }
 
 fn validate_request_user_messages(messages: &[Message]) -> Result<()> {
+    let mut media_bytes = 0;
     for message in messages {
         if message.role != Role::User {
             continue;
         }
         let Some(blocks) = message.content.as_array() else {
-            validate_direct_user_content(&message.content)?;
+            validate_direct_user_content_with_media(&message.content, &mut media_bytes)?;
             continue;
         };
         let contains_tool_result = blocks
@@ -203,9 +210,9 @@ fn validate_request_user_messages(messages: &[Message]) -> Result<()> {
             {
                 bail!("tool_result message 不能混入 direct user content block")
             }
-            validate_outbound_media_blocks(blocks)?;
+            validate_outbound_media_blocks_with_total(blocks, &mut media_bytes)?;
         } else {
-            validate_direct_user_content(&message.content)?;
+            validate_direct_user_content_with_media(&message.content, &mut media_bytes)?;
         }
     }
     Ok(())
@@ -399,13 +406,24 @@ fn messages_without_provider_state(messages: &[Message]) -> Result<Vec<Message>>
 }
 
 fn validate_outbound_media_blocks(blocks: &[Value]) -> Result<()> {
+    let mut media_bytes = 0;
+    validate_outbound_media_blocks_with_total(blocks, &mut media_bytes)
+}
+
+fn validate_outbound_media_blocks_with_total(
+    blocks: &[Value],
+    media_bytes: &mut usize,
+) -> Result<()> {
     if blocks.len() > MAX_CONTENT_BLOCKS {
         bail!("消息请求 content block 超过 {MAX_CONTENT_BLOCKS} 个限制")
     }
     for block in blocks {
-        let _ = media_source(block)?;
+        account_media_source(block, media_bytes)?;
         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-            validate_outbound_media_blocks(tool_result_model_blocks(block))?;
+            validate_outbound_media_blocks_with_total(
+                tool_result_model_blocks(block),
+                media_bytes,
+            )?;
         }
     }
     Ok(())
@@ -923,7 +941,7 @@ fn tool_result_model_blocks(block: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
-fn media_source(block: &Value) -> Result<Option<(&str, &str)>> {
+fn media_source(block: &Value) -> Result<Option<(&str, &str, usize)>> {
     let Some(kind @ ("image" | "document")) = block.get("type").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -963,7 +981,20 @@ fn media_source(block: &Value) -> Result<Option<(&str, &str)>> {
     if decoded.len() > MAX_MEDIA_RAW_BYTES {
         bail!("model media 解码后超过 {MAX_MEDIA_RAW_BYTES} 字节限制")
     }
-    Ok(Some((media_type, data)))
+    Ok(Some((media_type, data, decoded.len())))
+}
+
+fn account_media_source(block: &Value, total: &mut usize) -> Result<()> {
+    let Some((_, _, raw_bytes)) = media_source(block)? else {
+        return Ok(());
+    };
+    *total = total
+        .checked_add(raw_bytes)
+        .context("model media 总大小溢出")?;
+    if *total > MAX_MEDIA_TOTAL_RAW_BYTES {
+        bail!("model media 解码后累计超过 {MAX_MEDIA_TOTAL_RAW_BYTES} 字节限制")
+    }
+    Ok(())
 }
 
 fn media_title(block: &Value) -> &str {
@@ -975,7 +1006,7 @@ fn media_title(block: &Value) -> &str {
 }
 
 fn chat_media_part(block: &Value) -> Result<Option<Value>> {
-    let Some((media_type, data)) = media_source(block)? else {
+    let Some((media_type, data, _)) = media_source(block)? else {
         return Ok(None);
     };
     if block["type"] == "image" {
@@ -995,7 +1026,7 @@ fn chat_media_part(block: &Value) -> Result<Option<Value>> {
 }
 
 fn responses_media_part(block: &Value) -> Result<Option<Value>> {
-    let Some((media_type, data)) = media_source(block)? else {
+    let Some((media_type, data, _)) = media_source(block)? else {
         return Ok(None);
     };
     if block["type"] == "image" {
@@ -5541,6 +5572,37 @@ mod tests {
                 assert!(error.to_string().contains(expected));
             }
         }
+    }
+
+    #[test]
+    fn request_media_has_an_aggregate_decoded_size_limit() {
+        let encoded = BASE64.encode(vec![0_u8; 6 * 1024 * 1024 + 1]);
+        let messages = vec![Message {
+            role: Role::User,
+            content: json!([
+                {"type":"image", "source":{
+                    "type":"base64", "media_type":"image/png", "data":encoded.clone()
+                }},
+                {"type":"image", "source":{
+                    "type":"base64", "media_type":"image/png", "data":encoded
+                }}
+            ]),
+        }];
+        let error = encode_request(
+            ApiFormat::Messages,
+            RequestParts {
+                model: "model",
+                max_tokens: 10,
+                system: "system",
+                messages: &messages,
+                tools: &tools(),
+                stream: false,
+                chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                include_stream_usage: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("累计超过"), "{error:#}");
     }
 
     #[test]

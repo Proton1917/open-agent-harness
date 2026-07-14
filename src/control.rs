@@ -1051,7 +1051,7 @@ fn parse_inbound(value: Value) -> Result<ParsedInbound> {
             }))
         }
         "control_request" => {
-            let request_id = bounded_string(&value, "request_id", 256)?;
+            let request_id = bounded_string_alias(&value, "request_id", "requestId", 256)?;
             let request = value
                 .get("request")
                 .filter(|request| request.is_object())
@@ -1071,14 +1071,14 @@ fn parse_inbound(value: Value) -> Result<ParsedInbound> {
                 .filter(|response| response.is_object())
                 .cloned()
                 .context("control_response.response 必须是 object")?;
-            let request_id = bounded_string(&response, "request_id", 256)?;
+            let request_id = bounded_string_alias(&response, "request_id", "requestId", 256)?;
             Ok(ParsedInbound::Response {
                 request_id,
                 response,
             })
         }
         "control_cancel_request" => {
-            let request_id = bounded_string(&value, "request_id", 256)?;
+            let request_id = bounded_string_alias(&value, "request_id", "requestId", 256)?;
             Ok(ParsedInbound::Response {
                 request_id: request_id.clone(),
                 response: json!({
@@ -1112,13 +1112,19 @@ fn parse_inbound(value: Value) -> Result<ParsedInbound> {
     }
 }
 
-fn bounded_string(value: &Value, field: &str, max_bytes: usize) -> Result<String> {
+fn bounded_string_alias(
+    value: &Value,
+    field: &str,
+    alias: &str,
+    max_bytes: usize,
+) -> Result<String> {
     let text = value
         .get(field)
+        .or_else(|| value.get(alias))
         .and_then(Value::as_str)
-        .with_context(|| format!("缺少 {field}"))?;
+        .with_context(|| format!("缺少 {field}/{alias}"))?;
     if text.is_empty() || text.len() > max_bytes {
-        bail!("{field} 长度必须为 1..={max_bytes} 字节")
+        bail!("{field}/{alias} 长度必须为 1..={max_bytes} 字节")
     }
     Ok(text.to_owned())
 }
@@ -1627,6 +1633,31 @@ mod tests {
         };
         assert_eq!(request_id, "r1");
         assert_eq!(response["response"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn accepts_camel_case_request_ids_at_the_sdk_boundary() {
+        let request = parse_inbound(json!({
+            "type":"control_request",
+            "requestId":"camel-1",
+            "request":{"subtype":"get_context_usage"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            ParsedInbound::Message(InboundMessage::ControlRequest { request_id, .. })
+                if request_id == "camel-1"
+        ));
+
+        let response = parse_inbound(json!({
+            "type":"control_response",
+            "response":{"subtype":"success", "requestId":"camel-2", "response":{}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            response,
+            ParsedInbound::Response { request_id, .. } if request_id == "camel-2"
+        ));
     }
 
     #[test]

@@ -28,6 +28,17 @@ const RESERVED_COMMANDS: &[&str] = &[
     "compact",
     "init",
     "loop",
+    "status",
+    "tasks",
+    "diff",
+    "rewind",
+    "resume",
+    "skills",
+    "hooks",
+    "memory",
+    "mcp",
+    "sandbox",
+    "plugin",
     "help",
 ];
 
@@ -215,6 +226,18 @@ pub enum CommandOutcome {
     Cleared,
     Exit,
     SelectModel,
+    ShowHelp,
+    ShowStatus,
+    ShowTasks,
+    ShowDiff(String),
+    Rewind(String),
+    Resume(String),
+    ShowSkills,
+    ShowHooks,
+    ShowMemory,
+    ManageMcp(String),
+    ShowSandbox,
+    ShowPlugins,
     Submit(String),
     NotCommand,
 }
@@ -282,12 +305,18 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             eprintln!("Usage: /loop [interval] <prompt>");
             CommandOutcome::Handled
         }
-        "/help" => {
-            println!(
-                "/help  /init  /loop [interval] <prompt>  /model [name]  /cost  /context  /compact [instructions]  /permissions  /clear  /exit"
-            );
-            CommandOutcome::Handled
-        }
+        "/status" => CommandOutcome::ShowStatus,
+        "/tasks" => CommandOutcome::ShowTasks,
+        "/diff" => CommandOutcome::ShowDiff(argument.to_owned()),
+        "/rewind" => CommandOutcome::Rewind(argument.to_owned()),
+        "/resume" => CommandOutcome::Resume(argument.to_owned()),
+        "/skills" => CommandOutcome::ShowSkills,
+        "/hooks" => CommandOutcome::ShowHooks,
+        "/memory" => CommandOutcome::ShowMemory,
+        "/mcp" => CommandOutcome::ManageMcp(argument.to_owned()),
+        "/sandbox" => CommandOutcome::ShowSandbox,
+        "/plugin" => CommandOutcome::ShowPlugins,
+        "/help" => CommandOutcome::ShowHelp,
         _ => {
             eprintln!("Unknown command: {command}");
             CommandOutcome::Handled

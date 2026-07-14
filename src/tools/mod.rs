@@ -61,6 +61,32 @@ use crate::{
 pub type WorkspaceStateRecorder = Arc<dyn Fn(&Path, &Path) -> Result<()> + Send + Sync>;
 pub type CurrentCwdStateRecorder = Arc<dyn Fn(&Path, &Path) -> Result<()> + Send + Sync>;
 
+const MAX_FILE_SERVICE_CONTEXTS: usize = 64;
+const MAX_FILE_SERVICE_CONTEXT_BYTES: usize = 128 * 1024;
+
+fn append_bounded_file_service_context(
+    output: &mut ToolOutput,
+    contexts: &mut usize,
+    bytes: &mut usize,
+    label: &str,
+    mut message: String,
+) {
+    if *contexts >= MAX_FILE_SERVICE_CONTEXTS || *bytes >= MAX_FILE_SERVICE_CONTEXT_BYTES {
+        return;
+    }
+    let remaining = MAX_FILE_SERVICE_CONTEXT_BYTES.saturating_sub(*bytes);
+    if message.len() > remaining {
+        let mut end = remaining;
+        while !message.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        message.truncate(end);
+    }
+    *contexts = (*contexts).saturating_add(1);
+    *bytes = (*bytes).saturating_add(message.len());
+    output.append_context(label, &message);
+}
+
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
 pub(crate) use bash::command_is_destructive;
@@ -118,6 +144,8 @@ const MAX_CONCURRENT_READ_TOOLS: usize = 8;
 const MAX_ACTIVE_TOOLS: usize = 128;
 const MAX_DEFERRED_TOOLS: usize = 512;
 const MAX_SELECTED_TOOLS: usize = 32;
+const DEFAULT_TOOL_SEARCH_RESULTS: usize = 5;
+const MAX_TOOL_SEARCH_RESULTS: usize = 100;
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_TOOL_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
@@ -314,6 +342,7 @@ struct WorkspaceContextCandidate {
     skills: SkillCatalog,
     workspace_deny: Vec<String>,
     instruction_hook_paths: Vec<PathBuf>,
+    config_hook_paths: Vec<PathBuf>,
     changed_paths: Vec<PathBuf>,
 }
 
@@ -1994,8 +2023,10 @@ impl ToolContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let mut instruction_hook_paths = Vec::new();
+        let mut config_hook_paths = Vec::new();
         for (path, root, is_instruction) in &relevant {
             if !is_instruction {
+                config_hook_paths.push(path.clone());
                 continue;
             }
             nested_instructions.remove(path);
@@ -2016,6 +2047,8 @@ impl ToolContext {
         }
         instruction_hook_paths.sort_unstable();
         instruction_hook_paths.dedup();
+        config_hook_paths.sort_unstable();
+        config_hook_paths.dedup();
         let changed_paths = relevant
             .iter()
             .map(|(path, _, _)| path.clone())
@@ -2038,6 +2071,7 @@ impl ToolContext {
             skills: current.skills,
             workspace_deny: current.workspace_deny,
             instruction_hook_paths,
+            config_hook_paths,
             changed_paths,
         }))
     }
@@ -2045,11 +2079,26 @@ impl ToolContext {
     async fn run_workspace_hot_refresh_hooks(
         &self,
         candidate: &WorkspaceContextCandidate,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let cwd = self.cwd();
+        let mut feedback = Vec::new();
+        for path in &candidate.config_hook_paths {
+            let display = self.display_path(path);
+            let outcome = self
+                .hooks()
+                .run(
+                    "ConfigChange",
+                    Some("skills"),
+                    json!({"source":"skills", "file_path":display}),
+                    &cwd,
+                )
+                .await?;
+            feedback.extend(outcome.additional_context);
+        }
         for path in &candidate.instruction_hook_paths {
             let display = self.display_path(path);
-            self.hooks()
+            let outcome = self
+                .hooks()
                 .run(
                     "InstructionsLoaded",
                     Some(&display),
@@ -2057,8 +2106,9 @@ impl ToolContext {
                     &cwd,
                 )
                 .await?;
+            feedback.extend(outcome.additional_context);
         }
-        Ok(())
+        Ok(feedback)
     }
 
     fn commit_workspace_context_candidate(&self, candidate: WorkspaceContextCandidate) {
@@ -2128,7 +2178,7 @@ impl ToolContext {
                 continue;
             }
             if let Some(candidate) = candidate {
-                self.run_workspace_hot_refresh_hooks(&candidate).await?;
+                let _ = self.run_workspace_hot_refresh_hooks(&candidate).await?;
                 if self.workspace_context_changes.generation() != target {
                     continue;
                 }
@@ -3489,6 +3539,9 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
     fn read_only(&self, input: &Value) -> bool;
+    fn read_only_for(&self, _context: &ToolContext, input: &Value) -> bool {
+        self.read_only(input)
+    }
     fn destructive(&self, _input: &Value) -> bool {
         false
     }
@@ -3498,11 +3551,20 @@ pub trait Tool: Send + Sync {
     fn requires_permission_for(&self, _context: &ToolContext, _input: &Value) -> bool {
         self.requires_permission()
     }
+    /// Read-only operations normally bypass the interactive permission prompt.
+    /// Open-world reads may opt out: they remain semantically read-only and
+    /// concurrency-safe, while still requiring explicit network authorization.
+    fn explicit_permission_for(&self, _context: &ToolContext, _input: &Value) -> bool {
+        false
+    }
     fn path_fields(&self) -> &'static [&'static str] {
         &[]
     }
     fn concurrency_safe(&self, input: &Value) -> bool {
         self.read_only(input)
+    }
+    fn concurrency_safe_for(&self, _context: &ToolContext, input: &Value) -> bool {
+        self.concurrency_safe(input)
     }
     fn validate_input(&self, input: &Value) -> std::result::Result<(), String> {
         schema::validate(&self.input_schema(), input)
@@ -3521,6 +3583,16 @@ pub trait Tool: Send + Sync {
 
 #[async_trait]
 pub trait ToolService: Send + Sync {
+    /// Notifies long-lived integrations after a harness file tool has
+    /// successfully changed files. Services must treat the paths as hints and
+    /// re-validate their own workspace and size boundaries before reading.
+    /// Returned strings are bounded again when they are attached to the tool
+    /// result; an integration failure must not silently undo a successful file
+    /// mutation.
+    async fn files_changed(&self, _paths: &[PathBuf]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn shutdown(&self);
 }
 
@@ -3532,6 +3604,14 @@ pub struct ToolRefresh {
 #[async_trait]
 pub trait ToolDiscovery: Send + Sync {
     async fn refresh(&self) -> Result<ToolRefresh>;
+
+    /// Names of integrations which are known but have not finished exposing
+    /// their tools yet. This lets ToolSearch distinguish "no such tool" from
+    /// "the configured integration is still connecting" without depending on
+    /// any provider-specific discovery type.
+    fn pending_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 struct RegistryState {
@@ -3825,6 +3905,7 @@ impl ToolRegistry {
                     return ToolOutput::error(format!("权限目标规范化失败: {error:#}"));
                 }
             };
+        let mut authorized_read_only = tool.read_only_for(context, &input);
         if tool.requires_permission_for(context, &input) {
             match hooks
                 .run(
@@ -3847,15 +3928,16 @@ impl ToolRegistry {
                     ));
                 }
             }
-            match context.permissions.decide_invocation_with_targets(
+            match context.permissions.decide_invocation_with_targets_policy(
                 tool.name(),
                 &input,
                 tool_use_id,
                 &summary,
-                tool.read_only(&input),
+                authorized_read_only,
                 tool.destructive(&input),
                 outside_workspace,
                 &permission_targets,
+                tool.explicit_permission_for(context, &input),
             ) {
                 Ok(PermissionDecision::Allow) => {}
                 Ok(PermissionDecision::AllowWithUpdatedInput(updated)) => {
@@ -3889,7 +3971,7 @@ impl ToolRegistry {
                     if !context.permissions.permits_updated_invocation_with_targets(
                         tool.name(),
                         &updated_summary,
-                        tool.read_only(&updated),
+                        tool.read_only_for(context, &updated),
                         updated_outside_workspace,
                         &updated_targets,
                     ) {
@@ -3929,6 +4011,7 @@ impl ToolRegistry {
                         }
                         return output;
                     }
+                    authorized_read_only = tool.read_only_for(context, &updated);
                     input = updated;
                 }
                 Ok(PermissionDecision::Deny) => {
@@ -3969,6 +4052,9 @@ impl ToolRegistry {
                 Err(error) => return ToolOutput::error(format!("权限检查失败: {error:#}")),
             }
         }
+        if authorized_read_only && !tool.read_only_for(context, &input) {
+            return ToolOutput::error("只读工具调用在执行前的路径或权限重检中失效，已拒绝执行");
+        }
         for field in tool.path_fields() {
             let Some(value) = input.get(*field).and_then(Value::as_str) else {
                 continue;
@@ -3983,12 +4069,23 @@ impl ToolRegistry {
                 return ToolOutput::error(format!("嵌套 AGENTS.md 发现失败: {error:#}"));
             }
         }
+        let path_existed_before = tool
+            .path_fields()
+            .iter()
+            .filter_map(|field| input.get(*field).and_then(Value::as_str))
+            .filter_map(|path| context.resolve_path(path).ok())
+            .map(|path| {
+                let existed = path.exists();
+                (path, existed)
+            })
+            .collect::<HashMap<_, _>>();
         let mut output = match tool.execute(context, input.clone()).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(format!("{error:#}")),
         };
-        let inspect_context_change =
-            !output.is_error && !tool.read_only(&input) && !tool.path_fields().is_empty();
+        let inspect_context_change = !output.is_error
+            && !tool.read_only_for(context, &input)
+            && !tool.path_fields().is_empty();
         let _refresh_guard = if inspect_context_change {
             Some(context.workspace_context_refresh_lock.lock().await)
         } else {
@@ -3996,6 +4093,7 @@ impl ToolRegistry {
         };
         let mut hot_refresh_candidate = None;
         let mut relevant_context_mutation = false;
+        let mut service_changed_paths = Vec::new();
         if inspect_context_change {
             let paths = tool
                 .path_fields()
@@ -4014,18 +4112,23 @@ impl ToolRegistry {
                 .collect::<Result<Vec<_>>>();
             match paths {
                 Ok(paths) => {
-                    let hook_paths = paths
-                        .iter()
-                        .map(|(field, path)| {
-                            json!({"field":field, "path":context.display_path(path)})
-                        })
-                        .collect::<Vec<_>>();
-                    if !hook_paths.is_empty() {
+                    for (field, path) in &paths {
+                        let display = context.display_path(path);
+                        let event = if path_existed_before.get(path).copied().unwrap_or(false) {
+                            "change"
+                        } else {
+                            "add"
+                        };
                         match hooks
-                            .run(
-                                "FileChanged",
-                                Some(tool.name()),
-                                json!({"tool_name":tool.name(), "files":hook_paths}),
+                            .run_file_changed(
+                                tool.name(),
+                                &display,
+                                json!({
+                                    "tool_name":tool.name(),
+                                    "field":field,
+                                    "file_path":display,
+                                    "event":event,
+                                }),
                                 &context.cwd(),
                             )
                             .await
@@ -4042,25 +4145,37 @@ impl ToolRegistry {
                                     "FileChanged hook failed",
                                     &format!("{error:#}"),
                                 );
+                                break;
                             }
                             _ => {}
                         }
                     }
                     let changed_paths = paths.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+                    service_changed_paths = changed_paths.clone();
                     match context.prepare_workspace_hot_refresh(&changed_paths).await {
                         Ok(Some(candidate)) => {
                             relevant_context_mutation = true;
                             if output.is_error {
                                 output.rollback_turn = true;
-                            } else if let Err(error) =
-                                context.run_workspace_hot_refresh_hooks(&candidate).await
-                            {
-                                output.is_error = true;
-                                output.rollback_turn = true;
-                                output.append_context(
-                                    "Workspace context refresh hook failed",
-                                    &format!("{error:#}"),
-                                );
+                            } else {
+                                match context.run_workspace_hot_refresh_hooks(&candidate).await {
+                                    Ok(feedback) => {
+                                        for message in feedback {
+                                            output.append_context(
+                                                "Workspace context refresh hook context",
+                                                &message,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        output.is_error = true;
+                                        output.rollback_turn = true;
+                                        output.append_context(
+                                            "Workspace context refresh hook failed",
+                                            &format!("{error:#}"),
+                                        );
+                                    }
+                                }
                             }
                             hot_refresh_candidate = Some(candidate);
                         }
@@ -4097,8 +4212,34 @@ impl ToolRegistry {
             if let Some(candidate) = hot_refresh_candidate {
                 context.commit_workspace_hot_refresh(candidate);
             }
+            if !service_changed_paths.is_empty() {
+                let mut service_contexts = 0usize;
+                let mut service_context_bytes = 0usize;
+                for service in self.services.iter() {
+                    match service.files_changed(&service_changed_paths).await {
+                        Ok(contexts) => {
+                            for context_message in contexts {
+                                append_bounded_file_service_context(
+                                    &mut output,
+                                    &mut service_contexts,
+                                    &mut service_context_bytes,
+                                    "File integration context",
+                                    context_message,
+                                );
+                            }
+                        }
+                        Err(error) => append_bounded_file_service_context(
+                            &mut output,
+                            &mut service_contexts,
+                            &mut service_context_bytes,
+                            "File integration synchronization failed",
+                            format!("{error:#}"),
+                        ),
+                    }
+                }
+            }
         }
-        output
+        output.bounded()
     }
 
     pub async fn execute_batch(
@@ -4147,7 +4288,7 @@ impl ToolRegistry {
         let mut index = 0;
         while index < calls.len() {
             let (name, input) = &calls[index];
-            let concurrency_safe = self.concurrency_safe(name, input);
+            let concurrency_safe = self.concurrency_safe(context, name, input);
             if !concurrency_safe {
                 if let Some(observer) = observer {
                     observer.started(index);
@@ -4175,7 +4316,7 @@ impl ToolRegistry {
             let end = calls[index..]
                 .iter()
                 .position(|(candidate_name, candidate_input)| {
-                    !self.concurrency_safe(candidate_name, candidate_input)
+                    !self.concurrency_safe(context, candidate_name, candidate_input)
                 })
                 .map_or(calls.len(), |offset| index + offset);
             for chunk in calls[index..end].chunks(MAX_CONCURRENT_READ_TOOLS) {
@@ -4243,11 +4384,11 @@ impl ToolRegistry {
         outputs
     }
 
-    fn concurrency_safe(&self, name: &str, input: &Value) -> bool {
+    fn concurrency_safe(&self, context: &ToolContext, name: &str, input: &Value) -> bool {
         read_registry(&self.state)
             .active
             .get(name)
-            .is_some_and(|tool| tool.concurrency_safe(input))
+            .is_some_and(|tool| tool.concurrency_safe_for(context, input))
     }
 
     pub fn deferred_count(&self) -> usize {
@@ -4357,7 +4498,15 @@ impl Tool for ToolSearchTool {
 
     fn input_schema(&self) -> Value {
         object_schema(
-            json!({"query": {"type": "string", "minLength": 1, "maxLength": 4096}}),
+            json!({
+                "query": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TOOL_SEARCH_RESULTS,
+                    "default": DEFAULT_TOOL_SEARCH_RESULTS
+                }
+            }),
             &["query"],
         )
     }
@@ -4388,9 +4537,19 @@ impl Tool for ToolSearchTool {
             .and_then(Value::as_str)
             .context("query 必须是字符串")?
             .trim();
+        let max_results = input
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_TOOL_SEARCH_RESULTS);
         let state = self.state.upgrade().context("工具注册表已经关闭")?;
         let refresh_errors = refresh_discovered_tools(&state, &self.discoverers).await;
-        if let Some(selection) = query.strip_prefix("select:") {
+        let pending_integrations = pending_discovery_names(&self.discoverers);
+        if query
+            .get(.."select:".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select:"))
+        {
+            let selection = &query["select:".len()..];
             let requested = selection
                 .split(',')
                 .map(str::trim)
@@ -4405,10 +4564,15 @@ impl Tool for ToolSearchTool {
             let mut registry = write_registry(&state);
             let new_active = requested
                 .iter()
-                .copied()
+                .map(|name| name.to_ascii_lowercase())
                 .collect::<HashSet<_>>()
                 .into_iter()
-                .filter(|name| registry.deferred.contains_key(*name))
+                .filter(|name| {
+                    registry
+                        .deferred
+                        .keys()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+                })
                 .count();
             if registry.active.len().saturating_add(new_active) > MAX_ACTIVE_TOOLS {
                 bail!("active tool 数量将超过 {MAX_ACTIVE_TOOLS} 个限制")
@@ -4417,55 +4581,169 @@ impl Tool for ToolSearchTool {
             let mut already_active = Vec::new();
             let mut missing = Vec::new();
             for name in requested {
-                if registry.active.contains_key(name) {
-                    already_active.push(name.to_owned());
-                } else if let Some(tool) = registry.deferred.remove(name) {
-                    registry.active.insert(name.to_owned(), tool);
-                    loaded.push(name.to_owned());
+                if let Some(canonical) = registry
+                    .active
+                    .keys()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .cloned()
+                {
+                    if !already_active.contains(&canonical) {
+                        already_active.push(canonical);
+                    }
+                } else if let Some(canonical) = registry
+                    .deferred
+                    .keys()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .cloned()
+                {
+                    let tool = registry
+                        .deferred
+                        .remove(&canonical)
+                        .expect("selected deferred tool must still exist");
+                    registry.active.insert(canonical.clone(), tool);
+                    if !loaded.contains(&canonical) {
+                        loaded.push(canonical);
+                    }
                 } else {
                     missing.push(name.to_owned());
                 }
             }
+            let pending_integrations = if loaded.is_empty() && already_active.is_empty() {
+                pending_integrations
+            } else {
+                Vec::new()
+            };
             return Ok(ToolOutput::success(serde_json::to_string_pretty(&json!({
                 "loaded": loaded,
                 "already_active": already_active,
                 "missing": missing,
                 "remaining_deferred": registry.deferred.len(),
+                "pending_integrations": pending_integrations,
                 "refresh_errors": refresh_errors,
             }))?));
         }
 
-        let terms = query
+        let query_lower = query.to_ascii_lowercase();
+        let query_terms = query
             .split_whitespace()
             .map(str::to_ascii_lowercase)
             .collect::<Vec<_>>();
+        let required_terms = query_terms
+            .iter()
+            .filter_map(|term| term.strip_prefix('+').filter(|term| !term.is_empty()))
+            .collect::<Vec<_>>();
+        let scoring_terms = query_terms
+            .iter()
+            .map(|term| term.strip_prefix('+').unwrap_or(term))
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
         let registry = read_registry(&state);
+        if let Some(canonical) = registry
+            .deferred
+            .keys()
+            .chain(registry.active.keys())
+            .find(|name| name.to_ascii_lowercase() == query_lower)
+            .cloned()
+        {
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&json!({
+                "query": query,
+                "matches": [{"name": canonical}],
+                "total_deferred": registry.deferred.len(),
+                "pending_integrations": [],
+                "refresh_errors": refresh_errors,
+            }))?));
+        }
         let mut matches = registry
             .deferred
             .values()
             .filter_map(|tool| {
-                let haystack = format!(
-                    "{} {}",
-                    tool.name().to_ascii_lowercase(),
-                    tool.description().to_ascii_lowercase()
-                );
-                terms.iter().all(|term| haystack.contains(term)).then(|| {
+                let name = tool.name().to_ascii_lowercase();
+                let name_parts = tool_search_name_parts(tool.name());
+                let description = tool.description().to_ascii_lowercase();
+                if !required_terms.iter().all(|term| {
+                    name_parts.iter().any(|part| part.contains(*term))
+                        || description.contains(*term)
+                }) {
+                    return None;
+                }
+                let score = scoring_terms
+                    .iter()
+                    .map(|term| {
+                        if name_parts.iter().any(|part| part == *term) {
+                            10
+                        } else if name_parts.iter().any(|part| part.contains(*term)) {
+                            5
+                        } else if name.contains(*term) {
+                            3
+                        } else if description.contains(*term) {
+                            2
+                        } else {
+                            0
+                        }
+                    })
+                    .sum::<usize>();
+                (score > 0).then(|| {
                     json!({
                         "name": tool.name(),
                         "description": truncate_utf8(tool.description(), 512),
+                        "score": score,
                     })
                 })
             })
             .collect::<Vec<_>>();
-        matches.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        matches.truncate(20);
+        matches.sort_by(|left, right| {
+            right["score"]
+                .as_u64()
+                .cmp(&left["score"].as_u64())
+                .then_with(|| left["name"].as_str().cmp(&right["name"].as_str()))
+        });
+        matches.truncate(max_results);
+        let pending_integrations = if matches.is_empty() {
+            pending_integrations
+        } else {
+            Vec::new()
+        };
         Ok(ToolOutput::success(serde_json::to_string_pretty(&json!({
             "query": query,
             "matches": matches,
             "total_deferred": registry.deferred.len(),
+            "pending_integrations": pending_integrations,
             "refresh_errors": refresh_errors,
         }))?))
     }
+}
+
+fn tool_search_name_parts(name: &str) -> Vec<String> {
+    let mut normalized = String::with_capacity(name.len().saturating_add(8));
+    let mut previous_lowercase = false;
+    for character in name.chars() {
+        if matches!(character, '_' | '-') {
+            normalized.push(' ');
+            previous_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lowercase {
+            normalized.push(' ');
+        }
+        normalized.push(character.to_ascii_lowercase());
+        previous_lowercase = character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    normalized
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn pending_discovery_names(discoverers: &[Arc<dyn ToolDiscovery>]) -> Vec<String> {
+    let mut pending = discoverers
+        .iter()
+        .flat_map(|discoverer| discoverer.pending_names())
+        .filter(|name| !name.is_empty() && name.len() <= MAX_TOOL_NAME_BYTES)
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|name| name.to_ascii_lowercase());
+    pending.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    pending.truncate(MAX_DEFERRED_TOOLS);
+    pending
 }
 
 async fn refresh_discovered_tools(
@@ -5027,7 +5305,33 @@ mod tests {
 
     struct NamedReadTool(&'static str);
 
+    struct PendingDiscovery(&'static str);
+
     struct DeletePathTool;
+
+    struct OversizedFileFeedbackService;
+
+    struct FailingFileFeedbackService;
+
+    #[async_trait]
+    impl ToolService for OversizedFileFeedbackService {
+        async fn files_changed(&self, _paths: &[PathBuf]) -> Result<Vec<String>> {
+            Ok((0..100)
+                .map(|_| format!("diagnostic-marker{}", "x".repeat(4096)))
+                .collect())
+        }
+
+        async fn shutdown(&self) {}
+    }
+
+    #[async_trait]
+    impl ToolService for FailingFileFeedbackService {
+        async fn files_changed(&self, _paths: &[PathBuf]) -> Result<Vec<String>> {
+            bail!("mock synchronization failure")
+        }
+
+        async fn shutdown(&self) {}
+    }
 
     #[async_trait]
     impl Tool for NamedReadTool {
@@ -5053,6 +5357,20 @@ mod tests {
 
         async fn execute(&self, _: &ToolContext, _: Value) -> Result<ToolOutput> {
             Ok(ToolOutput::success("done"))
+        }
+    }
+
+    #[async_trait]
+    impl ToolDiscovery for PendingDiscovery {
+        async fn refresh(&self) -> Result<ToolRefresh> {
+            Ok(ToolRefresh {
+                upsert: Vec::new(),
+                remove: Vec::new(),
+            })
+        }
+
+        fn pending_names(&self) -> Vec<String> {
+            vec![self.0.to_owned()]
         }
     }
 
@@ -5238,10 +5556,20 @@ mod tests {
                         "type":"command",
                         "command":"printf '%s' '{\"additionalContext\":\"permission-denied-seen\"}'"
                     }]}],
-                    "FileChanged":[{"matcher":"Write", "hooks":[{
-                        "type":"command",
-                        "command":"printf '%s' '{\"additionalContext\":\"file-change-seen\"}'"
-                    }]}]
+                    "FileChanged":[
+                        {"matcher":"changed.txt", "hooks":[{
+                            "type":"command",
+                            "command":"printf '%s' '{\"additionalContext\":\"file-path-change-seen\"}'"
+                        }]},
+                        {"matcher":"Write", "hooks":[{
+                            "type":"command",
+                            "command":"printf '%s' '{\"additionalContext\":\"legacy-tool-change-seen\"}'"
+                        }]},
+                        {"matcher":"*", "hooks":[{
+                            "type":"command",
+                            "command":"printf '%s' '{\"additionalContext\":\"single-wildcard-change\"}'"
+                        }]}
+                    ]
                 }}),
             })
             .unwrap(),
@@ -5287,7 +5615,43 @@ mod tests {
             )
             .await;
         assert!(!changed.is_error, "{}", changed.content);
-        assert!(changed.content.contains("file-change-seen"));
+        assert!(changed.content.contains("file-path-change-seen"));
+        assert!(changed.content.contains("legacy-tool-change-seen"));
+        assert_eq!(changed.content.matches("single-wildcard-change").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_service_feedback_and_failures_are_visible_and_globally_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let registry = ToolRegistry::with_services(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                Arc::new(FailingFileFeedbackService),
+                Arc::new(OversizedFileFeedbackService),
+            ],
+        )
+        .unwrap();
+        let output = registry
+            .execute(
+                &context,
+                "Write",
+                json!({"file_path":"changed.txt", "content":"changed"}),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("mock synchronization failure"));
+        assert!(output.content.contains("diagnostic-marker"));
+        assert!(output.content.len() <= MAX_TOOL_RESULT_BYTES);
     }
 
     #[tokio::test]
@@ -5560,6 +5924,82 @@ mod tests {
         let refreshed_skills = context.workspace_system_context();
         assert!(refreshed_skills.contains("skill-after-refresh"));
         assert!(!refreshed_skills.contains("skill-before-refresh"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_hot_refresh_emits_blockable_config_change_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".open-agent-harness/skills/hot/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: hot\ndescription: before\n---\nold workflow",
+        )
+        .unwrap();
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"ConfigChange":[{"matcher":"skills","hooks":[{
+                    "type":"command",
+                    "command":"printf '%s' '{\"additionalContext\":\"skill-config-reloaded\"}'"
+                }]}]}}),
+            })
+            .unwrap(),
+        ));
+        let registry = ToolRegistry::default();
+        let read = registry
+            .execute(&context, "Read", json!({"file_path":&skill}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let write = registry
+            .execute(
+                &context,
+                "Write",
+                json!({
+                    "file_path":&skill,
+                    "content":"---\nname: hot\ndescription: after\n---\nnew workflow"
+                }),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.content);
+        assert!(write.content.contains("skill-config-reloaded"));
+        assert_eq!(context.skill("hot").unwrap().description, "after");
+
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"ConfigChange":[{"matcher":"skills","hooks":[{
+                    "type":"command", "command":"printf '%s' blocked >&2; exit 2"
+                }]}]}}),
+            })
+            .unwrap(),
+        ));
+        let read = registry
+            .execute(&context, "Read", json!({"file_path":&skill}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let blocked = registry
+            .execute(
+                &context,
+                "Write",
+                json!({
+                    "file_path":&skill,
+                    "content":"---\nname: hot\ndescription: blocked\n---\nblocked workflow"
+                }),
+            )
+            .await;
+        assert!(blocked.is_error);
+        assert!(blocked.rollback_turn);
+        assert_eq!(context.skill("hot").unwrap().description, "after");
     }
 
     #[tokio::test]
@@ -6732,6 +7172,102 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing {required}");
         }
+    }
+
+    #[tokio::test]
+    async fn tool_search_is_case_insensitive_bounded_and_reports_pending_discovery() {
+        let registry = ToolRegistry::with_integrations(
+            Vec::new(),
+            vec![
+                Arc::new(NamedReadTool("DeferredAlpha")),
+                Arc::new(NamedReadTool("DeferredBeta")),
+                Arc::new(NamedReadTool("DeferredGamma")),
+                Arc::new(NamedReadTool("DeferredDelta")),
+            ],
+            Vec::new(),
+            vec![Arc::new(PendingDiscovery("ExampleMcp"))],
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let limited = registry
+            .execute(
+                &context,
+                "ToolSearch",
+                json!({"query":"deferred", "max_results":2}),
+            )
+            .await;
+        assert!(!limited.is_error, "{}", limited.content);
+        let limited: Value = serde_json::from_str(&limited.content).unwrap();
+        assert_eq!(limited["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(limited["pending_integrations"], json!([]));
+
+        let optional_terms = registry
+            .execute(
+                &context,
+                "ToolSearch",
+                json!({"query":"alpha gamma", "max_results":10}),
+            )
+            .await;
+        assert!(!optional_terms.is_error, "{}", optional_terms.content);
+        let optional_terms: Value = serde_json::from_str(&optional_terms.content).unwrap();
+        assert_eq!(optional_terms["matches"].as_array().unwrap().len(), 2);
+
+        let required_term = registry
+            .execute(
+                &context,
+                "ToolSearch",
+                json!({"query":"+alpha gamma", "max_results":10}),
+            )
+            .await;
+        assert!(!required_term.is_error, "{}", required_term.content);
+        let required_term: Value = serde_json::from_str(&required_term.content).unwrap();
+        assert_eq!(required_term["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(required_term["matches"][0]["name"], "DeferredAlpha");
+
+        let selected = registry
+            .execute(
+                &context,
+                "ToolSearch",
+                json!({"query":"SeLeCt:deferredalpha,DEFERREDBETA"}),
+            )
+            .await;
+        assert!(!selected.is_error, "{}", selected.content);
+        let selected: Value = serde_json::from_str(&selected.content).unwrap();
+        assert_eq!(selected["loaded"], json!(["DeferredAlpha", "DeferredBeta"]));
+
+        let already_active = registry
+            .execute(&context, "ToolSearch", json!({"query":"deferredalpha"}))
+            .await;
+        assert!(!already_active.is_error, "{}", already_active.content);
+        let already_active: Value = serde_json::from_str(&already_active.content).unwrap();
+        assert_eq!(already_active["matches"], json!([{"name":"DeferredAlpha"}]));
+
+        let missing = registry
+            .execute(&context, "ToolSearch", json!({"query":"does-not-exist"}))
+            .await;
+        assert!(!missing.is_error, "{}", missing.content);
+        let missing: Value = serde_json::from_str(&missing.content).unwrap();
+        assert_eq!(missing["matches"], json!([]));
+        assert_eq!(missing["pending_integrations"], json!(["ExampleMcp"]));
+
+        let invalid_limit = registry
+            .execute(
+                &context,
+                "ToolSearch",
+                json!({"query":"deferred", "max_results":0}),
+            )
+            .await;
+        assert!(invalid_limit.is_error);
     }
 
     #[test]

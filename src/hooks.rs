@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Path,
     process::Stdio,
     sync::{
         Arc,
@@ -76,6 +77,7 @@ const SUPPORTED_EVENTS: &[&str] = &[
     "WorktreeRemove",
     "CwdChanged",
     "FileChanged",
+    "ConfigChange",
     "MessageDisplay",
 ];
 
@@ -198,8 +200,8 @@ struct McpToolHook {
 }
 
 enum HookAction {
-    Command(HookCommand),
-    McpTool(McpToolHook),
+    Command(Box<HookCommand>),
+    McpTool(Box<McpToolHook>),
 }
 
 struct HookCondition {
@@ -470,12 +472,48 @@ impl HookRunner {
         payload: Value,
         cwd: &std::path::Path,
     ) -> Result<HookOutcome> {
+        let matcher_values = matcher_value.into_iter().collect::<Vec<_>>();
+        self.run_with_matchers(event, &matcher_values, payload, cwd)
+            .await
+    }
+
+    /// File-change hooks historically matched the mutating tool name. The
+    /// observable file event uses its normalized path as the primary matcher,
+    /// while retaining tool-name matching for existing trusted configs. A rule
+    /// is evaluated once even when several selectors match it.
+    pub async fn run_file_changed(
+        &self,
+        tool_name: &str,
+        file_path: &str,
+        payload: Value,
+        cwd: &std::path::Path,
+    ) -> Result<HookOutcome> {
+        let file_name = Path::new(file_path)
+            .file_name()
+            .and_then(|name| name.to_str());
+        let mut matchers = vec![file_path, tool_name];
+        if let Some(file_name) = file_name {
+            if !matchers.contains(&file_name) {
+                matchers.push(file_name);
+            }
+        }
+        self.run_with_matchers("FileChanged", &matchers, payload, cwd)
+            .await
+    }
+
+    async fn run_with_matchers(
+        &self,
+        event: &str,
+        matcher_values: &[&str],
+        payload: Value,
+        cwd: &std::path::Path,
+    ) -> Result<HookOutcome> {
         let mut outcome = self
-            .run_local(event, matcher_value, payload.clone(), cwd)
+            .run_local(event, matcher_values, payload.clone(), cwd)
             .await?;
         for runner in &self.additional {
             let incoming = runner
-                .run_local(event, matcher_value, payload.clone(), cwd)
+                .run_local(event, matcher_values, payload.clone(), cwd)
                 .await?;
             if incoming.updated_input.is_some() {
                 outcome.updated_input = incoming.updated_input;
@@ -494,7 +532,7 @@ impl HookRunner {
     async fn run_local(
         &self,
         event: &str,
-        matcher_value: Option<&str>,
+        matcher_values: &[&str],
         payload: Value,
         cwd: &std::path::Path,
     ) -> Result<HookOutcome> {
@@ -514,7 +552,7 @@ impl HookRunner {
         let mut outcome = HookOutcome::default();
         let mut matched_actions = 0usize;
         for rule in rules {
-            if !rule.matcher.matches(matcher_value.unwrap_or("")) {
+            if !rule.matcher.matches_any(matcher_values) {
                 continue;
             }
             for action in &rule.actions {
@@ -817,6 +855,14 @@ impl HookMatcher {
             Self::Patterns(patterns) => patterns.iter().any(|pattern| pattern.is_match(value)),
         }
     }
+
+    fn matches_any(&self, values: &[&str]) -> bool {
+        match self {
+            Self::All => true,
+            Self::Patterns(_) if values.is_empty() => self.matches(""),
+            Self::Patterns(_) => values.iter().any(|value| self.matches(value)),
+        }
+    }
 }
 
 fn parse_matcher(value: &str) -> Result<HookMatcher> {
@@ -872,7 +918,7 @@ fn parse_action(raw: RawHookAction) -> Result<Arc<HookAction>> {
                 Some("powershell") => HookShell::PowerShell,
                 Some(value) => bail!("hook shell 不支持: {value}"),
             };
-            HookAction::Command(HookCommand {
+            HookAction::Command(Box::new(HookCommand {
                 command,
                 args,
                 shell,
@@ -885,7 +931,7 @@ fn parse_action(raw: RawHookAction) -> Result<Arc<HookAction>> {
                     .transpose()?,
                 status_message: validate_status_message(status_message)?,
                 fired: AtomicBool::new(false),
-            })
+            }))
         }
         RawHookAction::McpTool {
             server,
@@ -908,7 +954,7 @@ fn parse_action(raw: RawHookAction) -> Result<Arc<HookAction>> {
             }
             let input = Value::Object(input.unwrap_or_default());
             validate_mcp_input_shape(&input)?;
-            HookAction::McpTool(McpToolHook {
+            HookAction::McpTool(Box::new(McpToolHook {
                 server,
                 tool,
                 input,
@@ -920,7 +966,7 @@ fn parse_action(raw: RawHookAction) -> Result<Arc<HookAction>> {
                     .transpose()?,
                 status_message: validate_status_message(status_message)?,
                 fired: AtomicBool::new(false),
-            })
+            }))
         }
     };
     Ok(Arc::new(action))

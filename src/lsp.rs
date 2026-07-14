@@ -509,8 +509,63 @@ impl LspClient {
 
 impl LspManager {
     fn server_name_for_path(&self, path: &Path) -> Result<Option<String>> {
-        let extension = extension_of(path)?;
+        let Ok(extension) = extension_of(path) else {
+            return Ok(None);
+        };
         Ok(self.extensions.get(&extension).cloned())
+    }
+
+    async fn sync_changed_files(&self, paths: &[PathBuf]) -> Result<Vec<String>> {
+        let mut feedback = Vec::new();
+        for path in paths {
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                // File mutation tools currently create or replace files. A
+                // future delete tool may legitimately leave no document to
+                // synchronize, so disappearance is not an LSP failure.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !canonical.starts_with(&self.workspace) {
+                bail!("LSP file-change hint escaped the configured workspace")
+            }
+            let metadata = std::fs::symlink_metadata(&canonical)?;
+            if !metadata.is_file() {
+                continue;
+            }
+            if metadata.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let Some((_name, client)) = self.client_for_path(&canonical).await? else {
+                continue;
+            };
+            let bytes = std::fs::read(&canonical)?;
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                // LSP text synchronization is undefined for binary data.
+                continue;
+            };
+            client.sync_document(&canonical, &text).await?;
+            let diagnostics = self.take_diagnostics_for_uri(&file_uri(&canonical)?).await;
+            if diagnostics
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                let relative = canonical
+                    .strip_prefix(&self.workspace)
+                    .unwrap_or(&canonical)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                feedback.push(serde_json::to_string(&json!({
+                    "source": "lsp_diagnostics",
+                    "file": relative,
+                    "diagnostics": diagnostics,
+                }))?);
+            }
+        }
+        Ok(feedback)
     }
 
     async fn client_for_path(&self, path: &Path) -> Result<Option<(String, Arc<LspClient>)>> {
@@ -602,6 +657,10 @@ impl LspManager {
 
 #[async_trait]
 impl ToolService for LspManager {
+    async fn files_changed(&self, paths: &[PathBuf]) -> Result<Vec<String>> {
+        self.sync_changed_files(paths).await
+    }
+
     async fn shutdown(&self) {
         self.shutdown_all().await;
     }
@@ -1202,6 +1261,9 @@ fn main() {
             let uri = string_field(&body, "uri");
             send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///not-opened-private.txt\",\"diagnostics\":[{\"message\":\"injected diagnostic\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}}");
             send(&format!("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{}\",\"version\":1,\"diagnostics\":[{{\"message\":\"mock warning\",\"severity\":2,\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}]}}}}", uri));
+        } else if body.contains("\"method\":\"textDocument/didChange\"") {
+            let uri = string_field(&body, "uri");
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{}\",\"version\":2,\"diagnostics\":[{{\"message\":\"passive edit warning\",\"severity\":2,\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}]}}}}", uri));
         } else if body.contains("\"method\":\"textDocument/definition\"") {
             let uri = string_field(&body, "uri");
             if body.contains("\"line\":0") && body.contains("\"character\":0") {
@@ -1371,6 +1433,26 @@ fn main() {
         assert!(!after_restart.is_error, "{}", after_restart.content);
         assert!(after_restart.content.contains("sample.txt"));
         assert!(!after_restart.content.contains("file://"));
+        let read = registry
+            .execute(&context, "Read", json!({"file_path": file}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let edit = registry
+            .execute(
+                &context,
+                "Edit",
+                json!({
+                    "file_path": file,
+                    "old_string": "hello",
+                    "new_string": "updated"
+                }),
+            )
+            .await;
+        assert!(!edit.is_error, "{}", edit.content);
+        assert!(edit.content.contains("passive edit warning"));
+        assert!(edit.content.contains("lsp_diagnostics"));
+        assert!(edit.content.contains("sample.txt"));
+        assert!(!edit.content.contains("file://"));
         registry.shutdown().await;
     }
 }

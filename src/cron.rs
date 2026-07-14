@@ -35,6 +35,7 @@ const WAKEUP_READY_RESERVED_BYTES: usize =
 const SCHEDULER_INTERVAL: Duration = Duration::from_secs(1);
 const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_STORE_LOCK_AGE: Duration = Duration::from_secs(30);
+const DELIVERY_CLAIM_LEASE_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronCreateRequest {
@@ -110,6 +111,27 @@ struct CronStore {
     version: u32,
     workspace_key: String,
     tasks: Vec<CronTask>,
+    /// Durable outbox. A due task is committed here in the same atomic store
+    /// update that advances/removes the schedule, then hydrated into the
+    /// process queue. A crash between those steps therefore cannot lose it.
+    #[serde(default)]
+    deliveries: Vec<CronDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CronDelivery {
+    id: String,
+    prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim: Option<CronDeliveryClaim>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CronDeliveryClaim {
+    owner: String,
+    expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +160,7 @@ impl CronStore {
             version: STORE_VERSION,
             workspace_key,
             tasks: Vec::new(),
+            deliveries: Vec::new(),
         }
     }
 }
@@ -156,7 +179,8 @@ struct ReadyPrompt {
 
 #[derive(Clone)]
 enum ReadySource {
-    Cron,
+    SessionCron,
+    DurableCron(String),
     Wakeup(String),
 }
 
@@ -176,7 +200,14 @@ impl ReadyQueue {
         if !self.can_push_cron(&prompt) {
             return false;
         }
-        self.push_with_source(prompt, ReadySource::Cron)
+        self.push_with_source(prompt, ReadySource::SessionCron)
+    }
+
+    fn push_durable(&mut self, id: String, prompt: String) -> bool {
+        if !self.can_push_cron(&prompt) {
+            return false;
+        }
+        self.push_with_source(prompt, ReadySource::DurableCron(id))
     }
 
     fn push_wakeup(&mut self, id: String, prompt: String) -> bool {
@@ -195,10 +226,15 @@ impl ReadyQueue {
         true
     }
 
-    fn pop(&mut self) -> Option<String> {
+    fn pop(&mut self) -> Option<ReadyPrompt> {
         let prompt = self.prompts.pop_front()?;
         self.bytes = self.bytes.saturating_sub(prompt.content.len());
-        Some(prompt.content)
+        Some(prompt)
+    }
+
+    fn push_front(&mut self, prompt: ReadyPrompt) {
+        self.bytes = self.bytes.saturating_add(prompt.content.len());
+        self.prompts.push_front(prompt);
     }
 
     fn remove_wakeups(&mut self) -> BTreeSet<String> {
@@ -206,7 +242,9 @@ impl ReadyQueue {
         let mut retained = VecDeque::with_capacity(self.prompts.len());
         while let Some(prompt) = self.prompts.pop_front() {
             match &prompt.source {
-                ReadySource::Cron => retained.push_back(prompt),
+                ReadySource::SessionCron | ReadySource::DurableCron(_) => {
+                    retained.push_back(prompt)
+                }
                 ReadySource::Wakeup(id) => {
                     self.bytes = self.bytes.saturating_sub(prompt.content.len());
                     removed.insert(id.clone());
@@ -230,6 +268,13 @@ struct CronInner {
     session_tasks: Mutex<Vec<CronTask>>,
     wakeup: Mutex<WakeupState>,
     ready: Mutex<ReadyQueue>,
+    claimed_deliveries: Mutex<BTreeSet<String>>,
+    /// A durable prompt is acknowledged only when the sole consumer asks for
+    /// the next prompt. Returning to this boundary proves that the previous
+    /// model turn completed; a crash before then leaves the outbox row for
+    /// lease-based redelivery.
+    pending_delivery_ack: Mutex<Option<String>>,
+    delivery_owner: String,
     ready_notify: tokio::sync::Notify,
     scheduler_started: AtomicBool,
     scheduler_stopped: AtomicBool,
@@ -272,6 +317,9 @@ impl CronService {
                 session_tasks: Mutex::new(Vec::new()),
                 wakeup: Mutex::new(WakeupState::default()),
                 ready: Mutex::new(ReadyQueue::default()),
+                claimed_deliveries: Mutex::new(BTreeSet::new()),
+                pending_delivery_ack: Mutex::new(None),
+                delivery_owner: Uuid::new_v4().simple().to_string(),
                 ready_notify: tokio::sync::Notify::new(),
                 scheduler_started: AtomicBool::new(false),
                 scheduler_stopped: AtomicBool::new(false),
@@ -575,7 +623,37 @@ impl CronService {
 
     pub fn take_ready_prompt(&self) -> Result<Option<String>> {
         self.check_background_error()?;
-        Ok(lock_unpoisoned(&self.inner.ready).pop())
+        self.ack_previous_consumed_delivery()?;
+        let prompt = {
+            // Keep claim + dequeue atomic with respect to durable hydration.
+            let mut claimed = lock_unpoisoned(&self.inner.claimed_deliveries);
+            let mut ready = lock_unpoisoned(&self.inner.ready);
+            let prompt = ready.pop();
+            if let Some(ReadyPrompt {
+                source: ReadySource::DurableCron(id),
+                ..
+            }) = &prompt
+            {
+                claimed.insert(id.clone());
+            }
+            prompt
+        };
+        let Some(prompt) = prompt else {
+            return Ok(None);
+        };
+        if let ReadySource::DurableCron(id) = &prompt.source {
+            let id = id.clone();
+            let mut pending = lock_unpoisoned(&self.inner.pending_delivery_ack);
+            if pending.is_some() {
+                let mut claimed = lock_unpoisoned(&self.inner.claimed_deliveries);
+                let mut ready = lock_unpoisoned(&self.inner.ready);
+                claimed.remove(&id);
+                ready.push_front(prompt);
+                bail!("scheduled task durable outbox 同时存在多个未确认消费者")
+            }
+            *pending = Some(id);
+        }
+        Ok(Some(prompt.content))
     }
 
     pub async fn wait_ready_prompt(&self) -> Result<String> {
@@ -610,10 +688,13 @@ impl CronService {
         }
         let _store_lock = acquire_store_lock(path)?;
         let mut store = self.load_store_unlocked()?;
-        let mut ready = lock_unpoisoned(&self.inner.ready);
         let mut changed = false;
-        let mut staged = Vec::new();
         let mut remaining = Vec::with_capacity(store.tasks.len());
+        let mut delivery_bytes = store
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.prompt.len())
+            .sum::<usize>();
 
         for mut task in store.tasks.drain(..) {
             if task.recurring && task.created_at_ms.saturating_add(RECURRING_MAX_AGE_MS) <= now {
@@ -625,13 +706,8 @@ impl CronService {
                 continue;
             }
             let prompt = scheduled_prompt(&task, startup && !task.recurring);
-            let staged_bytes = staged.iter().map(String::len).sum::<usize>();
-            if ready.prompts.len().saturating_add(staged.len())
-                >= MAX_READY_PROMPTS.saturating_sub(1)
-                || ready
-                    .bytes
-                    .saturating_add(staged_bytes)
-                    .saturating_add(prompt.len())
+            if store.deliveries.len() >= MAX_READY_PROMPTS.saturating_sub(1)
+                || delivery_bytes.saturating_add(prompt.len())
                     > MAX_READY_PROMPT_BYTES.saturating_sub(WAKEUP_READY_RESERVED_BYTES)
             {
                 remaining.push(task);
@@ -645,19 +721,129 @@ impl CronService {
                 remaining.push(task);
             }
             changed = true;
-            staged.push(prompt);
+            delivery_bytes = delivery_bytes.saturating_add(prompt.len());
+            store.deliveries.push(CronDelivery {
+                id: Uuid::new_v4().simple().to_string(),
+                prompt,
+                claim: None,
+            });
         }
 
         if changed {
             store.tasks = remaining;
             self.write_store_unlocked(&store)?;
-            let had_staged = !staged.is_empty();
-            for prompt in staged {
-                debug_assert!(ready.push(prompt));
+        }
+        self.claim_and_hydrate_durable_deliveries(&mut store, now)?;
+        Ok(())
+    }
+
+    fn claim_and_hydrate_durable_deliveries(&self, store: &mut CronStore, now: i64) -> Result<()> {
+        let claimed = lock_unpoisoned(&self.inner.claimed_deliveries);
+        let mut ready = lock_unpoisoned(&self.inner.ready);
+        let mut queued = ready
+            .prompts
+            .iter()
+            .filter_map(|prompt| match &prompt.source {
+                ReadySource::DurableCron(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0_usize;
+        let mut claim_changed = false;
+        let lease_expires_at = now.saturating_add(DELIVERY_CLAIM_LEASE_MS);
+        let renew_after = now.saturating_add(DELIVERY_CLAIM_LEASE_MS / 2);
+        for delivery in &mut store.deliveries {
+            if claimed.contains(&delivery.id) || queued.contains(&delivery.id) {
+                if delivery.claim.as_ref().is_some_and(|claim| {
+                    claim.owner == self.inner.delivery_owner && claim.expires_at_ms <= renew_after
+                }) {
+                    delivery.claim = Some(CronDeliveryClaim {
+                        owner: self.inner.delivery_owner.clone(),
+                        expires_at_ms: lease_expires_at,
+                    });
+                    claim_changed = true;
+                }
+                continue;
             }
-            if had_staged {
-                self.inner.ready_notify.notify_one();
+            let claimable = delivery.claim.as_ref().is_none_or(|claim| {
+                claim.owner == self.inner.delivery_owner || claim.expires_at_ms <= now
+            });
+            if !claimable
+                || ready.prompts.len().saturating_add(staged.len())
+                    >= MAX_READY_PROMPTS.saturating_sub(1)
+                || ready
+                    .bytes
+                    .saturating_add(staged_bytes)
+                    .saturating_add(delivery.prompt.len())
+                    > MAX_READY_PROMPT_BYTES.saturating_sub(WAKEUP_READY_RESERVED_BYTES)
+            {
+                continue;
             }
+            delivery.claim = Some(CronDeliveryClaim {
+                owner: self.inner.delivery_owner.clone(),
+                expires_at_ms: lease_expires_at,
+            });
+            claim_changed = true;
+            staged_bytes = staged_bytes.saturating_add(delivery.prompt.len());
+            staged.push((delivery.id.clone(), delivery.prompt.clone()));
+            queued.insert(delivery.id.clone());
+        }
+        if claim_changed {
+            self.write_store_unlocked(store)?;
+        }
+        let mut pushed = false;
+        for (id, prompt) in staged {
+            if !ready.push_durable(id, prompt) {
+                break;
+            }
+            pushed = true;
+        }
+        drop(ready);
+        drop(claimed);
+        if pushed {
+            self.inner.ready_notify.notify_one();
+        }
+        Ok(())
+    }
+
+    fn ack_durable_delivery(&self, id: &str) -> Result<bool> {
+        let path = self.store_path()?;
+        let _store_lock = acquire_store_lock(path)?;
+        let mut store = self.load_store_unlocked()?;
+        let Some(index) = store
+            .deliveries
+            .iter()
+            .position(|delivery| delivery.id == id)
+        else {
+            return Ok(false);
+        };
+        if store.deliveries[index]
+            .claim
+            .as_ref()
+            .map(|claim| &claim.owner)
+            != Some(&self.inner.delivery_owner)
+        {
+            bail!("scheduled task durable outbox claim ownership 已变化")
+        }
+        store.deliveries.remove(index);
+        self.write_store_unlocked(&store)?;
+        Ok(true)
+    }
+
+    fn ack_previous_consumed_delivery(&self) -> Result<()> {
+        let id = lock_unpoisoned(&self.inner.pending_delivery_ack).clone();
+        let Some(id) = id else {
+            return Ok(());
+        };
+        // Do not clear process-local ownership until the durable removal has
+        // committed. On I/O failure the next boundary retries the same ack,
+        // and a crash still leaves the delivery recoverable after its lease.
+        self.ack_durable_delivery(&id)?;
+        let mut pending = lock_unpoisoned(&self.inner.pending_delivery_ack);
+        if pending.as_deref() == Some(id.as_str()) {
+            pending.take();
+            lock_unpoisoned(&self.inner.claimed_deliveries).remove(&id);
         }
         Ok(())
     }
@@ -839,6 +1025,9 @@ fn validate_store(store: &CronStore, expected_workspace_key: &str) -> Result<()>
     if store.tasks.len() > MAX_CRON_JOBS {
         bail!("scheduled task store 超过 {MAX_CRON_JOBS} 项限制")
     }
+    if store.deliveries.len() >= MAX_READY_PROMPTS {
+        bail!("scheduled task durable outbox 超过限制")
+    }
     let mut ids = BTreeSet::new();
     let now = now_ms();
     let allowed_clock_skew_ms = 5 * 60 * 1_000;
@@ -864,6 +1053,40 @@ fn validate_store(store: &CronStore, expected_workspace_key: &str) -> Result<()>
         {
             bail!("scheduled task 下一次触发时间超出允许范围")
         }
+    }
+    let mut delivery_ids = BTreeSet::new();
+    let mut delivery_bytes = 0_usize;
+    for delivery in &store.deliveries {
+        if delivery.id.len() != 32
+            || !delivery.id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !delivery_ids.insert(delivery.id.as_str())
+        {
+            bail!("scheduled task durable outbox id 无效或重复")
+        }
+        if delivery.prompt.is_empty()
+            || delivery.prompt.contains('\0')
+            || delivery.prompt.len() > MAX_READY_PROMPT_BYTES
+        {
+            bail!("scheduled task durable outbox prompt 无效")
+        }
+        delivery_bytes = delivery_bytes
+            .checked_add(delivery.prompt.len())
+            .context("scheduled task durable outbox 大小溢出")?;
+        if let Some(claim) = &delivery.claim {
+            if claim.owner.len() != 32
+                || !claim.owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || claim.expires_at_ms < 0
+                || claim.expires_at_ms
+                    > now
+                        .saturating_add(DELIVERY_CLAIM_LEASE_MS)
+                        .saturating_add(allowed_clock_skew_ms)
+            {
+                bail!("scheduled task durable outbox claim 无效")
+            }
+        }
+    }
+    if delivery_bytes > MAX_READY_PROMPT_BYTES.saturating_sub(WAKEUP_READY_RESERVED_BYTES) {
+        bail!("scheduled task durable outbox 超过字节限制")
     }
     Ok(())
 }
@@ -1390,6 +1613,7 @@ mod tests {
             version: STORE_VERSION,
             workspace_key: service.inner.workspace_key.clone(),
             tasks: vec![task],
+            deliveries: Vec::new(),
         };
         let path = service.store_path().unwrap();
         ensure_private_directory(path.parent().unwrap()).unwrap();
@@ -1401,6 +1625,218 @@ mod tests {
         assert!(queued.contains("Do not execute it yet"));
         assert!(queued.contains("perform old action"));
         service.stop();
+    }
+
+    #[test]
+    fn durable_outbox_survives_a_crash_between_store_commit_and_memory_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = service(&temp);
+        let now = now_ms();
+        let store = CronStore {
+            version: STORE_VERSION,
+            workspace_key: first.inner.workspace_key.clone(),
+            tasks: vec![CronTask {
+                id: "deadc0de".into(),
+                cron: "* * * * *".into(),
+                prompt: "must survive crash window".into(),
+                created_at_ms: now - 120_000,
+                next_fire_at_ms: now - 60_000,
+                last_fired_at_ms: None,
+                recurring: false,
+            }],
+            deliveries: Vec::new(),
+        };
+        let path = first.store_path().unwrap();
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        first.write_store_unlocked(&store).unwrap();
+        first.poll_durable_due(now, false).unwrap();
+        let mut committed = first.load_store_unlocked().unwrap();
+        assert!(committed.tasks.is_empty());
+        assert_eq!(committed.deliveries.len(), 1);
+        assert!(committed.deliveries[0].claim.is_some());
+
+        // Persist the exact atomic boundary: schedule consumed + outbox
+        // committed, before this process acquired/enqueued its delivery.
+        committed.deliveries[0].claim = None;
+        first.write_store_unlocked(&committed).unwrap();
+
+        // Dropping the process-local queue models SIGKILL immediately after
+        // the atomic store commit.
+        drop(first);
+        let reopened = service(&temp);
+        reopened.start().unwrap();
+        let prompt = reopened.take_ready_prompt().unwrap().unwrap();
+        assert!(prompt.contains("must survive crash window"));
+        assert_eq!(
+            reopened.load_store_unlocked().unwrap().deliveries.len(),
+            1,
+            "returning a prompt must not acknowledge it before model consumption"
+        );
+        assert!(reopened.take_ready_prompt().unwrap().is_none());
+        assert!(
+            reopened
+                .load_store_unlocked()
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+        reopened.stop();
+
+        let after_ack = service(&temp);
+        after_ack.start().unwrap();
+        assert!(after_ack.take_ready_prompt().unwrap().is_none());
+        after_ack.stop();
+    }
+
+    #[test]
+    fn durable_outbox_lease_prevents_two_live_sessions_from_double_firing() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = service(&temp);
+        let right = service(&temp);
+        let now = now_ms();
+        let store = CronStore {
+            version: STORE_VERSION,
+            workspace_key: left.inner.workspace_key.clone(),
+            tasks: vec![CronTask {
+                id: "abcdef12".into(),
+                cron: "* * * * *".into(),
+                prompt: "exactly one live claimant".into(),
+                created_at_ms: now - 120_000,
+                next_fire_at_ms: now - 60_000,
+                last_fired_at_ms: None,
+                recurring: false,
+            }],
+            deliveries: Vec::new(),
+        };
+        let path = left.store_path().unwrap();
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        left.write_store_unlocked(&store).unwrap();
+
+        left.poll_durable_due(now, false).unwrap();
+        right.poll_durable_due(now, false).unwrap();
+        assert!(
+            left.take_ready_prompt()
+                .unwrap()
+                .unwrap()
+                .contains("exactly one live claimant")
+        );
+        assert!(right.take_ready_prompt().unwrap().is_none());
+        assert!(left.take_ready_prompt().unwrap().is_none());
+    }
+
+    #[test]
+    fn expired_delivery_claim_is_recovered_after_claiming_process_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service(&temp);
+        let now = now_ms();
+        let store = CronStore {
+            version: STORE_VERSION,
+            workspace_key: service.inner.workspace_key.clone(),
+            tasks: Vec::new(),
+            deliveries: vec![CronDelivery {
+                id: Uuid::new_v4().simple().to_string(),
+                prompt: "recover expired crash claim".into(),
+                claim: Some(CronDeliveryClaim {
+                    owner: Uuid::new_v4().simple().to_string(),
+                    expires_at_ms: now - 1,
+                }),
+            }],
+        };
+        let path = service.store_path().unwrap();
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        service.write_store_unlocked(&store).unwrap();
+
+        service.start().unwrap();
+        assert!(
+            service
+                .take_ready_prompt()
+                .unwrap()
+                .unwrap()
+                .contains("recover expired crash claim")
+        );
+        assert!(service.take_ready_prompt().unwrap().is_none());
+        assert!(service.load_store_unlocked().unwrap().deliveries.is_empty());
+        service.stop();
+    }
+
+    #[test]
+    fn durable_outbox_redelivers_after_crash_between_return_and_model_consumption() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = service(&temp);
+        let now = now_ms();
+        let store = CronStore {
+            version: STORE_VERSION,
+            workspace_key: first.inner.workspace_key.clone(),
+            tasks: vec![CronTask {
+                id: "feedc0de".into(),
+                cron: "* * * * *".into(),
+                prompt: "redeliver after pre-consumption crash".into(),
+                created_at_ms: now - 120_000,
+                next_fire_at_ms: now - 60_000,
+                last_fired_at_ms: None,
+                recurring: false,
+            }],
+            deliveries: Vec::new(),
+        };
+        let path = first.store_path().unwrap();
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        first.write_store_unlocked(&store).unwrap();
+        first.poll_durable_due(now, false).unwrap();
+
+        let returned = first.take_ready_prompt().unwrap().unwrap();
+        assert!(returned.contains("redeliver after pre-consumption crash"));
+        assert_eq!(first.load_store_unlocked().unwrap().deliveries.len(), 1);
+
+        // Model consumption never starts. A real process crash leaves the
+        // claim to expire; force that clock boundary without waiting five
+        // minutes, then create a fresh process owner.
+        drop(first);
+        let recovered = service(&temp);
+        let mut committed = recovered.load_store_unlocked().unwrap();
+        committed.deliveries[0]
+            .claim
+            .as_mut()
+            .unwrap()
+            .expires_at_ms = now - 1;
+        recovered.write_store_unlocked(&committed).unwrap();
+        recovered.start().unwrap();
+
+        let redelivered = recovered.take_ready_prompt().unwrap().unwrap();
+        assert!(redelivered.contains("redeliver after pre-consumption crash"));
+        assert_eq!(recovered.load_store_unlocked().unwrap().deliveries.len(), 1);
+        // Crossing the next consumer boundary acknowledges the successfully
+        // consumed delivery exactly once.
+        assert!(recovered.take_ready_prompt().unwrap().is_none());
+        assert!(
+            recovered
+                .load_store_unlocked()
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+        recovered.stop();
+    }
+
+    #[test]
+    fn durable_outbox_corruption_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service(&temp);
+        let store = CronStore {
+            version: STORE_VERSION,
+            workspace_key: service.inner.workspace_key.clone(),
+            tasks: Vec::new(),
+            deliveries: vec![CronDelivery {
+                id: "not-a-delivery-id".into(),
+                prompt: "unsafe".into(),
+                claim: None,
+            }],
+        };
+        let path = service.store_path().unwrap();
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        let encoded = serde_json::to_string_pretty(&store).unwrap() + "\n";
+        atomic_write_private(path, &encoded).unwrap();
+        assert!(service.start().is_err());
+        assert!(service.take_ready_prompt().unwrap().is_none());
     }
 
     #[test]
@@ -1430,6 +1866,7 @@ mod tests {
             version: STORE_VERSION,
             workspace_key: service.inner.workspace_key.clone(),
             tasks: vec![current, expired],
+            deliveries: Vec::new(),
         };
         let path = service.store_path().unwrap();
         ensure_private_directory(path.parent().unwrap()).unwrap();

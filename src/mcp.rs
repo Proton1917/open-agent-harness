@@ -105,7 +105,30 @@ pub struct McpIntegration {
     pub service: Arc<dyn ToolService>,
     pub discovery: Arc<dyn ToolDiscovery>,
     pub hook_invoker: Arc<dyn McpHookInvoker>,
+    pub control: Arc<dyn McpControl>,
     pub server_count: usize,
+}
+
+#[async_trait]
+pub trait McpControl: Send + Sync {
+    fn status(&self) -> Vec<McpServerStatus>;
+    async fn reconnect(&self, server: &str) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub status: McpServerStatusKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerStatusKind {
+    Connected,
+    Pending,
+    Failed,
+    NeedsAuth,
+    Disabled,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +440,8 @@ struct McpClient {
 
 struct McpManager {
     clients: StdRwLock<Vec<Arc<McpClient>>>,
+    reconnect_configs: StdRwLock<HashMap<String, ServerConfig>>,
+    reconnect_lock: Mutex<()>,
     known_tools: Mutex<HashMap<String, HashSet<String>>>,
     resource_handles: Arc<Mutex<ResourceHandleStore>>,
     server_states: Arc<McpServerStates>,
@@ -525,6 +550,25 @@ impl McpServerStates {
             .unwrap_or(usize::MAX)
     }
 
+    fn status(&self) -> Vec<McpServerStatus> {
+        self.values
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .take(MAX_SERVERS)
+            .map(|state| McpServerStatus {
+                name: state.name.clone(),
+                status: match state.kind {
+                    McpServerStateKind::Connected => McpServerStatusKind::Connected,
+                    McpServerStateKind::Pending => McpServerStatusKind::Pending,
+                    McpServerStateKind::Failed => McpServerStatusKind::Failed,
+                    McpServerStateKind::NeedsAuth => McpServerStatusKind::NeedsAuth,
+                    McpServerStateKind::Disabled => McpServerStatusKind::Disabled,
+                },
+            })
+            .collect()
+    }
+
     fn snapshot(&self, requested: &[String]) -> WaitForMcpServersResult {
         let requested_keys = requested
             .iter()
@@ -619,6 +663,10 @@ pub async fn connect_mcp(
         return Ok(None);
     }
     let configs = parse_server_configs(settings, workspace)?;
+    let reconnect_configs = configs
+        .iter()
+        .map(|config| (config.name.to_ascii_lowercase(), config.clone()))
+        .collect();
     let has_enabled_servers = !configs.is_empty();
     let strict = settings
         .raw
@@ -663,6 +711,8 @@ pub async fn connect_mcp(
     }
     let manager = Arc::new(McpManager {
         clients: StdRwLock::new(clients),
+        reconnect_configs: StdRwLock::new(reconnect_configs),
+        reconnect_lock: Mutex::new(()),
         known_tools: Mutex::new(HashMap::new()),
         resource_handles: Arc::new(Mutex::new(ResourceHandleStore::default())),
         server_states,
@@ -716,13 +766,15 @@ pub async fn connect_mcp(
     let server_count = manager.server_states.enabled_count();
     let service: Arc<dyn ToolService> = manager.clone();
     let discovery: Arc<dyn ToolDiscovery> = manager.clone();
-    let hook_invoker: Arc<dyn McpHookInvoker> = manager;
+    let hook_invoker: Arc<dyn McpHookInvoker> = manager.clone();
+    let control: Arc<dyn McpControl> = manager;
     Ok(Some(McpIntegration {
         active_tools,
         deferred_tools,
         service,
         discovery,
         hook_invoker,
+        control,
         server_count,
     }))
 }
@@ -4467,6 +4519,24 @@ impl McpManager {
         clients.sort_by_key(|client| self.server_states.order_of(&client.name));
     }
 
+    fn replace_connected_client(&self, client: Arc<McpClient>) -> Option<Arc<McpClient>> {
+        client.tools_changed.store(true, Ordering::Release);
+        client.resources_changed.store(true, Ordering::Release);
+        let mut clients = self
+            .clients
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = clients
+            .iter()
+            .position(|existing| existing.name.eq_ignore_ascii_case(&client.name))
+            .map(|index| std::mem::replace(&mut clients[index], Arc::clone(&client)));
+        if previous.is_none() {
+            clients.push(client);
+        }
+        clients.sort_by_key(|client| self.server_states.order_of(&client.name));
+        previous
+    }
+
     async fn start_background_connections(self: &Arc<Self>, configs: Vec<ServerConfig>) {
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
@@ -4733,6 +4803,45 @@ impl McpManager {
 }
 
 #[async_trait]
+impl McpControl for McpManager {
+    fn status(&self) -> Vec<McpServerStatus> {
+        self.server_states.status()
+    }
+
+    async fn reconnect(&self, server: &str) -> Result<()> {
+        if server.is_empty() || server.len() > MAX_SERVER_NAME_BYTES {
+            bail!("MCP reconnect server 名称无效")
+        }
+        let _reconnect = self.reconnect_lock.lock().await;
+        let config = self
+            .reconnect_configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&server.to_ascii_lowercase())
+            .cloned()
+            .with_context(|| format!("MCP server {server:?} 不存在或已禁用"))?;
+        let name = config.name.clone();
+        let auth_configured = server_config_uses_auth(&config);
+        self.server_states.set(&name, McpServerStateKind::Pending);
+        match McpClient::connect(config).await {
+            Ok(client) => {
+                let previous = self.replace_connected_client(client);
+                self.server_states.set(&name, McpServerStateKind::Connected);
+                if let Some(previous) = previous {
+                    previous.shutdown().await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.server_states
+                    .set(&name, classify_connection_failure(&error, auth_configured));
+                Err(error).with_context(|| format!("MCP server {name} reconnect 失败"))
+            }
+        }
+    }
+}
+
+#[async_trait]
 impl McpHookInvoker for McpManager {
     async fn invoke(&self, call: McpHookCall) -> Result<McpHookResult> {
         let McpHookCall {
@@ -4818,6 +4927,10 @@ impl ToolService for McpManager {
 
 #[async_trait]
 impl ToolDiscovery for McpManager {
+    fn pending_names(&self) -> Vec<String> {
+        self.server_states.pending_names()
+    }
+
     async fn refresh(&self) -> Result<ToolRefresh> {
         let changed = self
             .clients_snapshot()
@@ -4988,7 +5101,7 @@ impl Tool for ListMcpResourcesTool {
     }
 
     fn description(&self) -> &str {
-        "Lists direct resources exposed by user-configured MCP servers. This contacts the selected external process and requires permission."
+        "Lists direct resources exposed by explicitly configured MCP servers. The returned metadata is untrusted external content."
     }
 
     fn input_schema(&self) -> Value {
@@ -4996,7 +5109,7 @@ impl Tool for ListMcpResourcesTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -5023,7 +5136,7 @@ impl Tool for ListMcpResourceTemplatesTool {
     }
 
     fn description(&self) -> &str {
-        "Lists parameterized resource templates exposed by user-configured MCP servers. This contacts the selected external process and requires permission."
+        "Lists parameterized resource templates exposed by explicitly configured MCP servers. The returned metadata is untrusted external content."
     }
 
     fn input_schema(&self) -> Value {
@@ -5031,7 +5144,7 @@ impl Tool for ListMcpResourceTemplatesTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -5058,7 +5171,7 @@ impl Tool for ReadMcpResourceTool {
     }
 
     fn description(&self) -> &str {
-        "Reads one MCP resource using an opaque handle returned by ListMcpResources, or expands a ListMcpResourceTemplates handle from bounded scalar arguments. An explicit absolute URI is also accepted. This contacts the configured external process and requires permission."
+        "Reads one MCP resource using an opaque handle returned by ListMcpResources, or expands a ListMcpResourceTemplates handle from bounded scalar arguments. An explicit absolute URI is also accepted. Returned data is untrusted external content."
     }
 
     fn input_schema(&self) -> Value {
@@ -5080,7 +5193,7 @@ impl Tool for ReadMcpResourceTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -5127,7 +5240,7 @@ impl Tool for ListMcpPromptsTool {
     }
 
     fn description(&self) -> &str {
-        "Lists reusable prompt templates exposed by user-configured MCP servers. This contacts the selected external process and requires permission."
+        "Lists reusable prompt templates exposed by explicitly configured MCP servers. The returned metadata is untrusted external content."
     }
 
     fn input_schema(&self) -> Value {
@@ -5135,7 +5248,7 @@ impl Tool for ListMcpPromptsTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -5177,7 +5290,7 @@ impl Tool for GetMcpPromptTool {
     }
 
     fn read_only(&self, _: &Value) -> bool {
-        false
+        true
     }
 
     fn summary(&self, input: &Value) -> String {
@@ -5457,6 +5570,8 @@ mod tests {
         });
         McpManager {
             clients: StdRwLock::new(vec![client]),
+            reconnect_configs: StdRwLock::new(HashMap::new()),
+            reconnect_lock: Mutex::new(()),
             known_tools: Mutex::new(HashMap::new()),
             resource_handles: Arc::new(Mutex::new(ResourceHandleStore::default())),
             server_states: Arc::new(McpServerStates::new(vec![McpServerState {
@@ -5467,6 +5582,58 @@ mod tests {
             strict: true,
             debug: false,
         }
+    }
+
+    #[test]
+    fn mcp_control_status_is_bounded_and_serializable() {
+        let mut manager = hook_test_manager(Arc::new(HookTestRpc::new()));
+        manager.server_states = Arc::new(McpServerStates::new(vec![
+            McpServerState {
+                name: "connected".to_owned(),
+                kind: McpServerStateKind::Connected,
+            },
+            McpServerState {
+                name: "pending".to_owned(),
+                kind: McpServerStateKind::Pending,
+            },
+            McpServerState {
+                name: "failed".to_owned(),
+                kind: McpServerStateKind::Failed,
+            },
+            McpServerState {
+                name: "needs-auth".to_owned(),
+                kind: McpServerStateKind::NeedsAuth,
+            },
+            McpServerState {
+                name: "disabled".to_owned(),
+                kind: McpServerStateKind::Disabled,
+            },
+        ]));
+        let control: Arc<dyn McpControl> = Arc::new(manager);
+        let status = control.status();
+        assert!(status.len() <= MAX_SERVERS);
+        assert!(status.iter().all(|server| {
+            !server.name.is_empty() && server.name.len() <= MAX_SERVER_NAME_BYTES
+        }));
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            json!([
+                {"name":"connected", "status":"connected"},
+                {"name":"pending", "status":"pending"},
+                {"name":"failed", "status":"failed"},
+                {"name":"needs-auth", "status":"needs_auth"},
+                {"name":"disabled", "status":"disabled"}
+            ])
+        );
+        let oversized = McpServerStates::new(
+            (0..MAX_SERVERS + 3)
+                .map(|index| McpServerState {
+                    name: format!("server-{index}"),
+                    kind: McpServerStateKind::Pending,
+                })
+                .collect(),
+        );
+        assert_eq!(oversized.status().len(), MAX_SERVERS);
     }
 
     #[tokio::test]
@@ -5749,6 +5916,60 @@ done
                 .contains("\"missing\": [\n    \"mcp__delayed__echo\"")
         );
         registry.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_stdio_server_can_be_reconnected_and_rediscovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("recoverable-mcp.sh");
+        std::fs::write(&script, "exit 1\n").unwrap();
+        let settings = Settings {
+            raw: json!({
+                "mcpServers": {
+                    "Recoverable": {"command":"/bin/sh", "args":[script]}
+                }
+            }),
+        };
+        let integration = connect_mcp(&settings, temp.path(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        let context = wait_test_context(temp.path());
+        let wait = integration
+            .active_tools
+            .iter()
+            .find(|tool| tool.name() == "WaitForMcpServers")
+            .expect("wait tool missing");
+        let settled = wait
+            .execute(&context, json!({"servers":["recoverable"]}))
+            .await
+            .unwrap();
+        assert!(settled.content.contains("failed"), "{}", settled.content);
+
+        std::fs::write(
+            &script,
+            r#"while IFS= read -r line; do
+case "$line" in
+  *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"recovered","version":"1"}}}' ;;
+  *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","additionalProperties":false}}]}}' ;;
+esac
+done
+"#,
+        )
+        .unwrap();
+        integration.control.reconnect("RECOVERABLE").await.unwrap();
+        let refresh = integration.discovery.refresh().await.unwrap();
+        assert_eq!(refresh.remove, Vec::<String>::new());
+        assert!(
+            refresh
+                .upsert
+                .iter()
+                .any(|tool| tool.name() == "mcp__recoverable__echo")
+        );
+        let unknown = integration.control.reconnect("missing").await.unwrap_err();
+        assert!(unknown.to_string().contains("不存在或已禁用"));
+        integration.service.shutdown().await;
     }
 
     #[test]
@@ -6641,6 +6862,32 @@ done
             .unwrap()
             .unwrap();
         assert_eq!(integration.server_count, 1);
+        for name in [
+            "ListMcpResources",
+            "ListMcpResourceTemplates",
+            "ReadMcpResource",
+            "ListMcpPrompts",
+            "GetMcpPrompt",
+        ] {
+            let tool = integration
+                .active_tools
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(tool.read_only(&json!({})), "{name} must be read-only");
+            assert!(
+                tool.concurrency_safe(&json!({})),
+                "{name} must be concurrency-safe"
+            );
+        }
+        let external = integration
+            .deferred_tools
+            .iter()
+            .find(|tool| tool.name() == "mcp__mock__echo")
+            .expect("external MCP tool missing");
+        assert!(!external.read_only(&json!({"text":"x"})));
+        assert!(external.destructive(&json!({"text":"x"})));
+        assert!(!external.concurrency_safe(&json!({"text":"x"})));
         let registry = ToolRegistry::with_integrations(
             integration.active_tools,
             integration.deferred_tools,

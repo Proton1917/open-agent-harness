@@ -871,6 +871,67 @@ async fn task_output_blocks_until_background_command_finishes() {
     assert!(output.content.contains("task-output-ready"));
 }
 
+#[tokio::test]
+async fn task_stop_does_not_discard_a_naturally_completed_task_result() {
+    let temp = tempdir().unwrap();
+    let context = context(temp.path());
+    let registry = ToolRegistry::default();
+    let started = registry
+        .execute(
+            &context,
+            "Bash",
+            json!({"command":"printf natural-completion","run_in_background":true}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let task_id = started
+        .content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Command running in background with ID: "))
+        .unwrap()
+        .to_owned();
+
+    let mut naturally_finished = false;
+    for _ in 0..200 {
+        let finished = {
+            let mut tasks = context.tasks.lock().await;
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.child.try_wait().unwrap().is_some()
+                && task.drains.iter().all(tokio::task::JoinHandle::is_finished)
+        };
+        if finished {
+            naturally_finished = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        naturally_finished,
+        "background command did not finish in time"
+    );
+
+    let stopped = registry
+        .execute(&context, "TaskStop", json!({"task_id":task_id}))
+        .await;
+    assert!(stopped.is_error);
+    assert!(
+        stopped.content.contains("TaskOutput"),
+        "{}",
+        stopped.content
+    );
+
+    let output = registry
+        .execute(
+            &context,
+            "TaskOutput",
+            json!({"task_id":task_id,"block":true,"timeout":5000}),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("natural-completion"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn task_stop_terminates_background_process_group() {

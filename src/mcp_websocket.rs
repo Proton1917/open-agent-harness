@@ -84,8 +84,30 @@ enum Command {
     },
 }
 
-type Pending = HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>;
+struct PendingRequest {
+    response: oneshot::Sender<std::result::Result<Value, String>>,
+    initialize_request: Option<Value>,
+}
+
+type Pending = HashMap<String, PendingRequest>;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone, Default)]
+struct ReconnectHandshake {
+    initialize_request: Option<Value>,
+    protocol_version: Option<String>,
+    capabilities: Option<Value>,
+    initialized_notification: Option<Value>,
+}
+
+impl ReconnectHandshake {
+    fn is_ready(&self) -> bool {
+        self.initialize_request.is_some()
+            && self.protocol_version.is_some()
+            && self.capabilities.is_some()
+            && self.initialized_notification.is_some()
+    }
+}
 
 struct ConnectedSocket {
     socket: Socket,
@@ -262,6 +284,7 @@ async fn run_actor(
     diagnostics: Arc<StdRwLock<String>>,
 ) {
     let mut pending = HashMap::new();
+    let mut handshake = ReconnectHandshake::default();
     loop {
         let outcome = run_connection(
             &config,
@@ -269,6 +292,7 @@ async fn run_actor(
             &mut commands,
             &events,
             &mut pending,
+            &mut handshake,
         )
         .await;
         fail_pending(&mut pending, connection_reason(&outcome));
@@ -288,7 +312,7 @@ async fn run_actor(
                     if attempt > 0 {
                         sleep(Duration::from_millis(100 * (1u64 << attempt))).await;
                     }
-                    match connect_socket(&config).await {
+                    match reconnect_socket(&config, &handshake).await {
                         Ok(socket) => {
                             replacement = Some(socket);
                             break;
@@ -318,6 +342,7 @@ async fn run_connection(
     commands: &mut mpsc::Receiver<Command>,
     events: &broadcast::Sender<Value>,
     pending: &mut Pending,
+    handshake: &mut ReconnectHandshake,
 ) -> ConnectionEnd {
     loop {
         tokio::select! {
@@ -347,7 +372,10 @@ async fn run_connection(
                             let _ = response.send(Err("WebSocket request write 失败".to_owned()));
                             return ConnectionEnd::Retryable(safe_ws_error(&error));
                         }
-                        pending.insert(key, response);
+                        let initialize_request = (message.get("method").and_then(Value::as_str)
+                            == Some("initialize"))
+                        .then_some(message);
+                        pending.insert(key, PendingRequest { response, initialize_request });
                     }
                     Command::Notify { message, written } => {
                         let text = match serialize_message(&message) {
@@ -358,7 +386,14 @@ async fn run_connection(
                             }
                         };
                         match connected.socket.send(Message::text(text)).await {
-                            Ok(()) => { let _ = written.send(Ok(())); }
+                            Ok(()) => {
+                                if message.get("method").and_then(Value::as_str)
+                                    == Some("notifications/initialized")
+                                {
+                                    handshake.initialized_notification = Some(message);
+                                }
+                                let _ = written.send(Ok(()));
+                            }
                             Err(error) => {
                                 let _ = written.send(Err("WebSocket notification write 失败".to_owned()));
                                 return ConnectionEnd::Retryable(safe_ws_error(&error));
@@ -435,10 +470,23 @@ async fn run_connection(
                             Ok(key) => key,
                             Err(error) => return ConnectionEnd::Fatal(safe_error(&error)),
                         };
-                        let Some(sender) = pending.remove(&key) else {
+                        let Some(pending_request) = pending.remove(&key) else {
                             continue;
                         };
-                        let _ = sender.send(parse_response(&message, &config.label));
+                        let response = parse_response(&message, &config.label);
+                        if let (Some(initialize_request), Ok(result)) =
+                            (&pending_request.initialize_request, &response)
+                        {
+                            if let (Some(version), Some(capabilities)) = (
+                                result.get("protocolVersion").and_then(Value::as_str),
+                                result.get("capabilities").filter(|value| value.is_object()),
+                            ) {
+                                handshake.initialize_request = Some(initialize_request.clone());
+                                handshake.protocol_version = Some(version.to_owned());
+                                handshake.capabilities = Some(capabilities.clone());
+                            }
+                        }
+                        let _ = pending_request.response.send(response);
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Err(error) = connected.socket.send(Message::Pong(payload)).await {
@@ -462,6 +510,100 @@ async fn run_connection(
             }
         }
     }
+}
+
+async fn reconnect_socket(
+    config: &WebSocketMcpConfig,
+    handshake: &ReconnectHandshake,
+) -> Result<ConnectedSocket> {
+    if !handshake.is_ready() {
+        bail!(
+            "{} WebSocket 断线前未完成 MCP initialize，拒绝裸重连",
+            config.label
+        )
+    }
+    let mut connected = connect_socket(config).await?;
+    reinitialize_socket(config, &mut connected, handshake).await?;
+    Ok(connected)
+}
+
+async fn reinitialize_socket(
+    config: &WebSocketMcpConfig,
+    connected: &mut ConnectedSocket,
+    handshake: &ReconnectHandshake,
+) -> Result<()> {
+    let initialize = handshake
+        .initialize_request
+        .as_ref()
+        .context("MCP reconnect 缺少 initialize request")?;
+    let expected_version = handshake
+        .protocol_version
+        .as_deref()
+        .context("MCP reconnect 缺少已协商 protocolVersion")?;
+    let expected_capabilities = handshake
+        .capabilities
+        .as_ref()
+        .context("MCP reconnect 缺少已协商 capabilities")?;
+    let initialized = handshake
+        .initialized_notification
+        .as_ref()
+        .context("MCP reconnect 缺少 initialized notification")?;
+
+    connected
+        .socket
+        .send(Message::text(serialize_message(initialize)?))
+        .await
+        .context("MCP WebSocket reconnect initialize 写入失败")?;
+    let deadline = tokio::time::Instant::now() + config.request_timeout;
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("MCP WebSocket reconnect initialize timeout")
+        }
+        let frame = timeout(remaining, connected.socket.next())
+            .await
+            .context("MCP WebSocket reconnect initialize timeout")?
+            .context("MCP WebSocket reconnect 在 initialize response 前关闭")??;
+        match frame {
+            Message::Text(text) => {
+                let message = parse_inbound_message(text.as_bytes())?;
+                if message.get("method").is_some() {
+                    bail!("MCP WebSocket reconnect initialize 前收到未预期 server request")
+                }
+                let expected_id = initialize.get("id").context("initialize request 缺少 id")?;
+                if message.get("id") != Some(expected_id) {
+                    bail!("MCP WebSocket reconnect initialize response id 不匹配")
+                }
+                break parse_response(&message, &config.label).map_err(anyhow::Error::msg)?;
+            }
+            Message::Ping(payload) => connected.socket.send(Message::Pong(payload)).await?,
+            Message::Pong(_) => {}
+            Message::Close(_) => bail!("MCP WebSocket reconnect initialize 被 server 关闭"),
+            Message::Binary(_) | Message::Frame(_) => {
+                bail!("MCP WebSocket reconnect initialize 只接受 text JSON-RPC")
+            }
+        }
+    };
+    let actual_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .context("MCP WebSocket reconnect initialize response 缺少 protocolVersion")?;
+    if actual_version != expected_version {
+        bail!("MCP WebSocket reconnect protocolVersion 从 {expected_version} 变为 {actual_version}")
+    }
+    let actual_capabilities = result
+        .get("capabilities")
+        .filter(|capabilities| capabilities.is_object())
+        .context("MCP WebSocket reconnect initialize response 缺少 capabilities object")?;
+    if actual_capabilities != expected_capabilities {
+        bail!("MCP WebSocket reconnect capabilities 与原协商结果不一致")
+    }
+    connected
+        .socket
+        .send(Message::text(serialize_message(initialized)?))
+        .await
+        .context("MCP WebSocket reconnect initialized 写入失败")?;
+    Ok(())
 }
 
 async fn connect_socket(config: &WebSocketMcpConfig) -> Result<ConnectedSocket> {
@@ -628,8 +770,8 @@ fn id_key(id: &Value) -> Result<String> {
 }
 
 fn fail_pending(pending: &mut Pending, reason: &str) {
-    for (_, sender) in pending.drain() {
-        let _ = sender.send(Err(reason.to_owned()));
+    for (_, pending) in pending.drain() {
+        let _ = pending.response.send(Err(reason.to_owned()));
     }
 }
 
@@ -930,15 +1072,41 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                let request = socket.next().await.unwrap().unwrap();
-                let Message::Text(request) = request else {
-                    panic!("expected text request")
+                let Message::Text(request) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected initialize request")
                 };
+                let initialize: Value = serde_json::from_str(request.as_str()).unwrap();
+                assert_eq!(initialize["method"], "initialize");
+                socket
+                    .send(Message::text(
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id":initialize["id"],
+                            "result":{
+                                "protocolVersion":"2025-11-25",
+                                "capabilities":{}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                let Message::Text(initialized) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected initialized notification")
+                };
+                let initialized: Value = serde_json::from_str(initialized.as_str()).unwrap();
+                assert_eq!(initialized["method"], "notifications/initialized");
+
+                let Message::Text(request) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected business request")
+                };
+                let request: Value = serde_json::from_str(request.as_str()).unwrap();
                 if connection == 0 {
+                    assert_eq!(request["method"], "test/first");
                     drop(socket);
                     continue;
                 }
-                let request: Value = serde_json::from_str(request.as_str()).unwrap();
+                assert_eq!(request["method"], "test/second");
                 socket
                     .send(Message::text(
                         json!({
@@ -965,11 +1133,107 @@ mod tests {
         })
         .await
         .unwrap();
+        let initialized = rpc
+            .request("initialize", Some(json!({"protocolVersion":"2025-11-25"})))
+            .await
+            .unwrap();
+        assert_eq!(initialized["protocolVersion"], "2025-11-25");
+        rpc.notify("notifications/initialized", None).await.unwrap();
         let first = rpc.request("test/first", None).await.unwrap_err();
         assert!(first.to_string().contains("WebSocket"));
         let second = rpc.request("test/second", None).await.unwrap();
         assert_eq!(second, json!({"connection":2}));
         rpc.shutdown().await;
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn websocket_reconnect_negotiation_failure_closes_without_business_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for connection in 0..=MAX_WS_RECONNECT_ATTEMPTS {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_hdr_async(stream, |_: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", HeaderValue::from_static("mcp"));
+                    Ok(response)
+                })
+                .await
+                .unwrap();
+                let Message::Text(request) = socket.next().await.unwrap().unwrap() else {
+                    panic!("connection {connection} must start with initialize")
+                };
+                let initialize: Value = serde_json::from_str(request.as_str()).unwrap();
+                assert_eq!(initialize["method"], "initialize");
+                let protocol_version = if connection == 0 {
+                    "2025-11-25"
+                } else {
+                    "2024-11-05"
+                };
+                socket
+                    .send(Message::text(
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id":initialize["id"],
+                            "result":{
+                                "protocolVersion":protocol_version,
+                                "capabilities":{}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 {
+                    let Message::Text(initialized) = socket.next().await.unwrap().unwrap() else {
+                        panic!("expected initialized notification")
+                    };
+                    let initialized: Value = serde_json::from_str(initialized.as_str()).unwrap();
+                    assert_eq!(initialized["method"], "notifications/initialized");
+                    let Message::Text(request) = socket.next().await.unwrap().unwrap() else {
+                        panic!("expected first business request")
+                    };
+                    let request: Value = serde_json::from_str(request.as_str()).unwrap();
+                    assert_eq!(request["method"], "test/first");
+                    drop(socket);
+                } else {
+                    match timeout(Duration::from_secs(1), socket.next()).await {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            panic!("business frame followed failed negotiation: {text}")
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {}
+                        Ok(Some(Ok(other))) => {
+                            panic!("unexpected frame after failed negotiation: {other:?}")
+                        }
+                        Err(_) => panic!("client did not close failed negotiation"),
+                    }
+                }
+            }
+        });
+        let rpc = WebSocketMcpRpc::connect(WebSocketMcpConfig {
+            label: "MCP/mock".to_owned(),
+            url: Url::parse(&format!("ws://{address}/mcp")).unwrap(),
+            headers: HeaderMap::new(),
+            configured_secrets: Vec::new(),
+            credential: None,
+            allow_private_network: true,
+            request_timeout: Duration::from_secs(2),
+            server_request_handler: Arc::new(|_, _| None),
+        })
+        .await
+        .unwrap();
+        rpc.request("initialize", Some(json!({"protocolVersion":"2025-11-25"})))
+            .await
+            .unwrap();
+        rpc.notify("notifications/initialized", None).await.unwrap();
+        let first = rpc.request("test/first", None).await.unwrap_err();
+        assert!(first.to_string().contains("WebSocket"));
+        let second = rpc.request("test/second", None).await.unwrap_err();
+        assert!(second.to_string().contains("WebSocket"));
+        server.await.unwrap();
+        rpc.shutdown().await;
     }
 }

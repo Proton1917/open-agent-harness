@@ -190,12 +190,15 @@ impl Tool for TaskStopTool {
                 .task_stop_alias(context, &input.task_id)
                 .await;
         }
-        let mut task = tasks.remove(&input.task_id).context("未找到后台任务")?;
-        let already_finished = task.child.try_wait()?.is_some()
-            && task.drains.iter().all(tokio::task::JoinHandle::is_finished);
+        let already_finished = {
+            let task = tasks.get_mut(&input.task_id).context("未找到后台任务")?;
+            task.child.try_wait()?.is_some()
+                && task.drains.iter().all(tokio::task::JoinHandle::is_finished)
+        };
         if already_finished {
-            bail!("任务已经结束")
+            bail!("任务已经结束；请用 TaskOutput 读取最终结果")
         }
+        let mut task = tasks.remove(&input.task_id).context("未找到后台任务")?;
         terminate_task(&mut task).await;
         let (mut output, preview_truncated, size) =
             read_output_preview(&task.output_path, MAX_OUTPUT_BYTES)?;

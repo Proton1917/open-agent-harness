@@ -298,6 +298,32 @@ impl PermissionManager {
         outside_workspace: bool,
         targets: &[PermissionTarget],
     ) -> Result<PermissionDecision> {
+        self.decide_invocation_with_targets_policy(
+            tool,
+            input,
+            tool_use_id,
+            summary,
+            read_only,
+            destructive,
+            outside_workspace,
+            targets,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_invocation_with_targets_policy(
+        &self,
+        tool: &str,
+        input: &Value,
+        tool_use_id: &str,
+        summary: &str,
+        read_only: bool,
+        destructive: bool,
+        outside_workspace: bool,
+        targets: &[PermissionTarget],
+        explicit_permission: bool,
+    ) -> Result<PermissionDecision> {
         let workspace_deny = self
             .workspace_deny
             .read()
@@ -329,7 +355,9 @@ impl PermissionManager {
             {
                 Ok(PermissionDecision::Allow)
             }
-            _ if read_only && !destructive && !outside_workspace => Ok(PermissionDecision::Allow),
+            _ if read_only && !destructive && !outside_workspace && !explicit_permission => {
+                Ok(PermissionDecision::Allow)
+            }
             PermissionMode::DontAsk => Ok(PermissionDecision::Deny),
             PermissionMode::Default | PermissionMode::AcceptEdits => {
                 let request = PermissionRequest {
@@ -503,6 +531,21 @@ impl PermissionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         invocation_matches_rules(&self.deny, "Read", "", &targets, RuleBehavior::Deny)
             || invocation_matches_rules(&workspace_deny, "Read", "", &targets, RuleBehavior::Deny)
+    }
+
+    pub(crate) fn has_read_deny_rules(&self) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|rule| parse_rule(rule).tool.eq_ignore_ascii_case("Read"))
+        {
+            return true;
+        }
+        self.workspace_deny
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|rule| parse_rule(rule).tool.eq_ignore_ascii_case("Read"))
     }
 }
 
@@ -875,6 +918,92 @@ struct LexedShell {
 
 fn analyze_shell(command: &str) -> ShellAnalysis {
     analyze_shell_depth(command, 0)
+}
+
+/// Returns a strictly static, pipeline-only shell representation. This is a
+/// narrower view than the deny analyzer: it rejects every expansion,
+/// redirection, wrapper/control construct, background operator and sequential
+/// connector so callers may reason about the actual argv of each process.
+pub(crate) fn static_shell_pipeline(command: &str) -> Option<Vec<Vec<String>>> {
+    let lexed = lex_shell(command);
+    if !lexed.safe
+        || lexed.commands.is_empty()
+        || split_atomic_shell_sources(command)
+            .iter()
+            .any(|segment| shell_segment_has_dynamic_token(segment))
+        || !pipeline_connectors_are_static(command)
+    {
+        return None;
+    }
+    Some(lexed.commands)
+}
+
+fn pipeline_connectors_are_static(command: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut at_word_start = true;
+    let mut saw_word_since_pipe = false;
+    let mut index = 0_usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            saw_word_since_pipe = true;
+            at_word_start = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && quote != Quote::Single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' if quote != Quote::Double => {
+                quote = if quote == Quote::Single {
+                    Quote::None
+                } else {
+                    Quote::Single
+                };
+                saw_word_since_pipe = true;
+                at_word_start = false;
+            }
+            '"' if quote != Quote::Single => {
+                quote = if quote == Quote::Double {
+                    Quote::None
+                } else {
+                    Quote::Double
+                };
+                saw_word_since_pipe = true;
+                at_word_start = false;
+            }
+            '#' if quote == Quote::None && at_word_start => break,
+            '|' if quote == Quote::None => {
+                if !saw_word_since_pipe || chars.get(index + 1) == Some(&'|') {
+                    return false;
+                }
+                saw_word_since_pipe = false;
+                at_word_start = true;
+            }
+            '\n' | ';' | '&' | '<' | '>' | '(' | ')' | '{' | '}' if quote == Quote::None => {
+                return false;
+            }
+            ch if quote == Quote::None && ch.is_whitespace() => at_word_start = true,
+            _ => {
+                saw_word_since_pipe = true;
+                at_word_start = false;
+            }
+        }
+        index += 1;
+    }
+    quote == Quote::None && !escaped && saw_word_since_pipe
 }
 
 fn analyze_shell_depth(command: &str, depth: usize) -> ShellAnalysis {

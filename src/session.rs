@@ -24,6 +24,8 @@ use crate::{
 
 const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_RECORDS: usize = 100_000;
+const MAX_SESSION_LIST_SCAN: usize = 10_000;
+const MAX_SESSION_LIST_RESULTS: usize = 100;
 const REDACTED_SECRET: &str = "[secret-redacted]";
 const REDACTED_PATH: &str = "[absolute-path-redacted]";
 
@@ -78,6 +80,13 @@ pub struct SessionWorkspaceState {
 pub struct SessionCurrentCwdState {
     pub root_key: String,
     pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub modified_ms: u128,
+    pub bytes: u64,
 }
 
 impl SessionWorkspaceState {
@@ -172,6 +181,10 @@ impl SessionStateRoot {
 }
 
 impl SessionStore {
+    pub fn persistence_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -192,6 +205,68 @@ impl SessionStore {
 
     pub fn create(cwd: &Path, enabled: bool) -> Result<Self> {
         Self::create_with_directory(cwd, enabled, || project_directory(cwd))
+    }
+
+    /// Lists recent persisted sessions for the current workspace without
+    /// opening or mutating their transcripts.
+    pub fn list(cwd: &Path, limit: usize) -> Result<Vec<SessionSummary>> {
+        Self::list_from_directory(project_directory(cwd)?, limit)
+    }
+
+    pub fn list_in(
+        cwd: &Path,
+        state_root: &SessionStateRoot,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        Self::list_from_directory(state_root.project_directory(cwd)?, limit)
+    }
+
+    fn list_from_directory(directory: PathBuf, limit: usize) -> Result<Vec<SessionSummary>> {
+        if limit == 0 || limit > MAX_SESSION_LIST_RESULTS {
+            bail!("session list limit 必须在 1..={MAX_SESSION_LIST_RESULTS} 范围内")
+        }
+        let mut sessions = Vec::new();
+        let mut scanned = 0usize;
+        for entry in fs::read_dir(directory)? {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_SESSION_LIST_SCAN {
+                bail!("session 目录条目超过 {MAX_SESSION_LIST_SCAN} 个安全上限")
+            }
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<Uuid>().ok())
+            else {
+                continue;
+            };
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_millis());
+            sessions.push(SessionSummary {
+                id,
+                modified_ms,
+                bytes: metadata.len(),
+            });
+        }
+        sessions.sort_by(|left, right| {
+            right
+                .modified_ms
+                .cmp(&left.modified_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        sessions.truncate(limit);
+        Ok(sessions)
     }
 
     pub fn create_in(cwd: &Path, state_root: &SessionStateRoot, enabled: bool) -> Result<Self> {
@@ -799,6 +874,20 @@ fn load_transcript(file: &Path) -> Result<LoadedTranscript> {
     if bytes.len() > MAX_TRANSCRIPT_BYTES as usize {
         bail!("transcript 超过 {MAX_TRANSCRIPT_BYTES} 字节限制")
     }
+    // append_record always commits a newline-terminated JSONL record. A final
+    // non-terminated fragment can only be an interrupted append; retain the
+    // last durable record boundary, but continue to reject corruption in any
+    // newline-terminated (middle or final) record.
+    let repaired_len = if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        bytes.truncate(complete_len);
+        Some(complete_len as u64)
+    } else {
+        None
+    };
     let mut expected_session_id = file
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -883,7 +972,7 @@ fn load_transcript(file: &Path) -> Result<LoadedTranscript> {
                 }
                 Ok(messages)
             })?;
-    Ok(LoadedTranscript {
+    let loaded = LoadedTranscript {
         messages,
         message_workspaces,
         message_current_cwds,
@@ -891,7 +980,41 @@ fn load_transcript(file: &Path) -> Result<LoadedTranscript> {
         boundary_current_cwd,
         workspace: current_workspace,
         current_cwd,
-    })
+    };
+    if let Some(length) = repaired_len {
+        truncate_private_transcript(file, length)?;
+    }
+    Ok(loaded)
+}
+
+fn truncate_private_transcript(path: &Path, length: u64) -> Result<()> {
+    if length > MAX_TRANSCRIPT_BYTES {
+        bail!("transcript 修复边界超过 {MAX_TRANSCRIPT_BYTES} 字节限制")
+    }
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!("拒绝修复 symlink transcript: {}", path.display())
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("无法打开待修复 transcript {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("待修复 transcript 不是普通文件")
+    }
+    file.set_len(length)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn validate_workspace_key(key: Option<&str>) -> Result<()> {
@@ -1356,6 +1479,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn session_listing_is_workspace_scoped_bounded_and_read_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        make_private_directory(storage.path());
+        let root = SessionStateRoot::open(storage.path()).unwrap();
+        let first = SessionStore::create_in(workspace.path(), &root, true).unwrap();
+        first.append(&[Message::user_text("first")]).unwrap();
+        let second = SessionStore::create_in(workspace.path(), &root, true).unwrap();
+        second.append(&[Message::user_text("second")]).unwrap();
+
+        let listed = SessionStore::list_in(workspace.path(), &root, 20).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|session| session.id == first.id));
+        assert!(listed.iter().any(|session| session.id == second.id));
+        assert!(listed.iter().all(|session| session.bytes > 0));
+        assert!(SessionStore::list_in(workspace.path(), &root, 0).is_err());
+        assert!(SessionStore::list_in(workspace.path(), &root, 101).is_err());
+    }
+
+    #[test]
     fn clear_boundary_removes_all_prior_history() {
         let temp = tempfile::tempdir().unwrap();
         let store = test_store(
@@ -1471,6 +1615,52 @@ mod tests {
             symlink(&target, &link).unwrap();
             assert!(load_messages(&link).is_err());
         }
+    }
+
+    #[test]
+    fn transcript_repairs_only_a_nonterminated_torn_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(temp.path(), temp.path().join(format!("{id}.jsonl")), id);
+        let expected = vec![Message::user_text("durable")];
+        store.append(&expected).unwrap();
+        let durable_len = fs::metadata(&store.file).unwrap().len();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&store.file)
+            .unwrap();
+        file.write_all(br#"{"session_id":"#).unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(load_messages(&store.file).unwrap(), expected);
+        assert_eq!(fs::metadata(&store.file).unwrap().len(), durable_len);
+        assert!(fs::read(&store.file).unwrap().ends_with(b"\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&store.file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_still_rejects_newline_terminated_middle_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(temp.path(), temp.path().join(format!("{id}.jsonl")), id);
+        store.append(&[Message::user_text("durable")]).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&store.file)
+            .unwrap();
+        file.write_all(b"not-json\n{\"partial\"").unwrap();
+        file.sync_all().unwrap();
+        let before = fs::read(&store.file).unwrap();
+
+        assert!(load_messages(&store.file).is_err());
+        assert_eq!(fs::read(&store.file).unwrap(), before);
     }
 
     #[test]
