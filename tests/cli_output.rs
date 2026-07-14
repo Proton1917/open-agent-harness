@@ -523,7 +523,13 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut stream = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break stream,
+                    Ok((stream, _)) => {
+                        // On macOS an accepted socket can inherit O_NONBLOCK from its listener.
+                        // Request parsing below is intentionally blocking and bounded by the
+                        // surrounding test deadline.
+                        stream.set_nonblocking(false).unwrap();
+                        break stream;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         if std::time::Instant::now() >= deadline {
                             return served;
