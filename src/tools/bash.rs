@@ -433,14 +433,15 @@ fn command_with_cwd_marker(shell: &str, command: &str, marker: &Path) -> String 
             .to_ascii_lowercase();
         if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
             let marker = marker.display().to_string().replace('\'', "''");
-            return format!(
+            format!(
                 "& {{ {command} }}; $__harness_ok = $?; $__harness_code = if ($__harness_ok) {{ 0 }} elseif ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}; (Get-Location).ProviderPath | Set-Content -LiteralPath '{marker}' -Encoding utf8 -NoNewline; exit $__harness_code"
-            );
+            )
+        } else {
+            let marker = marker.display().to_string().replace('"', "\"\"");
+            format!(
+                "{command}\r\nset \"__HARNESS_STATUS=%ERRORLEVEL%\"\r\ncd > \"{marker}\"\r\nexit /b %__HARNESS_STATUS%"
+            )
         }
-        let marker = marker.display().to_string().replace('"', "\"\"");
-        return format!(
-            "{command}\r\nset \"__HARNESS_STATUS=%ERRORLEVEL%\"\r\ncd > \"{marker}\"\r\nexit /b %__HARNESS_STATUS%"
-        );
     }
     #[cfg(not(windows))]
     {
