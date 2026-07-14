@@ -5,7 +5,16 @@ use std::{
     thread,
 };
 
+#[cfg(unix)]
+use std::{
+    io::{BufRead, BufReader},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
 use serde_json::Value;
+
+const SESSION_END_MARKER: &str = ".session-end-cleanup-marker";
 
 #[test]
 fn print_text_json_and_stream_json_contracts_are_stable() {
@@ -188,13 +197,11 @@ fn stream_json_init_precedes_buffered_session_start_hook_events() {
 #[test]
 fn session_start_failure_still_runs_session_end_cleanup() {
     let workspace = tempfile::tempdir().unwrap();
-    let marker = workspace
-        .path()
-        .join("session-end-after-startup-failure.txt");
+    let marker = workspace.path().join(SESSION_END_MARKER);
     let settings = serde_json::json!({
         "hooks": {
             "SessionStart": [{"hooks": [failing_hook()]}],
-            "SessionEnd": [{"hooks": [marker_hook(&marker)]}]
+            "SessionEnd": [{"hooks": [marker_hook()]}]
         }
     })
     .to_string();
@@ -225,11 +232,9 @@ fn session_start_failure_still_runs_session_end_cleanup() {
 #[test]
 fn engine_setup_failure_still_runs_session_end_cleanup() {
     let workspace = tempfile::tempdir().unwrap();
-    let marker = workspace
-        .path()
-        .join("session-end-after-engine-failure.txt");
+    let marker = workspace.path().join(SESSION_END_MARKER);
     let settings = serde_json::json!({
-        "hooks": {"SessionEnd": [{"hooks": [marker_hook(&marker)]}]}
+        "hooks": {"SessionEnd": [{"hooks": [marker_hook()]}]}
     })
     .to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
@@ -453,13 +458,32 @@ fn trusted_turn_end_memory_extraction_runs_after_a_completed_print_turn() {
     assert!(persisted.contains("Run the real verification command"));
 }
 
+#[cfg(unix)]
 #[test]
 fn stream_json_rewind_dry_run_does_not_modify_files() {
     let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let session_state = tempfile::tempdir().unwrap();
+    make_private_directory(workspace.path());
+    make_private_directory(session_state.path());
+    let overlapping = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args(["--print", "--bare", "--session-state-root"])
+        .arg(workspace.path())
+        .arg("state root must stay outside the workspace")
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", "http://127.0.0.1:9")
+        .env("HARNESS_MESSAGES_PATH", "/v1/messages")
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!overlapping.status.success());
+    assert!(
+        String::from_utf8_lossy(&overlapping.stderr).contains("不得与可信工作区重叠"),
+        "{}",
+        String::from_utf8_lossy(&overlapping.stderr)
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let (turn_done_tx, turn_done_rx) = std::sync::mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let mut served = 0;
@@ -496,14 +520,12 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
             )
             .unwrap();
             served += 1;
-            if served == 2 {
-                let _ = turn_done_tx.send(());
-            }
         }
         served
     });
     let user_id = uuid::Uuid::new_v4();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"));
+    command
         .args([
             "--print",
             "--bare",
@@ -511,20 +533,32 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
             "stream-json",
             "--input-format",
             "stream-json",
-            "--dangerously-skip-permissions",
         ])
+        .arg("--session-state-root")
+        .arg(session_state.path())
+        .arg("--dangerously-skip-permissions")
         .current_dir(workspace.path())
-        .env("HOME", home.path())
         .env("HARNESS_BASE_URL", format!("http://{address}"))
         .env("HARNESS_MESSAGES_PATH", "/v1/messages")
         .env_remove("HARNESS_API_KEY")
         .env_remove("HARNESS_AUTH_TOKEN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        BufReader::new(stdout)
+            .lines()
+            .map(|line| {
+                let line = line.unwrap();
+                let _ = stdout_tx.send(line.clone());
+                line
+            })
+            .collect::<Vec<_>>()
+    });
     writeln!(
         stdin,
         "{}",
@@ -535,18 +569,13 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
     )
     .unwrap();
     stdin.flush().unwrap();
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "system" && line["subtype"] == "init"
+    });
     let written = workspace.path().join("dry-run.txt");
-    turn_done_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("model turn did not receive its terminal response");
-    let persisted_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !tree_contains(home.path(), "done") {
-        assert!(
-            std::time::Instant::now() < persisted_deadline,
-            "model turn did not finish persisting"
-        );
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "result" && line["subtype"] == "success"
+    });
     assert!(written.exists(), "model turn did not create dry-run.txt");
     writeln!(
         stdin,
@@ -560,22 +589,23 @@ fn stream_json_rewind_dry_run_does_not_modify_files() {
     stdin.flush().unwrap();
     drop(stdin);
     let output = child.wait_with_output().unwrap();
+    let stdout = stdout_reader.join().unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        stdout.join("\n"),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         server.join().unwrap(),
         2,
         "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
+        stdout.join("\n"),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read_to_string(written).unwrap(), "changed");
-    let lines = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
+    let lines = stdout
+        .iter()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
     let response = lines
@@ -749,43 +779,53 @@ fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
     buffer[header_end..header_end + length].to_vec()
 }
 
-fn tree_contains(root: &std::path::Path, needle: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            tree_contains(&path, needle)
-        } else {
-            std::fs::read_to_string(path)
-                .map(|content| content.contains(needle))
-                .unwrap_or(false)
+#[cfg(unix)]
+fn wait_for_stream_json(
+    receiver: &mpsc::Receiver<String>,
+    timeout: Duration,
+    matches: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "stream-json event timed out");
+        let line = receiver
+            .recv_timeout(remaining)
+            .expect("stream-json output closed before the expected event");
+        let value: Value =
+            serde_json::from_str(&line).expect("stream-json line must be valid JSON");
+        if matches(&value) {
+            return value;
         }
-    })
+    }
 }
 
-#[cfg(not(windows))]
-fn marker_hook(path: &std::path::Path) -> Value {
-    serde_json::json!({
-        "type":"command",
-        "command":"/bin/sh",
-        "args":["-c", "printf cleanup > \"$1\"", "hook", path]
-    })
+#[cfg(unix)]
+fn make_private_directory(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-#[cfg(windows)]
-fn marker_hook(path: &std::path::Path) -> Value {
-    let command = std::path::PathBuf::from(
-        std::env::var_os("SystemRoot").expect("SystemRoot must be defined on Windows"),
-    )
-    .join("System32")
-    .join("cmd.exe");
+fn marker_hook() -> Value {
+    let command = std::env::current_exe().expect("current test executable must be available");
     serde_json::json!({
         "type":"command",
         "command":command,
-        "args":["/C", format!("echo cleanup>\"{}\"", path.display())]
+        "args":["--ignored", "--exact", "session_end_marker_worker", "--quiet"],
+        "workspaceRelative":true
     })
+}
+
+#[test]
+#[ignore = "helper process launched by SessionEnd lifecycle tests"]
+fn session_end_marker_worker() {
+    let Some(workspace) = std::env::var_os("HARNESS_WORKSPACE") else {
+        return;
+    };
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    assert_eq!(cwd, workspace, "marker worker must run in the workspace");
+    std::fs::write(cwd.join(SESSION_END_MARKER), b"cleanup").unwrap();
 }
 
 #[cfg(not(windows))]

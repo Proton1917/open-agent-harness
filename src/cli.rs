@@ -195,6 +195,14 @@ pub struct Cli {
     #[arg(long)]
     pub no_session_persistence: bool,
 
+    /// Store session transcripts and file-history journals below this existing absolute directory.
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        conflicts_with = "no_session_persistence"
+    )]
+    pub session_state_root: Option<PathBuf>,
+
     /// Disable project settings and automatic context discovery.
     #[arg(long)]
     pub bare: bool,
@@ -262,6 +270,29 @@ mod tests {
         let cli = Cli::try_parse_from(["open-agent-harness", "--safe-mode"]).unwrap();
         assert!(cli.safe_mode);
         assert!(!cli.bare);
+    }
+
+    #[test]
+    fn parses_explicit_session_state_root() {
+        let cli = Cli::try_parse_from([
+            "open-agent-harness",
+            "--session-state-root",
+            "/isolated/session-state",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.session_state_root,
+            Some(PathBuf::from("/isolated/session-state"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "open-agent-harness",
+                "--no-session-persistence",
+                "--session-state-root",
+                "/isolated/session-state",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

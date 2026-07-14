@@ -222,11 +222,18 @@ pub struct TodoItem {
     pub active_form: String,
 }
 
+#[derive(Default)]
+struct WorkspaceSecurityRegistry {
+    trusted_roots: Vec<PathBuf>,
+    private_state_roots: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     async_owner: AsyncOwner,
     location: Arc<RwLock<WorkspaceLocation>>,
     trusted_roots: Arc<RwLock<Vec<PathBuf>>>,
+    workspace_security: Arc<RwLock<WorkspaceSecurityRegistry>>,
     explicit_context_roots: Arc<RwLock<HashSet<PathBuf>>>,
     pub permissions: Arc<PermissionManager>,
     read_cache: Arc<Mutex<ReadCache>>,
@@ -439,6 +446,10 @@ impl ToolContext {
                 root: workspace_root.clone(),
             })),
             trusted_roots: Arc::new(RwLock::new(vec![cwd.clone()])),
+            workspace_security: Arc::new(RwLock::new(WorkspaceSecurityRegistry {
+                trusted_roots: vec![cwd.clone()],
+                private_state_roots: Vec::new(),
+            })),
             explicit_context_roots: Arc::new(RwLock::new(HashSet::new())),
             permissions: Arc::new(permissions),
             read_cache: Arc::new(Mutex::new(ReadCache::default())),
@@ -539,6 +550,20 @@ impl ToolContext {
         Ok(dirs::home_dir()
             .context("无法确定主目录")?
             .join(".open-agent-harness/tasks"))
+    }
+
+    pub(crate) fn cwd_marker_root(&self) -> Result<PathBuf> {
+        if let Some(root) = self
+            .task_capture_root
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(root);
+        }
+        Ok(dirs::home_dir()
+            .context("无法确定 shell cwd marker 主目录")?
+            .join(".open-agent-harness/cwd-markers"))
     }
 
     pub(crate) fn async_owner(&self) -> AsyncOwner {
@@ -692,6 +717,7 @@ impl ToolContext {
             if !canonical.is_dir() {
                 bail!("--add-dir 不是目录: {}", requested.display())
             }
+            self.register_security_trusted_root(&canonical)?;
             explicit.push(canonical.clone());
             if trusted.iter().any(|root| canonical.starts_with(root)) {
                 continue;
@@ -718,6 +744,45 @@ impl ToolContext {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub fn reserve_private_state_root(&self, root: &Path) -> Result<()> {
+        let root = std::fs::canonicalize(root)
+            .with_context(|| format!("无法解析私有状态根目录 {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("私有状态根目录不是目录")
+        }
+        let mut security = self
+            .workspace_security
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for trusted in &security.trusted_roots {
+            if paths_overlap(&root, trusted) {
+                bail!("私有状态根目录不得与可信工作区重叠")
+            }
+        }
+        if !security.private_state_roots.contains(&root) {
+            security.private_state_roots.push(root);
+        }
+        Ok(())
+    }
+
+    fn register_security_trusted_root(&self, root: &Path) -> Result<()> {
+        let mut security = self
+            .workspace_security
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if security
+            .private_state_roots
+            .iter()
+            .any(|private| paths_overlap(private, root))
+        {
+            bail!("可信工作区不得与私有状态根目录重叠")
+        }
+        if !security.trusted_roots.iter().any(|trusted| trusted == root) {
+            security.trusted_roots.push(root.to_path_buf());
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_team_identity(&self, team_id: uuid::Uuid, actor_id: uuid::Uuid) {
@@ -2327,6 +2392,7 @@ impl ToolContext {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+            workspace_security: Arc::clone(&self.workspace_security),
             explicit_context_roots: Arc::new(RwLock::new(
                 self.explicit_context_roots
                     .read()
@@ -2504,6 +2570,7 @@ impl ToolContext {
         if !cwd.is_dir() || !root.is_dir() || !cwd.starts_with(&root) {
             bail!("新工作目录必须位于有效工作区根目录内")
         }
+        self.register_security_trusted_root(&root)?;
         {
             let mut trusted = self
                 .trusted_roots
@@ -4638,6 +4705,10 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 fn push_permission_path_candidate(candidates: &mut Vec<String>, path: &Path) {
     let rendered = normalize_path_for_display(path.to_string_lossy().into_owned());
     if !candidates.contains(&rendered) {
@@ -4645,7 +4716,7 @@ fn push_permission_path_candidate(candidates: &mut Vec<String>, path: &Path) {
     }
 }
 
-fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
+pub(crate) fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
     let normalized = value.replace('\\', "/");
     let namespace = normalized.to_ascii_lowercase();
     if normalized.starts_with("//")
@@ -4701,7 +4772,7 @@ fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_windows_network_or_device_resolved_path(path: &Path) -> Result<()> {
+pub(crate) fn reject_windows_network_or_device_resolved_path(path: &Path) -> Result<()> {
     reject_windows_network_or_device_resolved_text(&path.to_string_lossy())
 }
 
@@ -6044,9 +6115,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let launch = temp.path().join("launch");
         let additional = temp.path().join("additional");
+        let private_state = temp.path().join("private-state");
+        let private_nested = private_state.join("nested-workspace");
+        let late_private_state = temp.path().join("late-private-state");
+        let late_nested = late_private_state.join("child-workspace");
         let nested = additional.join("crates/core");
         std::fs::create_dir_all(&launch).unwrap();
         std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&private_nested).unwrap();
+        std::fs::create_dir_all(&late_nested).unwrap();
         std::fs::write(launch.join("AGENTS.md"), "launch-only").unwrap();
         std::fs::write(additional.join("AGENTS.md"), "additional-root").unwrap();
         std::fs::write(nested.join("AGENTS.md"), "core-only").unwrap();
@@ -6090,6 +6167,31 @@ mod tests {
         assert!(refreshed.contains("core-only"));
         assert!(refreshed.contains("scope=\"crates/core/**\""));
         assert_eq!(refreshed.matches("core-only").count(), 1);
+
+        context.reserve_private_state_root(&private_state).unwrap();
+        assert!(
+            context
+                .add_trusted_roots(std::slice::from_ref(&private_nested))
+                .is_err()
+        );
+        assert!(
+            context
+                .switch_workspace(private_nested.clone(), private_state.clone())
+                .await
+                .is_err()
+        );
+        assert!(context.reserve_private_state_root(&additional).is_err());
+        assert!(context.reserve_private_state_root(temp.path()).is_err());
+
+        let child = context.fork_for_agent();
+        child
+            .add_trusted_roots(std::slice::from_ref(&late_nested))
+            .unwrap();
+        assert!(
+            context
+                .reserve_private_state_root(&late_private_state)
+                .is_err()
+        );
     }
 
     #[tokio::test]

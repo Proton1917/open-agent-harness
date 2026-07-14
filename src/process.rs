@@ -510,7 +510,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn secret_env_scrubber_removes_values_from_child_environment() {
         let scrubber = SecretEnvScrubber::from_settings(&Settings {
@@ -519,7 +518,14 @@ mod tests {
             }}}}),
         })
         .unwrap();
+        #[cfg(unix)]
         let mut command = Command::new("/usr/bin/env");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", "set"]);
+            command
+        };
         command
             .env("MCP_CHILD_SECRET_TEST", "must-not-leak")
             .env("ORDINARY_CHILD_ENV_TEST", "kept");

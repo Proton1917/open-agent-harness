@@ -15,7 +15,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    tools::{ensure_private_directory, workspace_key},
+    tools::{
+        ensure_private_directory, reject_windows_network_or_device_path,
+        reject_windows_network_or_device_resolved_path, workspace_key,
+    },
     types::Message,
 };
 
@@ -107,6 +110,67 @@ pub struct SessionStore {
     write_lock: Arc<Mutex<()>>,
 }
 
+/// A user-selected root for session transcripts and their file-history journals.
+///
+/// The path must already exist so selecting an override never creates an
+/// unexpected ancestor tree. It is canonicalized once, and every managed child
+/// is checked against that canonical boundary before use.
+#[derive(Debug, Clone)]
+pub struct SessionStateRoot {
+    root: PathBuf,
+}
+
+impl SessionStateRoot {
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            bail!("session state root 必须是绝对路径")
+        }
+        reject_windows_network_or_device_path(&path.to_string_lossy())?;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("session state root 不存在或无法读取: {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("session state root 必须是非 symlink 目录")
+        }
+        let root = fs::canonicalize(path)
+            .with_context(|| format!("无法解析 session state root: {}", path.display()))?;
+        reject_windows_network_or_device_resolved_path(&root)?;
+        let metadata = fs::symlink_metadata(&root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || !root.is_absolute() {
+            bail!("session state root 规范化结果无效")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            bail!("--session-state-root 当前仅支持可强制 0700/0600 权限的 Unix 平台")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                bail!("session state root 必须预先设置为 Unix 0700 私有目录")
+            }
+            Ok(Self { root })
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    fn project_directory(&self, cwd: &Path) -> Result<PathBuf> {
+        let projects = self.private_child("projects")?;
+        ensure_private_bounded_child(&self.root, &projects, &workspace_key(cwd))
+    }
+
+    pub fn file_history_root(&self) -> Result<PathBuf> {
+        self.private_child("file-history")
+    }
+
+    fn private_child(&self, name: &str) -> Result<PathBuf> {
+        ensure_private_bounded_child(&self.root, &self.root, name)
+    }
+}
+
 impl SessionStore {
     pub fn cwd(&self) -> &Path {
         &self.cwd
@@ -127,9 +191,21 @@ impl SessionStore {
     }
 
     pub fn create(cwd: &Path, enabled: bool) -> Result<Self> {
+        Self::create_with_directory(cwd, enabled, || project_directory(cwd))
+    }
+
+    pub fn create_in(cwd: &Path, state_root: &SessionStateRoot, enabled: bool) -> Result<Self> {
+        Self::create_with_directory(cwd, enabled, || state_root.project_directory(cwd))
+    }
+
+    fn create_with_directory(
+        cwd: &Path,
+        enabled: bool,
+        directory: impl FnOnce() -> Result<PathBuf>,
+    ) -> Result<Self> {
         let id = Uuid::new_v4();
         let file = if enabled {
-            project_directory(cwd)?.join(format!("{id}.jsonl"))
+            directory()?.join(format!("{id}.jsonl"))
         } else {
             PathBuf::new()
         };
@@ -145,7 +221,24 @@ impl SessionStore {
     }
 
     pub fn resume(cwd: &Path, id: Uuid, enabled: bool) -> Result<(Self, Vec<Message>)> {
-        let directory = project_directory(cwd)?;
+        Self::resume_from_directory(cwd, id, enabled, project_directory(cwd)?)
+    }
+
+    pub fn resume_in(
+        cwd: &Path,
+        id: Uuid,
+        state_root: &SessionStateRoot,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
+        Self::resume_from_directory(cwd, id, enabled, state_root.project_directory(cwd)?)
+    }
+
+    fn resume_from_directory(
+        cwd: &Path,
+        id: Uuid,
+        enabled: bool,
+        directory: PathBuf,
+    ) -> Result<(Self, Vec<Message>)> {
         let file = directory.join(format!("{id}.jsonl"));
         if !file.exists() {
             bail!("当前目录下没有会话 {id}")
@@ -166,7 +259,22 @@ impl SessionStore {
     }
 
     pub fn continue_latest(cwd: &Path, enabled: bool) -> Result<(Self, Vec<Message>)> {
-        let directory = project_directory(cwd)?;
+        Self::continue_latest_from_directory(cwd, enabled, project_directory(cwd)?)
+    }
+
+    pub fn continue_latest_in(
+        cwd: &Path,
+        state_root: &SessionStateRoot,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
+        Self::continue_latest_from_directory(cwd, enabled, state_root.project_directory(cwd)?)
+    }
+
+    fn continue_latest_from_directory(
+        cwd: &Path,
+        enabled: bool,
+        directory: PathBuf,
+    ) -> Result<(Self, Vec<Message>)> {
         let latest = fs::read_dir(&directory)?
             .filter_map(Result::ok)
             .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
@@ -202,7 +310,39 @@ impl SessionStore {
         message_count: Option<usize>,
         enabled: bool,
     ) -> Result<(Self, Vec<Message>)> {
-        let source = project_directory(cwd)?.join(format!("{source_id}.jsonl"));
+        Self::fork_from_directory(
+            cwd,
+            source_id,
+            message_count,
+            enabled,
+            project_directory(cwd)?,
+        )
+    }
+
+    pub fn fork_in(
+        cwd: &Path,
+        source_id: Uuid,
+        message_count: Option<usize>,
+        state_root: &SessionStateRoot,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
+        Self::fork_from_directory(
+            cwd,
+            source_id,
+            message_count,
+            enabled,
+            state_root.project_directory(cwd)?,
+        )
+    }
+
+    fn fork_from_directory(
+        cwd: &Path,
+        source_id: Uuid,
+        message_count: Option<usize>,
+        enabled: bool,
+        directory: PathBuf,
+    ) -> Result<(Self, Vec<Message>)> {
+        let source = directory.join(format!("{source_id}.jsonl"));
         if !source.exists() {
             bail!("当前目录下没有会话 {source_id}")
         }
@@ -576,6 +716,30 @@ fn ensure_private_component(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     ensure_private_directory(path)
+}
+
+fn ensure_private_bounded_child(root: &Path, parent: &Path, name: &str) -> Result<PathBuf> {
+    let component = Path::new(name);
+    if name.is_empty()
+        || component.components().count() != 1
+        || !matches!(
+            component.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        bail!("session state 私有目录名称无效")
+    }
+    if !parent.starts_with(root) {
+        bail!("session state 私有目录父路径越过存储根")
+    }
+    let child = parent.join(component);
+    ensure_private_component(&child)?;
+    let child = fs::canonicalize(&child)
+        .with_context(|| format!("无法解析 session state 私有目录: {}", child.display()))?;
+    if !child.starts_with(root) {
+        bail!("session state 私有目录越过存储根")
+    }
+    Ok(child)
 }
 
 fn open_private_transcript(path: &Path) -> Result<fs::File> {
@@ -1032,6 +1196,12 @@ fn home_path_regex() -> &'static Regex {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn make_private_directory(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn test_store(cwd: &Path, file: PathBuf, id: Uuid) -> SessionStore {
         SessionStore {
             id,
@@ -1053,6 +1223,94 @@ mod tests {
             .append(&[Message::user_text("not persisted")])
             .unwrap();
         assert!(store.file.as_os_str().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_state_root_keeps_the_full_session_lifecycle_in_one_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        make_private_directory(storage.path());
+        let state_root = SessionStateRoot::open(storage.path()).unwrap();
+        let message = Message::user_text("isolated session");
+
+        let store = SessionStore::create_in(workspace.path(), &state_root, true).unwrap();
+        store.append(std::slice::from_ref(&message)).unwrap();
+        let canonical_storage = fs::canonicalize(storage.path()).unwrap();
+        assert!(store.file.starts_with(canonical_storage.join("projects")));
+
+        let (_, resumed) =
+            SessionStore::resume_in(workspace.path(), store.id, &state_root, true).unwrap();
+        assert_eq!(resumed, vec![message.clone()]);
+        let (continued, continued_messages) =
+            SessionStore::continue_latest_in(workspace.path(), &state_root, true).unwrap();
+        assert_eq!(continued.id, store.id);
+        assert_eq!(continued_messages, vec![message.clone()]);
+
+        let (fork, forked) =
+            SessionStore::fork_in(workspace.path(), store.id, None, &state_root, true).unwrap();
+        assert_ne!(fork.id, store.id);
+        assert!(fork.file.starts_with(canonical_storage.join("projects")));
+        assert_eq!(forked, vec![message]);
+        assert!(
+            state_root
+                .file_history_root()
+                .unwrap()
+                .starts_with(&canonical_storage)
+        );
+    }
+
+    #[test]
+    fn explicit_state_root_rejects_ambiguous_or_unsafe_roots() {
+        let storage = tempfile::tempdir().unwrap();
+        assert!(SessionStateRoot::open(Path::new("relative-state-root")).is_err());
+        assert!(SessionStateRoot::open(&storage.path().join("missing")).is_err());
+
+        let file = storage.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(SessionStateRoot::open(&file).is_err());
+
+        #[cfg(not(unix))]
+        assert!(
+            SessionStateRoot::open(storage.path())
+                .unwrap_err()
+                .to_string()
+                .contains("仅支持")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_state_root_rejects_symlinks_and_keeps_private_modes() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let linked_root = storage.path().join("linked-root");
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), &linked_root).unwrap();
+        assert!(SessionStateRoot::open(&linked_root).is_err());
+
+        fs::set_permissions(storage.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(SessionStateRoot::open(storage.path()).is_err());
+        fs::set_permissions(storage.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let state_root = SessionStateRoot::open(storage.path()).unwrap();
+        assert_eq!(
+            fs::metadata(storage.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let store = SessionStore::create_in(workspace.path(), &state_root, true).unwrap();
+        store.append(&[Message::user_text("private")]).unwrap();
+        assert_eq!(
+            fs::metadata(&store.file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let escaped_storage = tempfile::tempdir().unwrap();
+        make_private_directory(escaped_storage.path());
+        let escaped_root = SessionStateRoot::open(escaped_storage.path()).unwrap();
+        symlink(outside.path(), escaped_storage.path().join("projects")).unwrap();
+        assert!(SessionStore::create_in(workspace.path(), &escaped_root, true).is_err());
     }
 
     #[test]

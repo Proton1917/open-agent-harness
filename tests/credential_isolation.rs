@@ -1,3 +1,5 @@
+#![cfg(not(windows))]
+
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -10,6 +12,7 @@ use serde_json::Value;
 
 #[test]
 fn endpoint_credential_is_not_inherited_by_shell_tools() {
+    let home = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -40,6 +43,7 @@ fn endpoint_credential_is_not_inherited_by_shell_tools() {
         .env("HARNESS_BASE_URL", format!("http://{address}"))
         .env("HARNESS_MESSAGES_PATH", "/v1/messages")
         .env("HARNESS_API_KEY", secret)
+        .env("HOME", home.path())
         .env_remove("HARNESS_AUTH_TOKEN")
         .output()
         .unwrap();

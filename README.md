@@ -31,11 +31,12 @@ sessions and control streaming, local agents and teams, Skills and plugins,
 hooks, MCP/OAuth/WebSocket, LSP, scheduling, monitoring, declarative workflows,
 media, structured interaction, and opt-in local memory.
 
-The release gate currently contains 588 test entries: 585 pass and three are
+The release gate currently contains 593 test entries: 589 pass and four are
 intentionally ignored helper-process entry points exercised by their parent
 tests. Formatting, Rust 1.85 all-target checks, Clippy with warnings denied,
 the release build, the repository audit, and the Windows GNU cross-check all
-pass. The exact behavior matrix, evidence, and deliberate exclusions are in
+pass; the same test and Clippy gate also runs natively on macOS and Windows in
+CI. The exact behavior matrix, evidence, and deliberate exclusions are in
 [the migration audit](MIGRATION.md) and the
 [provider-neutral parity audit](docs/GENERIC_PARITY_2026-03-31.md). This status
 does not weaken the criticism above and does not turn behavioral compatibility
@@ -256,10 +257,11 @@ need to survive cwd changes or process restarts, so they are persisted there;
 `tasks` and `cwd-markers` are bounded temporary state and unretained entries
 must be removed when their owning task or process ends. Keeping this state out
 of the current directory also prevents it from being committed to the project
-by accident. Tests and trusted embeddings inject isolated temporary roots
-instead of writing task captures into the real user home.
+by accident. Tests and trusted embeddings can inject isolated temporary roots
+for task captures and session state instead of writing them into the real user
+home.
 
-- JSONL sessions stay on local disk. `--continue` resumes the latest session; `--resume` restores any session; `--fork-session` creates an independent branch, while `--resume-at` forks at an effective message boundary; `--no-session-persistence` creates no transcript for a new run. Directories are private (`0700` on Unix), files are private (`0600`), and persisted records retain complete tool inputs and tool-result bodies after removing opaque provider state and sanitizing credentials, endpoint secrets, and host absolute paths. There is no remote history service hidden in this repository. The configured model endpoint necessarily receives the conversation context required for each request; what that endpoint retains or trains on is the policy of the endpoint you chose, not a promise this harness can make on its behalf.
+- JSONL sessions stay on local disk. `--continue` resumes the latest session; `--resume` restores any session; `--fork-session` creates an independent branch, while `--resume-at` forks at an effective message boundary; `--no-session-persistence` creates no transcript for a new run. On Unix, isolated CI/embedding or a deliberately separate local history boundary can use `--session-state-root /absolute/existing/directory` to place only transcripts and file-history journals below that dedicated root; the override is currently rejected on non-Unix platforms because this harness cannot yet enforce an equivalent private directory ACL there. The root must not overlap the current workspace or any `--add-dir`; relative, missing, non-directory, network/device, and final-symlink roots are rejected, and the caller must make the existing root `0700` before launch. Resume/continue/fork stay inside the same canonical boundary, and later workspace switches cannot enter it. Persisted files are private (`0600`), and records retain complete tool inputs and tool-result bodies after removing opaque provider state and sanitizing credentials, endpoint secrets, and host absolute paths. There is no remote history service hidden in this repository. The configured model endpoint necessarily receives the conversation context required for each request; what that endpoint retains or trains on is the policy of the endpoint you chose, not a promise this harness can make on its behalf.
 - A file checkpoint is created at each persisted user-message boundary. `Write`, `Edit`, and `NotebookEdit` record pre-edit state; forks inherit the active workspace's source history. The stream-JSON `rewind_files` control request supports a non-mutating diff dry-run and file-only rewind; it does not discard conversation history. Its rollback journal coordinates one harness process, not independently running OS processes editing the same workspace.
 - Workspace memory is off by default. Trusted `memory.enabled` settings expose the bounded local `Memory` tool for index/recall/remember/forget, label retrieved values as untrusted workspace data, reject likely secrets, and use private atomic storage. Trusted `memory.autoExtract=true` separately schedules bounded, tool-constrained, best-effort extraction after completed root turns; overlapping schedules are coalesced so only the latest pending turn is extracted. Extraction cannot delete entries, invoke runtime tools, or alter the transcript. Cooperating harness processes serialize initialization and updates through a private `.MEMORY.lock`; a crash-stale lock fails closed and must be removed explicitly after verifying that no writer remains. This remains local memory, not a remote service.
 - Session-level todos and per-workspace persistent task lists support status, ownership, dependency relationships, and metadata.
@@ -337,7 +339,7 @@ MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discriminati
 
 当前声明的 provider-neutral 能力已经按静态 2026-03-31 对照快照完成一致化，并补入 2.1.207 校验归档审校中确认的、具有通用价值的开放功能。覆盖范围包括事务式模型/工具循环、权限与文件系统边界、session 与 control stream、本地 agent/team、Skill/plugin、hook、MCP/OAuth/WebSocket、LSP、调度、Monitor、声明式 Workflow、媒体、结构化交互以及显式开启的本地 memory。
 
-当前 release gate 共 588 个测试项：585 项通过，3 个是由父测试实际调用、按设计 ignored 的子进程入口。格式检查、Rust 1.85 all-targets、Clippy 零警告、release 构建、仓库审计和 Windows GNU 交叉检查全部通过。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)与[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
+当前 release gate 共 593 个测试项：589 项通过，4 个是由父测试实际调用、按设计 ignored 的子进程入口。格式检查、Rust 1.85 all-targets、Clippy 零警告、release 构建、仓库审计和 Windows GNU 交叉检查全部通过；同一套测试与 Clippy gate 也在 CI 中原生运行于 macOS 和 Windows。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)与[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
 
 ## 消息循环
 
@@ -536,7 +538,7 @@ Command hook 会从 stdin 收到一个 JSON object，其中包含 `hook_event_na
 
 `~/.open-agent-harness` 是仓库外的私有运行时状态根：settings、session、team、plugin cache、OAuth material 等需要跨 cwd 或跨进程恢复的内容会持久化；`tasks`/`cwd-markers` 属于有界临时状态，未显式保留的条目应在所属任务或进程生命周期结束时清除。这样既不会污染当前仓库，也不会把运行状态误提交进 Git。
 
-- JSONL 会话落在本地磁盘，`--continue` 接续上一场，`--resume` 恢复任意一场；`--fork-session` 创建独立分支，`--resume-at` 从有效消息边界 fork；新运行使用 `--no-session-persistence` 时不创建 transcript。Unix 下目录权限为 `0700`、文件为 `0600`；持久记录会保留完整工具输入和工具结果正文，同时去除 opaque provider state，并脱敏凭据、endpoint secret 与本机绝对路径。本仓库没有藏着一套远程历史服务。每次请求所需的对话上下文当然会送往你配置的 model endpoint；那个 endpoint 是否留存、是否训练，取决于你选择的 endpoint，而不是这个 harness 有资格替它许下的空头承诺。
+- JSONL 会话落在本地磁盘，`--continue` 接续上一场，`--resume` 恢复任意一场；`--fork-session` 创建独立分支，`--resume-at` 从有效消息边界 fork；新运行使用 `--no-session-persistence` 时不创建 transcript。Unix 上的 CI、embedding 或需要独立本地历史边界时，可用 `--session-state-root /absolute/existing/directory` 只把 transcript 与 file-history journal 放进该专用根目录；非 Unix 平台暂时拒绝该 override，因为目前还不能在那里强制等价的私有目录 ACL。该根不得与当前 workspace 或任何 `--add-dir` 重叠；相对路径、不存在路径、普通文件、网络/设备路径及末级 symlink 均被拒绝，且调用方须在启动前把既存根目录设为 `0700`。Resume/continue/fork 始终留在同一规范化边界内，后续 workspace 切换也不能进入该根；持久文件权限为 `0600`。记录会保留完整工具输入和工具结果正文，同时去除 opaque provider state，并脱敏凭据、endpoint secret 与本机绝对路径。本仓库没有藏着一套远程历史服务。每次请求所需的对话上下文当然会送往你配置的 model endpoint；那个 endpoint 是否留存、是否训练，取决于你选择的 endpoint，而不是这个 harness 有资格替它许下的空头承诺。
 - 每个持久化 user-message 边界都会建立 file checkpoint；`Write`、`Edit`、`NotebookEdit` 会记录修改前状态，fork 会继承当前活跃 workspace 的来源 history。stream-JSON 的 `rewind_files` 支持不改文件的 diff dry-run 与只恢复文件的 rewind，不会丢弃对话历史。Rollback journal 只协调一个 harness 进程，不协调同时编辑同一 workspace 的独立 OS 进程。
 - Workspace memory 默认关闭。只有可信 `memory.enabled` settings 才会暴露有界本地 `Memory` 工具，提供 index/recall/remember/forget；检索值会标记为不可信工作区数据，疑似 secret 会被拒绝，落盘采用私有原子写。可信 `memory.autoExtract=true` 会在 root turn 完成后调度有界、工具受限的 best-effort 提取；重叠调度会合并，只提取最新待处理 turn。提取不能删除条目、调用运行时工具或改变 transcript。协作运行的 harness 进程通过私有 `.MEMORY.lock` 串行初始化与更新；进程崩溃遗留的锁会失败关闭，确认没有 writer 后才可显式删除。这仍是本地 memory，不是远程服务。
 - 会话级 Todo 与按工作区持久化的任务列表，支持状态、负责人、依赖关系和 metadata。

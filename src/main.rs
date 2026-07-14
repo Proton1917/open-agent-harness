@@ -33,7 +33,7 @@ use open_agent_harness::{
     plugins::PluginCatalog,
     prompt::default_system_prompt,
     query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
-    session::SessionStore,
+    session::{SessionStateRoot, SessionStore},
     structured_output::StructuredOutputTool,
     terminal::{ConversationUi, InputEditor},
     tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
@@ -116,6 +116,11 @@ async fn run(
     endpoint: EndpointConfig,
 ) -> Result<()> {
     validate_cli_modes(&cli)?;
+    let session_state_root = cli
+        .session_state_root
+        .as_deref()
+        .map(SessionStateRoot::open)
+        .transpose()?;
     let mut control_session = (cli.input_format == InputFormat::StreamJson)
         .then(|| ControlSession::stdio(cli.replay_user_messages));
     let control_handle = control_session.as_ref().map(ControlSession::handle);
@@ -142,6 +147,9 @@ async fn run(
         deny_rules,
     );
     let mut tool_context = ToolContext::new(cwd.clone(), permissions);
+    if let Some(root) = &session_state_root {
+        tool_context.reserve_private_state_root(root.path())?;
+    }
     tool_context.set_bare(cli.bare || cli.safe_mode);
     let additional_roots = tool_context.add_trusted_roots(&cli.add_dirs)?;
     tool_context.set_sandbox_runtime(
@@ -206,7 +214,7 @@ async fn run(
         .map(|(name, definition)| json!({"name":name, "description":definition.description}))
         .collect::<Vec<_>>();
     tool_context.set_agent_limits(agents.limits);
-    let (store, history) = open_session(&cli, &cwd)?;
+    let (store, history) = open_session(&cli, &cwd, session_state_root.as_ref())?;
     let worktree = configure_worktree(&settings, &cwd)?;
     let workspace_state = store.workspace_state();
     if let Some(restored) = worktree.restore_session(&workspace_state).await? {
@@ -231,7 +239,7 @@ async fn run(
     let file_histories = tool_context
         .trusted_roots()
         .into_iter()
-        .map(|root| open_file_history(&cli, &root, store.id))
+        .map(|root| open_file_history(&cli, &root, store.id, session_state_root.as_ref()))
         .collect::<Result<Vec<_>>>()?;
     tool_context.set_file_histories(file_histories)?;
     let mut active_tools = Vec::new();
@@ -1023,6 +1031,7 @@ impl HookEventEmitter {
 fn open_session(
     cli: &Cli,
     cwd: &std::path::Path,
+    state_root: Option<&SessionStateRoot>,
 ) -> Result<(SessionStore, Vec<open_agent_harness::types::Message>)> {
     let enabled = !cli.no_session_persistence;
     if cli.r#continue && cli.resume.is_some() {
@@ -1032,35 +1041,44 @@ fn open_session(
         bail!("--resume-at 需要 --resume 或 --fork-session")
     }
     if let Some(id) = &cli.fork_session {
-        return SessionStore::fork(
-            cwd,
-            id.parse::<Uuid>().context("--fork-session 必须是 UUID")?,
-            cli.resume_at,
-            enabled,
-        );
+        let id = id.parse::<Uuid>().context("--fork-session 必须是 UUID")?;
+        return match state_root {
+            Some(root) => SessionStore::fork_in(cwd, id, cli.resume_at, root, enabled),
+            None => SessionStore::fork(cwd, id, cli.resume_at, enabled),
+        };
     }
     if cli.r#continue {
-        return SessionStore::continue_latest(cwd, enabled);
+        return match state_root {
+            Some(root) => SessionStore::continue_latest_in(cwd, root, enabled),
+            None => SessionStore::continue_latest(cwd, enabled),
+        };
     }
     if let Some(id) = &cli.resume {
+        let id = id.parse::<Uuid>().context("--resume 必须是 UUID")?;
         if cli.resume_at.is_some() {
-            return SessionStore::fork(
-                cwd,
-                id.parse::<Uuid>().context("--resume 必须是 UUID")?,
-                cli.resume_at,
-                enabled,
-            );
+            return match state_root {
+                Some(root) => SessionStore::fork_in(cwd, id, cli.resume_at, root, enabled),
+                None => SessionStore::fork(cwd, id, cli.resume_at, enabled),
+            };
         }
-        return SessionStore::resume(
-            cwd,
-            id.parse::<Uuid>().context("--resume 必须是 UUID")?,
-            enabled,
-        );
+        return match state_root {
+            Some(root) => SessionStore::resume_in(cwd, id, root, enabled),
+            None => SessionStore::resume(cwd, id, enabled),
+        };
     }
-    Ok((SessionStore::create(cwd, enabled)?, Vec::new()))
+    let store = match state_root {
+        Some(root) => SessionStore::create_in(cwd, root, enabled)?,
+        None => SessionStore::create(cwd, enabled)?,
+    };
+    Ok((store, Vec::new()))
 }
 
-fn open_file_history(cli: &Cli, cwd: &std::path::Path, session_id: Uuid) -> Result<FileHistory> {
+fn open_file_history(
+    cli: &Cli,
+    cwd: &std::path::Path,
+    session_id: Uuid,
+    state_root: Option<&SessionStateRoot>,
+) -> Result<FileHistory> {
     let enabled = !cli.no_session_persistence;
     if !enabled {
         return FileHistory::create(cwd, session_id, false);
@@ -1070,12 +1088,19 @@ fn open_file_history(cli: &Cli, cwd: &std::path::Path, session_id: Uuid) -> Resu
         .as_deref()
         .or_else(|| cli.resume_at.and(cli.resume.as_deref()));
     let Some(source) = source else {
-        return FileHistory::create(cwd, session_id, true);
+        return match state_root {
+            Some(root) => FileHistory::create_in(cwd, session_id, &root.file_history_root()?, true),
+            None => FileHistory::create(cwd, session_id, true),
+        };
     };
     let source_id = source
         .parse::<Uuid>()
         .context("source session 必须是 UUID")?;
-    FileHistory::create(cwd, source_id, true)?.fork(session_id)
+    let source = match state_root {
+        Some(root) => FileHistory::create_in(cwd, source_id, &root.file_history_root()?, true)?,
+        None => FileHistory::create(cwd, source_id, true)?,
+    };
+    source.fork(session_id)
 }
 
 async fn build_base_system_prompt(cli: &Cli) -> Result<String> {
@@ -1208,6 +1233,9 @@ fn print_result(
 }
 
 fn validate_cli_modes(cli: &Cli) -> Result<()> {
+    if cli.no_session_persistence && cli.session_state_root.is_some() {
+        bail!("--session-state-root 不能与 --no-session-persistence 同时使用")
+    }
     if cli.input_format == InputFormat::StreamJson {
         if !cli.print || cli.output_format != OutputFormat::StreamJson {
             bail!("--input-format stream-json 需要同时使用 --print --output-format stream-json")

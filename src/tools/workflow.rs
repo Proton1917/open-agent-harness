@@ -334,7 +334,11 @@ mod tests {
         path: &std::path::Path,
         permissions: PermissionManager,
     ) -> ToolContext {
-        ToolContext::new(path.to_owned(), permissions)
+        let context = ToolContext::new(path.to_owned(), permissions);
+        context
+            .set_task_capture_root(path.join(".test-task-captures"))
+            .unwrap();
+        context
     }
 
     #[test]

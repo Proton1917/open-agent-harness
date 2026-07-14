@@ -1491,6 +1491,9 @@ async fn failed_followup_stops_background_tasks_started_by_the_turn() {
             Vec::new(),
         ),
     );
+    context
+        .set_task_capture_root(temp.path().join(".test-task-captures"))
+        .unwrap();
     let observed = context.clone();
     let mut engine = QueryEngine::new(
         client,

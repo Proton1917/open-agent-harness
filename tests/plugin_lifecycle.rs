@@ -1,3 +1,8 @@
+// Windows Known Folder resolution intentionally ignores HOME/USERPROFILE.
+// The cross-platform PluginManager unit suite uses explicit temporary roots;
+// keep this CLI/HOME integration check on platforms where HOME is authoritative.
+#![cfg(not(windows))]
+
 use std::{fs, path::Path, process::Command};
 
 use serde_json::Value;

@@ -165,7 +165,7 @@ async fn execute_bash(
         }
         return spawn_background(context, &shell, input.command, timeout_ms).await;
     }
-    let (cwd_path, cwd_file) = create_private_cwd_marker()?;
+    let (cwd_path, cwd_file) = create_private_cwd_marker(context)?;
     let _cwd_marker_guard = CwdMarkerGuard(cwd_path.clone());
     drop(cwd_file);
     let (mut command, sandbox_warning) =
@@ -632,13 +632,10 @@ pub(crate) fn create_private_output(
     Ok((output_path, file))
 }
 
-fn create_private_cwd_marker() -> Result<(PathBuf, File)> {
-    // Keep markers under the component-by-component checked private harness
-    // tree. A predictable directory below the shared OS temp root could be
-    // pre-created as a symlink before the process starts.
-    let base = dirs::home_dir()
-        .context("无法确定 shell cwd marker 主目录")?
-        .join(".open-agent-harness/cwd-markers");
+fn create_private_cwd_marker(context: &ToolContext) -> Result<(PathBuf, File)> {
+    // Keep markers under either the checked private harness tree or the
+    // embedding/test capture root that ToolContext validated explicitly.
+    let base = context.cwd_marker_root()?;
     ensure_private_directory(&base)?;
     let mut entries = 0usize;
     for entry in std::fs::read_dir(&base)? {
