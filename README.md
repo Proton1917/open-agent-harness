@@ -31,7 +31,7 @@ sessions and control streaming, local agents and teams, Skills and plugins,
 hooks, MCP/OAuth/WebSocket, LSP, scheduling, monitoring, declarative workflows,
 media, structured interaction, and opt-in local memory.
 
-The release gate currently contains 593 test entries: 589 pass and four are
+The release gate currently contains 601 test entries: 597 pass and four are
 intentionally ignored helper-process entry points exercised by their parent
 tests. Formatting, Rust 1.85 all-target checks, Clippy with warnings denied,
 the release build, the repository audit, and the Windows GNU cross-check all
@@ -354,7 +354,7 @@ MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discriminati
 
 当前声明的 provider-neutral 能力已经按静态 2026-03-31 对照快照完成一致化，并补入 2.1.207 校验归档审校中确认的、具有通用价值的开放功能。覆盖范围包括事务式模型/工具循环、权限与文件系统边界、session 与 control stream、本地 agent/team、Skill/plugin、hook、MCP/OAuth/WebSocket、LSP、调度、Monitor、声明式 Workflow、媒体、结构化交互以及显式开启的本地 memory。
 
-当前 release gate 共 593 个测试项：589 项通过，4 个是由父测试实际调用、按设计 ignored 的子进程入口。格式检查、Rust 1.85 all-targets、Clippy 零警告、release 构建、仓库审计和 Windows GNU 交叉检查全部通过；同一套测试与 Clippy gate 也在 CI 中原生运行于 macOS 和 Windows。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)与[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
+当前 release gate 共 601 个测试项：597 项通过，4 个是由父测试实际调用、按设计 ignored 的子进程入口。格式检查、Rust 1.85 all-targets、Clippy 零警告、release 构建、仓库审计和 Windows GNU 交叉检查全部通过；同一套测试与 Clippy gate 也在 CI 中原生运行于 macOS 和 Windows。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)与[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
 
 ## 消息循环
 
