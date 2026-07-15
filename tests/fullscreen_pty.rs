@@ -25,15 +25,22 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let (mut child, mut terminal) = spawn_terminal(clipboard_bin.path());
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let mut pending_output = Vec::new();
+    let _ = read_until(
+        &mut terminal,
+        &mut pending_output,
+        "Shift+Tab mode",
+        Duration::from_secs(5),
+    );
     wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
 
-    terminal.write_all(b"/tui fullscreen\r").unwrap();
-    let entered = read_until(
+    let entered = submit_prompt(
         &mut terminal,
-        "TUI mode: fullscreen",
+        &mut pending_output,
+        b"/tui fullscreen\r",
         Duration::from_secs(3),
     );
+    assert!(entered.contains("TUI mode: fullscreen"));
     assert!(
         entered.contains("\x1b[?1049h"),
         "alternate screen was not entered"
@@ -42,8 +49,11 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         entered.contains("\x1b[?1000h"),
         "mouse capture was not enabled"
     );
-    wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
-    drain_terminal(&mut terminal, Duration::from_millis(100));
+    drain_terminal(
+        &mut terminal,
+        &mut pending_output,
+        Duration::from_millis(100),
+    );
 
     // SGR mouse: double click a visible transcript word and bridge the
     // bounded logical selection to the native clipboard command. Probe the
@@ -57,42 +67,52 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     terminal.write_all(&clicks).unwrap();
     let copied = read_until(
         &mut terminal,
+        &mut pending_output,
         "Selected transcript text copied",
         Duration::from_secs(3),
     );
     assert!(copied.contains("Selected transcript text copied"));
 
     for _ in 0..12 {
-        wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
-        terminal.write_all(b"/tui\r").unwrap();
-        let _ = read_until(
+        let cycle = submit_prompt(
             &mut terminal,
-            "TUI mode: fullscreen",
+            &mut pending_output,
+            b"/tui\r",
             Duration::from_secs(3),
         );
+        assert!(cycle.contains("TUI mode: fullscreen"));
     }
 
-    wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
-    terminal.write_all(b"\x1b[5~").unwrap();
-    let page_up = read_until(&mut terminal, "You", Duration::from_secs(3));
+    drain_terminal(
+        &mut terminal,
+        &mut pending_output,
+        Duration::from_millis(100),
+    );
+    let page_up = submit_prompt(
+        &mut terminal,
+        &mut pending_output,
+        b"\x1b[5~/tui\r",
+        Duration::from_secs(3),
+    );
     assert!(
         page_up.contains("/tui fullscreen"),
         "PageUp did not expose older transcript content: {page_up:?}"
     );
 
-    terminal.write_all(b"/tui\r").unwrap();
-    let unseen = read_until(&mut terminal, "new message", Duration::from_secs(3));
     assert!(
-        unseen.contains("End to jump to bottom"),
-        "scrolled transcript did not expose the unseen-message affordance"
+        page_up.contains("new message") && page_up.contains("End to jump to bottom"),
+        "scrolled transcript did not expose the unseen-message affordance: {page_up:?}"
     );
 
-    drain_terminal(&mut terminal, Duration::from_millis(150));
-    wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
-    terminal.write_all(b"\x1b[F").unwrap();
-    let bottom = read_until(
+    drain_terminal(
         &mut terminal,
-        "TUI mode: fullscreen",
+        &mut pending_output,
+        Duration::from_millis(150),
+    );
+    let bottom = submit_prompt(
+        &mut terminal,
+        &mut pending_output,
+        b"\x1b[F/tui\r",
         Duration::from_secs(3),
     );
     assert!(
@@ -100,8 +120,13 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         "End did not restore the sticky bottom"
     );
 
-    terminal.write_all(b"/tui default\r").unwrap();
-    let restored = read_until(&mut terminal, "TUI mode: default", Duration::from_secs(3));
+    let restored = submit_prompt(
+        &mut terminal,
+        &mut pending_output,
+        b"/tui default\r",
+        Duration::from_secs(3),
+    );
+    assert!(restored.contains("TUI mode: default"));
     assert!(
         restored.contains("\x1b[?1049l"),
         "alternate screen was not restored"
@@ -111,10 +136,10 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         "mouse capture was not disabled"
     );
 
-    wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
         &mut terminal,
+        &mut pending_output,
         "Press Ctrl-C again to exit",
         Duration::from_secs(2),
     );
@@ -189,19 +214,22 @@ fn spawn_terminal(clipboard_bin: &Path) -> (Child, File) {
     (child, unsafe { File::from_raw_fd(master) })
 }
 
-fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
+fn read_until(
+    terminal: &mut File,
+    pending_output: &mut Vec<u8>,
+    needle: &str,
+    timeout: Duration,
+) -> String {
     let started = Instant::now();
-    let mut output = Vec::new();
+    let mut output = std::mem::take(pending_output);
     let mut buffer = [0u8; 8192];
     while started.elapsed() < timeout {
+        if let Some(found) = take_through_needle(&output, pending_output, needle.as_bytes()) {
+            return found;
+        }
         match terminal.read(&mut buffer) {
             Ok(0) => break,
-            Ok(count) => {
-                output.extend_from_slice(&buffer[..count]);
-                if String::from_utf8_lossy(&output).contains(needle) {
-                    return String::from_utf8_lossy(&output).into_owned();
-                }
-            }
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -217,7 +245,33 @@ fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
     )
 }
 
-fn drain_terminal(terminal: &mut File, quiet_for: Duration) {
+fn take_through_needle(
+    output: &[u8],
+    pending_output: &mut Vec<u8>,
+    needle: &[u8],
+) -> Option<String> {
+    let position = output
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let end = position + needle.len();
+    pending_output.extend_from_slice(&output[end..]);
+    Some(String::from_utf8_lossy(output).into_owned())
+}
+
+fn submit_prompt(
+    terminal: &mut File,
+    pending_output: &mut Vec<u8>,
+    input: &[u8],
+    timeout: Duration,
+) -> String {
+    terminal.write_all(input).unwrap();
+    let submitted = read_until(terminal, pending_output, "\x1b[?2004l", timeout);
+    let resumed = read_until(terminal, pending_output, "\x1b[?2004h", timeout);
+    format!("{submitted}{resumed}")
+}
+
+fn drain_terminal(terminal: &mut File, pending_output: &mut Vec<u8>, quiet_for: Duration) {
+    pending_output.clear();
     let mut quiet_since = Instant::now();
     let mut buffer = [0u8; 8192];
     while quiet_since.elapsed() < quiet_for {
