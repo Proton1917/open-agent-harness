@@ -26,6 +26,9 @@ const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_RECORDS: usize = 100_000;
 const MAX_SESSION_LIST_SCAN: usize = 10_000;
 const MAX_SESSION_LIST_RESULTS: usize = 100;
+const MAX_SESSION_METADATA_BYTES: u64 = 16 * 1024;
+const MAX_SESSION_TITLE_BYTES: usize = 512;
+const SESSION_METADATA_VERSION: u8 = 1;
 const REDACTED_SECRET: &str = "[secret-redacted]";
 const REDACTED_PATH: &str = "[absolute-path-redacted]";
 
@@ -44,6 +47,28 @@ struct Record {
     compact_boundary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionMetadata {
+    version: u8,
+    session_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<Uuid>,
+}
+
+impl SessionMetadata {
+    fn new(session_id: Uuid) -> Self {
+        Self {
+            version: SESSION_METADATA_VERSION,
+            session_id,
+            title: None,
+            parent_session_id: None,
+        }
+    }
 }
 
 impl Record {
@@ -87,6 +112,8 @@ pub struct SessionSummary {
     pub id: Uuid,
     pub modified_ms: u128,
     pub bytes: u64,
+    pub title: Option<String>,
+    pub parent_session_id: Option<Uuid>,
 }
 
 impl SessionWorkspaceState {
@@ -253,10 +280,13 @@ impl SessionStore {
                 .ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
                 .map_or(0, |duration| duration.as_millis());
+            let sidecar = read_session_metadata(&path, id).ok().flatten();
             sessions.push(SessionSummary {
                 id,
                 modified_ms,
                 bytes: metadata.len(),
+                title: sidecar.as_ref().and_then(|metadata| metadata.title.clone()),
+                parent_session_id: sidecar.and_then(|metadata| metadata.parent_session_id),
             });
         }
         sessions.sort_by(|left, right| {
@@ -350,31 +380,68 @@ impl SessionStore {
         enabled: bool,
         directory: PathBuf,
     ) -> Result<(Self, Vec<Message>)> {
-        let latest = fs::read_dir(&directory)?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-            .max_by_key(|(modified, _)| *modified)
-            .map(|(_, path)| path)
-            .context("当前目录没有可继续的会话")?;
-        let id = latest
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .context("会话文件名无效")?
-            .parse()?;
-        let loaded = load_transcript(&latest)?;
-        Ok((
-            Self {
-                id,
-                cwd: cwd.to_owned(),
-                file: latest,
-                enabled,
-                workspace: Arc::new(Mutex::new(loaded.workspace)),
-                current_cwd: Arc::new(Mutex::new(loaded.current_cwd)),
-                write_lock: Arc::new(Mutex::new(())),
-            },
-            loaded.messages,
-        ))
+        let mut candidates = Vec::new();
+        let mut scanned = 0usize;
+        for entry in fs::read_dir(&directory)? {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_SESSION_LIST_SCAN {
+                bail!("session 目录条目超过 {MAX_SESSION_LIST_SCAN} 个安全上限")
+            }
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<Uuid>().ok())
+            else {
+                continue;
+            };
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            candidates.push((modified, id, path));
+        }
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+        let mut rejected = 0usize;
+        for (_, id, path) in candidates {
+            let loaded = match load_transcript(&path) {
+                Ok(loaded) => loaded,
+                Err(_) => {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+            };
+            if !fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0) {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+            return Ok((
+                Self {
+                    id,
+                    cwd: cwd.to_owned(),
+                    file: path,
+                    enabled,
+                    workspace: Arc::new(Mutex::new(loaded.workspace)),
+                    current_cwd: Arc::new(Mutex::new(loaded.current_cwd)),
+                    write_lock: Arc::new(Mutex::new(())),
+                },
+                loaded.messages,
+            ));
+        }
+        if rejected == 0 {
+            bail!("当前目录没有可继续的会话")
+        }
+        bail!("当前目录没有可恢复的会话；已跳过 {rejected} 个损坏或不可读取的候选")
     }
 
     /// Creates a new session from a bounded prefix of an existing session.
@@ -385,10 +452,21 @@ impl SessionStore {
         message_count: Option<usize>,
         enabled: bool,
     ) -> Result<(Self, Vec<Message>)> {
+        Self::fork_with_title(cwd, source_id, message_count, None, enabled)
+    }
+
+    pub fn fork_with_title(
+        cwd: &Path,
+        source_id: Uuid,
+        message_count: Option<usize>,
+        title: Option<&str>,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
         Self::fork_from_directory(
             cwd,
             source_id,
             message_count,
+            title,
             enabled,
             project_directory(cwd)?,
         )
@@ -401,10 +479,22 @@ impl SessionStore {
         state_root: &SessionStateRoot,
         enabled: bool,
     ) -> Result<(Self, Vec<Message>)> {
+        Self::fork_in_with_title(cwd, source_id, message_count, None, state_root, enabled)
+    }
+
+    pub fn fork_in_with_title(
+        cwd: &Path,
+        source_id: Uuid,
+        message_count: Option<usize>,
+        title: Option<&str>,
+        state_root: &SessionStateRoot,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
         Self::fork_from_directory(
             cwd,
             source_id,
             message_count,
+            title,
             enabled,
             state_root.project_directory(cwd)?,
         )
@@ -414,6 +504,7 @@ impl SessionStore {
         cwd: &Path,
         source_id: Uuid,
         message_count: Option<usize>,
+        title: Option<&str>,
         enabled: bool,
         directory: PathBuf,
     ) -> Result<(Self, Vec<Message>)> {
@@ -430,7 +521,7 @@ impl SessionStore {
             current_cwd: Arc::new(Mutex::new(None)),
             write_lock: Arc::new(Mutex::new(())),
         };
-        source_store.fork_from(message_count, enabled)
+        source_store.fork_from_with_title(message_count, title, enabled)
     }
 
     /// Forks this store without requiring another project-directory lookup.
@@ -439,6 +530,18 @@ impl SessionStore {
         message_count: Option<usize>,
         enabled: bool,
     ) -> Result<(Self, Vec<Message>)> {
+        self.fork_from_with_title(message_count, None, enabled)
+    }
+
+    pub fn fork_from_with_title(
+        &self,
+        message_count: Option<usize>,
+        title: Option<&str>,
+        enabled: bool,
+    ) -> Result<(Self, Vec<Message>)> {
+        let title = title
+            .map(|title| validate_session_title(title, &self.cwd))
+            .transpose()?;
         let LoadedTranscript {
             mut messages,
             mut message_workspaces,
@@ -488,8 +591,30 @@ impl SessionStore {
                 &message_workspaces,
                 &message_current_cwds,
             )?;
+            let mut metadata = SessionMetadata::new(destination.id);
+            metadata.title = title;
+            metadata.parent_session_id = Some(self.id);
+            if let Err(error) = write_session_metadata(&destination.file, &metadata) {
+                let _ = fs::remove_file(&destination.file);
+                return Err(error);
+            }
         }
         Ok((destination, messages))
+    }
+
+    pub fn rename(&self, title: &str) -> Result<()> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            bail!("当前会话未启用持久化，无法保存标题")
+        }
+        let title = validate_session_title(title, &self.cwd)?;
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metadata = read_session_metadata(&self.file, self.id)?
+            .unwrap_or_else(|| SessionMetadata::new(self.id));
+        metadata.title = Some(title);
+        write_session_metadata(&self.file, &metadata)
     }
 
     /// Loads the currently effective history, after compact boundaries.
@@ -775,6 +900,9 @@ impl SessionStore {
         let (archive, messages) = self.fork_from(None, true)?;
         if messages.is_empty() {
             let _ = fs::remove_file(&archive.file);
+            if let Ok(metadata) = session_metadata_path(&archive.file) {
+                let _ = fs::remove_file(metadata);
+            }
             self.clear_history()?;
             return Ok(None);
         }
@@ -1127,6 +1255,149 @@ fn replace_private_transcript(path: &Path, contents: &[u8]) -> Result<()> {
     result.with_context(|| format!("无法原子替换 transcript {}", path.display()))
 }
 
+fn session_metadata_path(transcript: &Path) -> Result<PathBuf> {
+    let parent = transcript.parent().context("transcript 路径缺少父目录")?;
+    let id = transcript
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<Uuid>().ok())
+        .context("transcript 文件名不是 session UUID")?;
+    Ok(parent.join(format!("{id}.meta.json")))
+}
+
+fn validate_session_title(title: &str, cwd: &Path) -> Result<String> {
+    let title = title.trim();
+    validate_session_title_value(title, cwd)?;
+    Ok(title.to_owned())
+}
+
+fn validate_session_title_value(title: &str, cwd: &Path) -> Result<()> {
+    if title.is_empty() || title.len() > MAX_SESSION_TITLE_BYTES {
+        bail!("session 标题必须为 1..={MAX_SESSION_TITLE_BYTES} 字节")
+    }
+    if title.chars().any(char::is_control) {
+        bail!("session 标题必须是单行且不能包含控制字符")
+    }
+    if sanitize_text(title, None, cwd) != title {
+        bail!("session 标题不能包含 secret、endpoint 凭据或本机绝对路径")
+    }
+    if title.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\''
+            )
+        });
+        looks_absolute_path(token)
+    }) {
+        bail!("session 标题不能包含本机绝对路径")
+    }
+    Ok(())
+}
+
+fn validate_session_metadata(metadata: &SessionMetadata, expected_id: Uuid) -> Result<()> {
+    if metadata.version != SESSION_METADATA_VERSION || metadata.session_id != expected_id {
+        bail!("session metadata 版本或 session id 不匹配")
+    }
+    if metadata.parent_session_id == Some(expected_id) {
+        bail!("session metadata 不能将自身记录为父会话")
+    }
+    if let Some(title) = &metadata.title {
+        if title.trim() != title
+            || validate_session_title_value(title, Path::new("<session-metadata>")).is_err()
+        {
+            bail!("session metadata 标题无效")
+        }
+    }
+    Ok(())
+}
+
+fn read_session_metadata(transcript: &Path, expected_id: Uuid) -> Result<Option<SessionMetadata>> {
+    let path = session_metadata_path(transcript)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("session metadata 必须是非 symlink 普通文件")
+    }
+    if metadata.len() > MAX_SESSION_METADATA_BYTES {
+        bail!("session metadata 超过 {MAX_SESSION_METADATA_BYTES} 字节限制")
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("无法打开 session metadata {}", path.display()))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_SESSION_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SESSION_METADATA_BYTES {
+        bail!("session metadata 超过 {MAX_SESSION_METADATA_BYTES} 字节限制")
+    }
+    let metadata: SessionMetadata =
+        serde_json::from_slice(&bytes).context("session metadata JSON 损坏")?;
+    validate_session_metadata(&metadata, expected_id)?;
+    Ok(Some(metadata))
+}
+
+fn write_session_metadata(transcript: &Path, metadata: &SessionMetadata) -> Result<()> {
+    let expected_id = transcript
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<Uuid>().ok())
+        .context("transcript 文件名不是 session UUID")?;
+    validate_session_metadata(metadata, expected_id)?;
+    let path = session_metadata_path(transcript)?;
+    if fs::symlink_metadata(&path)
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        .unwrap_or(false)
+    {
+        bail!(
+            "拒绝替换 symlink 或非普通 session metadata: {}",
+            path.display()
+        )
+    }
+    let contents = serde_json::to_vec(metadata)?;
+    if contents.len() as u64 > MAX_SESSION_METADATA_BYTES {
+        bail!("session metadata 超过 {MAX_SESSION_METADATA_BYTES} 字节限制")
+    }
+    let parent = path.parent().context("session metadata 路径缺少父目录")?;
+    ensure_private_directory(parent)?;
+    let temp = parent.join(format!(".open-agent-harness-meta-{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&contents)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("无法原子替换 session metadata {}", path.display()))
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1400,6 +1671,194 @@ mod tests {
                 .unwrap()
                 .starts_with(&canonical_storage)
         );
+    }
+
+    #[test]
+    fn continue_latest_skips_empty_and_corrupt_candidates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let valid_id = Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap();
+        let corrupt_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let empty_id = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let torn_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
+        let valid = test_store(
+            workspace.path(),
+            directory.path().join(format!("{valid_id}.jsonl")),
+            valid_id,
+        );
+        let expected = Message::user_text("recoverable history");
+        valid.append(std::slice::from_ref(&expected)).unwrap();
+        fs::write(
+            directory.path().join(format!("{corrupt_id}.jsonl")),
+            b"not-json\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join(format!("{empty_id}.jsonl")), b"").unwrap();
+        fs::write(
+            directory.path().join(format!("{torn_id}.jsonl")),
+            br#"{"session_id":"#,
+        )
+        .unwrap();
+
+        let (continued, messages) = SessionStore::continue_latest_from_directory(
+            workspace.path(),
+            true,
+            directory.path().to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(continued.id, valid_id);
+        assert_eq!(messages, vec![expected]);
+    }
+
+    #[test]
+    fn session_metadata_rename_and_fork_are_private_and_listed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        make_private_directory(directory.path());
+        let id = Uuid::new_v4();
+        let store = test_store(
+            workspace.path(),
+            directory.path().join(format!("{id}.jsonl")),
+            id,
+        );
+        store.append(&[Message::user_text("hello")]).unwrap();
+        store.rename("  会话标题  ").unwrap();
+
+        let metadata_path = session_metadata_path(&store.file).unwrap();
+        let metadata = read_session_metadata(&store.file, id).unwrap().unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("会话标题"));
+        assert_eq!(metadata.parent_session_id, None);
+        assert!(
+            !fs::read_to_string(&metadata_path)
+                .unwrap()
+                .contains(workspace.path().to_string_lossy().as_ref())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&metadata_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let (fork, messages) = store
+            .fork_from_with_title(Some(1), Some("Branch α"), true)
+            .unwrap();
+        assert_eq!(messages, vec![Message::user_text("hello")]);
+        let fork_metadata = read_session_metadata(&fork.file, fork.id).unwrap().unwrap();
+        assert_eq!(fork_metadata.title.as_deref(), Some("Branch α"));
+        assert_eq!(fork_metadata.parent_session_id, Some(id));
+
+        let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
+        let source_summary = listed.iter().find(|summary| summary.id == id).unwrap();
+        assert_eq!(source_summary.title.as_deref(), Some("会话标题"));
+        assert_eq!(source_summary.parent_session_id, None);
+        let fork_summary = listed.iter().find(|summary| summary.id == fork.id).unwrap();
+        assert_eq!(fork_summary.title.as_deref(), Some("Branch α"));
+        assert_eq!(fork_summary.parent_session_id, Some(id));
+        assert!(
+            !directory
+                .path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    #[test]
+    fn session_metadata_title_boundaries_fail_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(
+            workspace.path(),
+            directory.path().join(format!("{id}.jsonl")),
+            id,
+        );
+        store.append(&[Message::user_text("hello")]).unwrap();
+
+        assert!(store.rename("").is_err());
+        assert!(store.rename("line one\nline two").is_err());
+        assert!(store.rename("control\0character").is_err());
+        assert!(
+            store
+                .rename(&"x".repeat(MAX_SESSION_TITLE_BYTES + 1))
+                .is_err()
+        );
+        assert!(store.rename("Inspect /tmp/private-file").is_err());
+        assert!(store.rename("api_key=not-a-real-key").is_err());
+
+        let exact = "界".repeat(MAX_SESSION_TITLE_BYTES / "界".len());
+        store.rename(&exact).unwrap();
+        assert_eq!(
+            read_session_metadata(&store.file, id)
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some(exact.as_str())
+        );
+    }
+
+    #[test]
+    fn corrupt_or_oversized_session_metadata_does_not_hide_transcript() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(
+            workspace.path(),
+            directory.path().join(format!("{id}.jsonl")),
+            id,
+        );
+        store.append(&[Message::user_text("hello")]).unwrap();
+        let metadata_path = session_metadata_path(&store.file).unwrap();
+
+        fs::write(&metadata_path, b"not-json").unwrap();
+        assert!(store.rename("replacement").is_err());
+        let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].title, None);
+        assert_eq!(listed[0].parent_session_id, None);
+
+        fs::write(
+            &metadata_path,
+            vec![b'x'; MAX_SESSION_METADATA_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(store.rename("replacement").is_err());
+        let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_session_metadata_is_ignored_by_list_and_rejected_by_rename() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(
+            workspace.path(),
+            directory.path().join(format!("{id}.jsonl")),
+            id,
+        );
+        store.append(&[Message::user_text("hello")]).unwrap();
+        let metadata_path = session_metadata_path(&store.file).unwrap();
+        symlink(outside.path(), &metadata_path).unwrap();
+
+        assert!(store.rename("replacement").is_err());
+        let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, None);
+        assert_eq!(fs::read(outside.path()).unwrap(), Vec::<u8>::new());
     }
 
     #[test]

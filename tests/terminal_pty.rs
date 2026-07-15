@@ -196,11 +196,11 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
     let palette = open_slash_palette(&mut terminal);
     assert_no_bare_line_feeds(palette.as_bytes());
     terminal.write_all(b"\x0e").unwrap();
-    let next = read_until(&mut terminal, "› /compact", Duration::from_secs(3));
-    assert!(next.contains("› /compact"));
+    let next = read_until(&mut terminal, "› /agents", Duration::from_secs(3));
+    assert!(next.contains("› /agents"));
     terminal.write_all(b"\x10").unwrap();
-    let previous = read_until(&mut terminal, "› /clear", Duration::from_secs(3));
-    assert!(previous.contains("› /clear"));
+    let previous = read_until(&mut terminal, "› /add-dir", Duration::from_secs(3));
+    assert!(previous.contains("› /add-dir"));
 
     terminal.write_all(b"mo").unwrap();
     let filtered = read_until(&mut terminal, "/model", Duration::from_secs(3));
@@ -257,6 +257,10 @@ fn theme_picker_previews_without_persisting_on_escape() {
     let initial = read_until(&mut terminal, "Preview · demo.rs", Duration::from_secs(3));
     assert!(initial.contains("- let message = \"before\";"));
     assert!(initial.contains("+ let message = \"after\";"));
+
+    terminal.write_all(b"\x14").unwrap();
+    let syntax = read_until(&mut terminal, "syntax off", Duration::from_secs(3));
+    assert!(syntax.contains("Ctrl-T toggles code syntax highlighting"));
 
     terminal.write_all(b"\x1b[B").unwrap();
     let focused = read_until(&mut terminal, "› 2. Dark", Duration::from_secs(3));
@@ -345,6 +349,42 @@ fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
 
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
+fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"/permissions\r").unwrap();
+    let permissions = read_until(&mut terminal, "Permissions", Duration::from_secs(3));
+    assert!(permissions.contains("Allow"));
+    assert!(permissions.contains("Workspace"));
+    terminal.write_all(b"\x1b").unwrap();
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+
+    terminal.write_all(b"/config\r").unwrap();
+    let settings = read_until(&mut terminal, "Settings", Duration::from_secs(3));
+    assert!(settings.contains("Syntax highlighting"));
+    terminal.write_all(b"\x1b").unwrap();
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+
+    terminal.write_all(b"/tasks\r").unwrap();
+    let tasks = read_until(&mut terminal, "Background tasks", Duration::from_secs(3));
+    assert!(tasks.contains("No background tasks"));
+    terminal.write_all(b"\x1b").unwrap();
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
     terminal.write_all(b"\x03").unwrap();
     drop(terminal);
     assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
@@ -526,6 +566,10 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
     assert_eq!(output.matches("Permission required").count(), 1);
     assert!(output.contains("Allowed exact action for this session"));
 
+    if !output.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
         &mut terminal,

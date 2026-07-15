@@ -226,21 +226,27 @@ is accurate; “complete parity with the proprietary product” is not.
 - The main conversation supports both native scrollback and an optional
   `/tui fullscreen` virtual viewport with sticky-bottom/unseen state, resize,
   wheel/page scrolling, mouse word/line/drag selection, grapheme-aware keyboard
-  selection and bounded native/OSC 52 clipboard copy. Rich Markdown/table/
-  syntax rendering and clickable file/URL/tool-result regions are not yet
-  declared for the primary conversation stream.
+  selection and bounded native/OSC 52 clipboard copy. The primary stream now
+  renders control-sanitized Markdown headings, lists, quotes, fenced code and
+  bounded tables from a structured IR. Syntax highlighting is optional;
+  credential-free HTTP(S) links, bounded tool results and canonical files under
+  a trusted workspace receive fullscreen actions. File actions re-canonicalize
+  at click time so a symlink swap cannot widen access.
 - Prompt editing now provides private hot-reloaded contextual keybindings,
   Vim Insert/Normal/Visual operation, scoped persistent history, visible and
   removable clipboard images, draft-preserving model/transcript/todo modals,
   safe UI settings, theme presets and a trusted bounded status-line command.
-  The theme picker previews a bounded diff sample and rolls back on Escape;
+  The theme picker covers the local snapshot's auto, dark/light, daltonized and
+  ANSI variants, previews a bounded diff sample, toggles syntax highlighting
+  with Ctrl-T, and rolls back on Escape;
   status-line commands refresh asynchronously on relevant state changes and at
   the configured idle interval. Custom theme editing remains outside the
   declared integration surface.
 - `/diff`, `/rewind`, `/resume`, `/tasks`, `/copy`, and `/export` expose their
-  generic data and safe actions, but do not reproduce proprietary React/Ink
-  layouts or live process hot-swap. These are explicit UI boundaries, not
-  claims of parity.
+  generic data and safe actions. `/resume` switches the active transcript,
+  workspace/cwd recorders and file histories in the current terminal;
+  `/rename` and `/branch` use private, strict session metadata. The layouts are
+  original Rust terminal components, not proprietary React/Ink reproduction.
 - The slash palette does not copy private usage ranking or vendor command
   inventory. Builtin/custom/Skill conflicts and ranking are deterministic;
   namespaced MCP prompts and trusted dynamic argument candidates are included
@@ -249,10 +255,12 @@ is accurate; “complete parity with the proprietary product” is not.
   fast-mode, or proprietary effort behavior; its options are explicit trusted
   configuration plus the active model.
 - Permission prompts show bounded tool-aware action/diff summaries plus the
-  complete exact JSON before authorization, but `/permissions` does not yet
-  implement the proprietary persistent add/remove rule-management dialog.
-  Task commands expose generic data and stop/output actions but do not yet
-  reproduce the live task-tree footer/dialog.
+  complete exact JSON before authorization. `/permissions` now provides
+  Recent/Allow/Ask/Deny/Workspace tabs, search and typed add/remove actions;
+  only user rules persist, while the primary workspace remains immutable.
+  `/tasks` uses a bounded live snapshot for its list/detail dialog and routes
+  stop/output through the existing tool boundary. These dialogs deliberately
+  keep original wording and layout.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
 - `ConfigChange` covers the accepted project-Skill hot-refresh boundary only.

@@ -236,6 +236,16 @@ impl<'a> FrameSpec<'a> {
 struct TranscriptLine {
     id: u64,
     text: String,
+    action: Option<TranscriptAction>,
+}
+
+/// Trusted interaction attached by the harness to a rendered transcript line.
+/// Model text cannot construct one of these values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptAction {
+    ToggleTool(String),
+    OpenUrl(String),
+    OpenFile(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +290,7 @@ pub struct FullscreenState {
     transcript_bytes: usize,
     dropped_lines: usize,
     next_line_id: u64,
-    streaming: Option<TranscriptLine>,
+    streaming: Vec<TranscriptLine>,
     streaming_unseen_counted: bool,
     status: Option<String>,
     rows: usize,
@@ -302,7 +312,7 @@ impl FullscreenState {
             transcript_bytes: 0,
             dropped_lines: 0,
             next_line_id: 1,
-            streaming: None,
+            streaming: Vec::new(),
             streaming_unseen_counted: false,
             status: None,
             rows: usize::from(rows).max(1),
@@ -362,7 +372,7 @@ impl FullscreenState {
     }
 
     pub fn streaming_line(&self) -> Option<&str> {
-        self.streaming.as_ref().map(|line| line.text.as_str())
+        self.streaming.first().map(|line| line.text.as_str())
     }
 
     pub fn set_wheel_config(&mut self, config: WheelConfig) {
@@ -381,11 +391,11 @@ impl FullscreenState {
         let was_sticky = self.sticky_bottom;
         let mut added = 0usize;
         for line in split_logical_lines(text) {
-            self.push_line_inner(line);
+            self.push_line_inner(line, None);
             added += 1;
         }
         if added == 0 {
-            self.push_line_inner("");
+            self.push_line_inner("", None);
         }
         self.trim_to_limits();
         self.rebuild_visual_cache();
@@ -398,32 +408,56 @@ impl FullscreenState {
         self.discard_stale_selection();
     }
 
-    /// Updates the active streaming line without committing it to transcript
-    /// storage.  A stream counts as one unseen message while scrolled away.
+    /// Updates the active streaming message without committing it to transcript
+    /// storage. Newlines remain distinct logical lines so code, lists and
+    /// paragraphs do not collapse while the model is still streaming. A stream
+    /// counts as one unseen message while scrolled away.
     pub fn set_streaming_line(&mut self, line: Option<&str>) {
         let anchor = self.top_anchor();
         let was_sticky = self.sticky_bottom;
         match line {
             Some(line) => {
-                let text = bounded_plain_text(
-                    line,
-                    self.limits
-                        .max_line_bytes
-                        .min(self.limits.max_transcript_bytes),
-                );
-                if let Some(streaming) = self.streaming.as_mut() {
-                    streaming.text = text;
-                } else {
-                    let id = self.take_line_id();
-                    self.streaming = Some(TranscriptLine { id, text });
+                let total_limit = self.limits.max_transcript_bytes;
+                let line_limit = self.limits.max_line_bytes.min(total_limit);
+                let mut remaining = total_limit;
+                let mut next = Vec::new();
+                for (index, source) in split_logical_lines(line).enumerate() {
+                    if next.len() >= self.limits.max_transcript_lines || remaining == 0 {
+                        break;
+                    }
+                    let text = bounded_plain_text(source, line_limit.min(remaining));
+                    remaining = remaining.saturating_sub(transcript_line_cost(&text));
+                    let id = if let Some(existing) = self.streaming.get(index) {
+                        existing.id
+                    } else {
+                        self.take_line_id()
+                    };
+                    next.push(TranscriptLine {
+                        id,
+                        text,
+                        action: None,
+                    });
                 }
+                if next.is_empty() {
+                    let id = if let Some(existing) = self.streaming.first() {
+                        existing.id
+                    } else {
+                        self.take_line_id()
+                    };
+                    next.push(TranscriptLine {
+                        id,
+                        text: String::new(),
+                        action: None,
+                    });
+                }
+                self.streaming = next;
                 if !was_sticky && !self.streaming_unseen_counted {
                     self.unseen_messages = self.unseen_messages.saturating_add(1);
                     self.streaming_unseen_counted = true;
                 }
             }
             None => {
-                self.streaming = None;
+                self.streaming.clear();
                 self.streaming_unseen_counted = false;
             }
         }
@@ -438,15 +472,17 @@ impl FullscreenState {
     /// Commits the current streaming line without double-counting unseen work.
     /// Returns false if no stream was active.
     pub fn commit_streaming_line(&mut self) -> bool {
-        let Some(streaming) = self.streaming.take() else {
+        if self.streaming.is_empty() {
             return false;
-        };
+        }
         let anchor = self.top_anchor();
         let was_sticky = self.sticky_bottom;
-        self.transcript_bytes = self
-            .transcript_bytes
-            .saturating_add(transcript_line_cost(&streaming.text));
-        self.lines.push_back(streaming);
+        for streaming in self.streaming.drain(..) {
+            self.transcript_bytes = self
+                .transcript_bytes
+                .saturating_add(transcript_line_cost(&streaming.text));
+            self.lines.push_back(streaming);
+        }
         self.trim_to_limits();
         self.rebuild_visual_cache();
         self.streaming_unseen_counted = false;
@@ -462,7 +498,7 @@ impl FullscreenState {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.visual_cache.clear();
-        self.streaming = None;
+        self.streaming.clear();
         self.transcript_bytes = 0;
         self.scroll_top = 0;
         self.sticky_bottom = true;
@@ -818,7 +854,115 @@ impl FullscreenState {
         self.scroll_lines(delta);
     }
 
-    fn push_line_inner(&mut self, line: &str) {
+    /// Appends a message whose visible rows carry one harness-created action.
+    pub fn push_action_message(&mut self, text: &str, action: TranscriptAction) {
+        let anchor = self.top_anchor();
+        let was_sticky = self.sticky_bottom;
+        let mut added = false;
+        for line in split_logical_lines(text) {
+            self.push_line_inner(line, Some(action.clone()));
+            added = true;
+        }
+        if !added {
+            self.push_line_inner("", Some(action));
+        }
+        self.trim_to_limits();
+        self.rebuild_visual_cache();
+        if was_sticky {
+            self.scroll_to_bottom();
+        } else {
+            self.restore_top_anchor(anchor);
+            self.unseen_messages = self.unseen_messages.saturating_add(1);
+        }
+        self.discard_stale_selection();
+    }
+
+    /// Replaces every line carrying `action` while preserving its position.
+    pub fn replace_action_message(&mut self, action: &TranscriptAction, text: &str) -> bool {
+        let Some(start) = self
+            .lines
+            .iter()
+            .position(|line| line.action.as_ref() == Some(action))
+        else {
+            return false;
+        };
+        let anchor = self.top_anchor();
+        let was_sticky = self.sticky_bottom;
+        let mut reusable_ids = VecDeque::new();
+        let mut index = start;
+        while index < self.lines.len() {
+            if self.lines[index].action.as_ref() == Some(action) {
+                if let Some(removed) = self.lines.remove(index) {
+                    reusable_ids.push_back(removed.id);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let mut inserted = 0usize;
+        for source in split_logical_lines(text) {
+            let text = bounded_plain_text(
+                source,
+                self.limits
+                    .max_line_bytes
+                    .min(self.limits.max_transcript_bytes),
+            );
+            let id = reusable_ids
+                .pop_front()
+                .unwrap_or_else(|| self.take_line_id());
+            self.lines.insert(
+                start + inserted,
+                TranscriptLine {
+                    id,
+                    text,
+                    action: Some(action.clone()),
+                },
+            );
+            inserted += 1;
+        }
+        if inserted == 0 {
+            let id = reusable_ids
+                .pop_front()
+                .unwrap_or_else(|| self.take_line_id());
+            self.lines.insert(
+                start,
+                TranscriptLine {
+                    id,
+                    text: String::new(),
+                    action: Some(action.clone()),
+                },
+            );
+        }
+        self.transcript_bytes = self
+            .lines
+            .iter()
+            .map(|line| transcript_line_cost(&line.text))
+            .sum();
+        self.trim_to_limits();
+        self.rebuild_visual_cache();
+        if was_sticky {
+            self.scroll_to_bottom();
+        } else {
+            self.restore_top_anchor(anchor);
+        }
+        self.discard_stale_selection();
+        true
+    }
+
+    pub fn action_at(&self, point: ViewportPoint) -> Option<TranscriptAction> {
+        if point.row >= self.layout().content_rows {
+            return None;
+        }
+        let row = self
+            .visual_rows()
+            .get(self.scroll_top.min(self.scroll_max()) + point.row)?;
+        if point.column >= UnicodeWidthStr::width(row.text.as_str()) {
+            return None;
+        }
+        self.line_by_id(row.source.line_id)?.action.clone()
+    }
+
+    fn push_line_inner(&mut self, line: &str, action: Option<TranscriptAction>) {
         let text = bounded_plain_text(
             line,
             self.limits
@@ -829,7 +973,7 @@ impl FullscreenState {
         self.transcript_bytes = self
             .transcript_bytes
             .saturating_add(transcript_line_cost(&text));
-        self.lines.push_back(TranscriptLine { id, text });
+        self.lines.push_back(TranscriptLine { id, text, action });
     }
 
     fn take_line_id(&mut self) -> u64 {
@@ -1537,6 +1681,56 @@ mod tests {
         assert!(state.commit_streaming_line());
         assert_eq!(state.unseen_messages(), 1);
         assert!(!state.commit_streaming_line());
+    }
+
+    #[test]
+    fn streaming_message_preserves_newlines_and_reuses_logical_line_ids() {
+        let mut state = state(8, 20);
+        state.set_streaming_line(Some("heading\n```rust\nfn main()"));
+        assert_eq!(state.streaming.len(), 3);
+        assert_eq!(
+            state
+                .streaming
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["heading", "```rust", "fn main()"]
+        );
+        let ids = state
+            .streaming
+            .iter()
+            .map(|line| line.id)
+            .collect::<Vec<_>>();
+        state.set_streaming_line(Some("heading updated\n```rust\nfn main() {}\n```"));
+        assert_eq!(state.streaming.len(), 4);
+        assert_eq!(
+            state
+                .streaming
+                .iter()
+                .take(3)
+                .map(|line| line.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(state.commit_streaming_line());
+        assert_eq!(state.transcript_len(), 4);
+        assert_eq!(state.lines.back().unwrap().text, "```");
+    }
+
+    #[test]
+    fn trusted_action_hit_map_and_replacement_preserve_plain_selection_model() {
+        let mut state = state(8, 40);
+        let action = TranscriptAction::ToggleTool("tool-1".to_owned());
+        state.push_action_message("result (click to expand)", action.clone());
+        assert_eq!(
+            state.action_at(ViewportPoint { row: 0, column: 2 }),
+            Some(action.clone())
+        );
+        assert_eq!(state.action_at(ViewportPoint { row: 0, column: 39 }), None);
+        assert!(state.replace_action_message(&action, "result\n  line two"));
+        assert_eq!(state.transcript_len(), 2);
+        assert_eq!(state.lines[1].text, "  line two");
+        assert_eq!(state.lines[1].action, Some(action));
     }
 
     #[test]

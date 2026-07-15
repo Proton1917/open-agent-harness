@@ -18,6 +18,290 @@ const MAX_TASKS: usize = 1000;
 const MAX_TASK_STORE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_METADATA_KEYS: usize = 128;
+const MAX_TASK_UI_ITEMS: usize = 448;
+const MAX_TASK_UI_ITEMS_PER_SOURCE: usize = 64;
+const MAX_TASK_UI_SNAPSHOT_BYTES: usize = 384 * 1024;
+const MAX_TASK_UI_ID_BYTES: usize = 128;
+const MAX_TASK_UI_TITLE_BYTES: usize = 512;
+const MAX_TASK_UI_DETAIL_BYTES: usize = 1024;
+
+/// Origin of one entry in the local task UI snapshot.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskUiItemKind {
+    PersistentTask,
+    Todo,
+    BackgroundTask,
+    WorkflowTask,
+    MonitorTask,
+    CronJob,
+    DynamicWakeup,
+}
+
+/// Small, provider-neutral state vocabulary used by the task UI.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskUiStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Tracked,
+    Scheduled,
+    Unknown,
+}
+
+/// One bounded, display-only task entry. It contains no process handles,
+/// captured output paths, task metadata, or mutable runtime capability.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUiItem {
+    pub kind: TaskUiItemKind,
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub status: TaskUiStatus,
+}
+
+/// Point-in-time local task state for terminal rendering. `truncated` is set
+/// whenever a source or field exceeded a UI-specific bound.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUiSnapshot {
+    pub items: Vec<TaskUiItem>,
+    pub truncated: bool,
+}
+
+impl TaskUiSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+pub(super) async fn task_ui_snapshot(context: &ToolContext) -> Result<TaskUiSnapshot> {
+    let store = {
+        let _guard = context.task_store_lock.lock().await;
+        load_store(context)?
+    };
+    let todos = context.todos.lock().await.clone();
+    let mut background_ids = context
+        .tasks
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut workflow_ids = context
+        .workflow_runtime()
+        .task_ids()
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut monitor_ids = context
+        .monitor_service()
+        .owned_task_ids(&context.async_owner())
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    background_ids.sort();
+    workflow_ids.sort();
+    monitor_ids.sort();
+
+    let (cron_jobs, wakeup) = if context.agent_depth() == 0 {
+        let cron = context.cron_service();
+        (cron.list()?, cron.current_wakeup()?)
+    } else {
+        (Vec::new(), None)
+    };
+
+    let mut snapshot = SnapshotBuilder::default();
+    let visible_tasks = store
+        .tasks
+        .iter()
+        .filter(|task| task.metadata.get("_internal").and_then(Value::as_bool) != Some(true));
+    snapshot.extend_limited(visible_tasks, |task| {
+        bounded_ui_item(
+            TaskUiItemKind::PersistentTask,
+            &task.id,
+            &task.subject,
+            task.active_form.as_deref(),
+            task_ui_status(&task.status),
+        )
+    });
+    snapshot.extend_limited(todos.iter().enumerate(), |(index, todo)| {
+        bounded_ui_item(
+            TaskUiItemKind::Todo,
+            &format!("todo-{}", index + 1),
+            &todo.content,
+            Some(&todo.active_form),
+            task_ui_status(&todo.status),
+        )
+    });
+    snapshot.extend_limited(background_ids.iter(), |id| {
+        bounded_ui_item(
+            TaskUiItemKind::BackgroundTask,
+            id,
+            "Background task",
+            None,
+            TaskUiStatus::Tracked,
+        )
+    });
+    snapshot.extend_limited(workflow_ids.iter(), |id| {
+        bounded_ui_item(
+            TaskUiItemKind::WorkflowTask,
+            id,
+            "Workflow task",
+            None,
+            TaskUiStatus::Tracked,
+        )
+    });
+    snapshot.extend_limited(monitor_ids.iter(), |id| {
+        bounded_ui_item(
+            TaskUiItemKind::MonitorTask,
+            id,
+            "Monitor task",
+            None,
+            TaskUiStatus::Tracked,
+        )
+    });
+    snapshot.extend_limited(cron_jobs.iter(), |job| {
+        let detail = format!(
+            "{}; {}; {}; next={}",
+            job.human_schedule,
+            if job.recurring {
+                "recurring"
+            } else {
+                "one-shot"
+            },
+            if job.durable {
+                "durable"
+            } else {
+                "session-only"
+            },
+            job.next_fire_at_ms
+        );
+        bounded_ui_item(
+            TaskUiItemKind::CronJob,
+            &job.id,
+            &job.prompt,
+            Some(&detail),
+            TaskUiStatus::Scheduled,
+        )
+    });
+    if let Some(job) = wakeup {
+        let detail = format!("{}; next={}", job.reason, job.scheduled_for_ms);
+        snapshot.push(bounded_ui_item(
+            TaskUiItemKind::DynamicWakeup,
+            &job.id,
+            &job.prompt,
+            Some(&detail),
+            TaskUiStatus::Scheduled,
+        ));
+    }
+    Ok(snapshot.finish())
+}
+
+fn task_ui_status(status: &str) -> TaskUiStatus {
+    match status {
+        "pending" => TaskUiStatus::Pending,
+        "in_progress" => TaskUiStatus::InProgress,
+        "completed" => TaskUiStatus::Completed,
+        _ => TaskUiStatus::Unknown,
+    }
+}
+
+fn bounded_ui_item(
+    kind: TaskUiItemKind,
+    id: &str,
+    title: &str,
+    detail: Option<&str>,
+    status: TaskUiStatus,
+) -> (TaskUiItem, bool) {
+    let (id, id_truncated) = bounded_ui_text(id, MAX_TASK_UI_ID_BYTES);
+    let (title, title_truncated) = bounded_ui_text(title, MAX_TASK_UI_TITLE_BYTES);
+    let (detail, detail_truncated) = detail.map_or((None, false), |detail| {
+        let (detail, truncated) = bounded_ui_text(detail, MAX_TASK_UI_DETAIL_BYTES);
+        (Some(detail), truncated)
+    });
+    (
+        TaskUiItem {
+            kind,
+            id,
+            title,
+            detail,
+            status,
+        },
+        id_truncated || title_truncated || detail_truncated,
+    )
+}
+
+fn bounded_ui_text(value: &str, max_bytes: usize) -> (String, bool) {
+    let mut output = String::with_capacity(value.len().min(max_bytes));
+    let mut truncated = false;
+    for character in value.trim().chars() {
+        let replacement = match character {
+            '\t' | '\r' | '\n' => ' ',
+            character if character.is_control() => '�',
+            character => character,
+        };
+        if output.len().saturating_add(replacement.len_utf8()) > max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push(replacement);
+    }
+    if truncated && max_bytes >= '…'.len_utf8() {
+        while output.len().saturating_add('…'.len_utf8()) > max_bytes {
+            output.pop();
+        }
+        output.push('…');
+    }
+    (output, truncated)
+}
+
+#[derive(Default)]
+struct SnapshotBuilder {
+    snapshot: TaskUiSnapshot,
+    bytes: usize,
+}
+
+impl SnapshotBuilder {
+    fn extend_limited<T>(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+        mut make_item: impl FnMut(T) -> (TaskUiItem, bool),
+    ) {
+        for (count, value) in values.into_iter().enumerate() {
+            if count == MAX_TASK_UI_ITEMS_PER_SOURCE {
+                self.snapshot.truncated = true;
+                break;
+            }
+            self.push(make_item(value));
+        }
+    }
+
+    fn push(&mut self, (item, field_truncated): (TaskUiItem, bool)) {
+        self.snapshot.truncated |= field_truncated;
+        let item_bytes = item
+            .id
+            .len()
+            .saturating_add(item.title.len())
+            .saturating_add(item.detail.as_ref().map_or(0, String::len))
+            .saturating_add(32);
+        if self.snapshot.items.len() >= MAX_TASK_UI_ITEMS
+            || self.bytes.saturating_add(item_bytes) > MAX_TASK_UI_SNAPSHOT_BYTES
+        {
+            self.snapshot.truncated = true;
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(item_bytes);
+        self.snapshot.items.push(item);
+    }
+
+    fn finish(self) -> TaskUiSnapshot {
+        self.snapshot
+    }
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TaskStore {
@@ -675,6 +959,105 @@ fn validate_metadata(metadata: &Map<String, Value>) -> Result<()> {
         bail!("metadata 超过 {MAX_METADATA_BYTES} 字节限制")
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::permissions::{PermissionManager, PermissionMode};
+
+    fn test_context(workspace: &std::path::Path) -> ToolContext {
+        let root = ToolContext::new(
+            workspace.to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        root.set_task_store_path(workspace.join("tasks.json"));
+        // Agent contexts intentionally cannot see root cron jobs. Using one
+        // keeps this unit test isolated from the real per-user durable store.
+        root.fork_for_agent()
+    }
+
+    fn task(id: &str, subject: String, status: &str) -> TaskItem {
+        TaskItem {
+            id: id.to_owned(),
+            subject,
+            description: "private long description is not part of the UI snapshot".to_owned(),
+            active_form: Some("Working safely".to_owned()),
+            status: status.to_owned(),
+            owner: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+            metadata: Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_snapshot_reads_persistent_tasks_and_todos_without_tool_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = test_context(temp.path());
+        let mut hidden = task("2", "hidden".to_owned(), "pending");
+        hidden.metadata.insert("_internal".to_owned(), json!(true));
+        let subject = format!("visible\n\u{1b}{}", "界".repeat(300));
+        save_store(
+            &context,
+            &TaskStore {
+                next_id: 3,
+                tasks: vec![task("1", subject, "in_progress"), hidden],
+            },
+        )
+        .unwrap();
+        *context.todos.lock().await = vec![TodoItem {
+            content: "review snapshot".to_owned(),
+            status: "pending".to_owned(),
+            active_form: "Reviewing snapshot".to_owned(),
+        }];
+
+        let snapshot = context.task_ui_snapshot().await.unwrap();
+        assert_eq!(snapshot.items.len(), 2);
+        assert!(snapshot.truncated);
+        let persistent = &snapshot.items[0];
+        assert_eq!(persistent.kind, TaskUiItemKind::PersistentTask);
+        assert_eq!(persistent.status, TaskUiStatus::InProgress);
+        assert!(persistent.title.len() <= MAX_TASK_UI_TITLE_BYTES);
+        assert!(
+            !persistent
+                .title
+                .chars()
+                .any(|character| matches!(character, '\n' | '\r' | '\u{1b}'))
+        );
+        assert_eq!(persistent.detail.as_deref(), Some("Working safely"));
+        assert!(
+            !serde_json::to_string(persistent)
+                .unwrap()
+                .contains("private long description")
+        );
+        let todo = &snapshot.items[1];
+        assert_eq!(todo.kind, TaskUiItemKind::Todo);
+        assert_eq!(todo.id, "todo-1");
+        assert_eq!(todo.status, TaskUiStatus::Pending);
+    }
+
+    #[test]
+    fn ui_snapshot_caps_each_source_and_reports_omissions() {
+        let mut builder = SnapshotBuilder::default();
+        builder.extend_limited(0..=MAX_TASK_UI_ITEMS_PER_SOURCE, |index| {
+            bounded_ui_item(
+                TaskUiItemKind::BackgroundTask,
+                &format!("task-{index}"),
+                "Background task",
+                None,
+                TaskUiStatus::Tracked,
+            )
+        });
+        let snapshot = builder.finish();
+        assert_eq!(snapshot.items.len(), MAX_TASK_UI_ITEMS_PER_SOURCE);
+        assert!(snapshot.truncated);
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -7,7 +7,13 @@ use std::{
 use anyhow::{Result, bail};
 use clap::ValueEnum;
 use globset::GlobBuilder;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub const MAX_USER_PERMISSION_RULES: usize = 256;
+pub const MAX_USER_PERMISSION_RULE_BYTES: usize = 512;
+pub const MAX_RECENT_PERMISSION_PROMPTS: usize = 64;
+pub const MAX_RECENT_PERMISSION_SUMMARY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PermissionMode {
@@ -56,6 +62,49 @@ pub struct PermissionRequest {
     pub outside_workspace: bool,
 }
 
+/// User-authored permission rules persisted by the private UI settings store.
+/// Overlaps are resolved at evaluation time as deny, then ask, then allow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserPermissionRules {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl UserPermissionRules {
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let total = self
+            .allow
+            .len()
+            .saturating_add(self.ask.len())
+            .saturating_add(self.deny.len());
+        if total > MAX_USER_PERMISSION_RULES {
+            bail!("permissionRules exceeds the {MAX_USER_PERMISSION_RULES}-rule limit")
+        }
+        validate_user_rule_list("allow", &self.allow)?;
+        validate_user_rule_list("ask", &self.ask)?;
+        validate_user_rule_list("deny", &self.deny)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentPermissionPrompt {
+    pub tool: String,
+    pub summary: String,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub outside_workspace: bool,
+}
+
 #[derive(Clone)]
 pub struct PermissionManager {
     pub mode: PermissionMode,
@@ -66,6 +115,8 @@ pub struct PermissionManager {
     session_mode: Arc<RwLock<Option<PermissionMode>>>,
     workspace_deny: Arc<RwLock<Vec<String>>>,
     prompt_handler: Arc<RwLock<Option<PermissionPromptHandler>>>,
+    user_rules: Arc<RwLock<UserPermissionRules>>,
+    recent_prompts: Arc<RwLock<VecDeque<RecentPermissionPrompt>>>,
 }
 
 impl fmt::Debug for PermissionManager {
@@ -76,6 +127,7 @@ impl fmt::Debug for PermissionManager {
             .field("interactive", &self.interactive)
             .field("allow", &self.allow)
             .field("deny", &self.deny)
+            .field("user_rules", &self.user_rules())
             .finish_non_exhaustive()
     }
 }
@@ -92,7 +144,8 @@ pub enum PermissionDecision {
 /// spellings of the same object (for example canonical absolute and
 /// workspace-relative file paths). A matching deny rule on any spelling wins;
 /// an allow rule may match any spelling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionTarget {
     pub tool: String,
     pub candidates: Vec<String>,
@@ -102,6 +155,23 @@ pub struct PermissionTarget {
 struct SessionGrant {
     invocation_tool: String,
     targets: Vec<PermissionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionSessionGrantView {
+    pub invocation_tool: String,
+    pub targets: Vec<PermissionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRuleCatalog {
+    pub trusted_allow: Vec<String>,
+    pub trusted_deny: Vec<String>,
+    pub user: UserPermissionRules,
+    pub workspace_deny: Vec<String>,
+    pub session_grants: Vec<PermissionSessionGrantView>,
 }
 
 impl PermissionTarget {
@@ -129,6 +199,57 @@ impl PermissionManager {
             session_mode: Arc::new(RwLock::new(None)),
             workspace_deny: Arc::new(RwLock::new(Vec::new())),
             prompt_handler: Arc::new(RwLock::new(None)),
+            user_rules: Arc::new(RwLock::new(UserPermissionRules::default())),
+            recent_prompts: Arc::new(RwLock::new(VecDeque::new())),
+        }
+    }
+
+    /// Replaces all user-authored rules atomically after bounded validation.
+    pub fn set_user_rules(&self, rules: UserPermissionRules) -> Result<()> {
+        rules.validate()?;
+        *self
+            .user_rules
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rules;
+        Ok(())
+    }
+
+    pub fn user_rules(&self) -> UserPermissionRules {
+        self.user_rules
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Returns newest-first public summaries. Raw input and tool-use IDs are
+    /// deliberately never retained by this in-memory history.
+    pub fn recent_permission_prompts(&self) -> Vec<RecentPermissionPrompt> {
+        self.recent_prompts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Groups rules by origin for a `/permissions` UI.
+    pub fn permission_rule_catalog(&self) -> PermissionRuleCatalog {
+        let session_grants = self
+            .session_grants
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|grant| PermissionSessionGrantView {
+                invocation_tool: grant.invocation_tool.clone(),
+                targets: grant.targets.clone(),
+            })
+            .collect();
+        PermissionRuleCatalog {
+            trusted_allow: self.allow.clone(),
+            trusted_deny: self.deny.clone(),
+            user: self.user_rules(),
+            workspace_deny: self.workspace_deny_rules(),
+            session_grants,
         }
     }
 
@@ -166,6 +287,8 @@ impl PermissionManager {
             session_mode: Arc::clone(&self.session_mode),
             workspace_deny: Arc::new(RwLock::new(self.workspace_deny_rules())),
             prompt_handler: Arc::clone(&self.prompt_handler),
+            user_rules: Arc::clone(&self.user_rules),
+            recent_prompts: Arc::clone(&self.recent_prompts),
         }
     }
 
@@ -328,8 +451,16 @@ impl PermissionManager {
             .workspace_deny
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user_rules = self.user_rules();
         if invocation_matches_rules(&self.deny, tool, summary, targets, RuleBehavior::Deny)
             || invocation_matches_rules(&workspace_deny, tool, summary, targets, RuleBehavior::Deny)
+            || invocation_matches_rules(
+                &user_rules.deny,
+                tool,
+                summary,
+                targets,
+                RuleBehavior::Deny,
+            )
         {
             return Ok(PermissionDecision::Deny);
         }
@@ -341,11 +472,38 @@ impl PermissionManager {
                 PermissionDecision::Deny
             });
         }
-        if invocation_matches_rules(&self.allow, tool, summary, targets, RuleBehavior::Allow) {
+        let user_asks =
+            invocation_matches_rules(&user_rules.ask, tool, summary, targets, RuleBehavior::Allow);
+        if !user_asks
+            && (invocation_matches_rules(&self.allow, tool, summary, targets, RuleBehavior::Allow)
+                || invocation_matches_rules(
+                    &user_rules.allow,
+                    tool,
+                    summary,
+                    targets,
+                    RuleBehavior::Allow,
+                ))
+        {
             return Ok(PermissionDecision::Allow);
         }
-        if self.invocation_matches_session_grant(tool, targets) {
+        if !user_asks && self.invocation_matches_session_grant(tool, targets) {
             return Ok(PermissionDecision::Allow);
+        }
+        if user_asks {
+            return if mode == PermissionMode::DontAsk {
+                Ok(PermissionDecision::Deny)
+            } else {
+                self.request_permission(
+                    tool,
+                    input,
+                    tool_use_id,
+                    summary,
+                    read_only,
+                    destructive,
+                    outside_workspace,
+                    targets,
+                )
+            };
         }
         match mode {
             PermissionMode::BypassPermissions => Ok(PermissionDecision::Allow),
@@ -359,58 +517,101 @@ impl PermissionManager {
                 Ok(PermissionDecision::Allow)
             }
             PermissionMode::DontAsk => Ok(PermissionDecision::Deny),
-            PermissionMode::Default | PermissionMode::AcceptEdits => {
-                let request = PermissionRequest {
-                    tool: tool.to_owned(),
-                    input: input.clone(),
-                    tool_use_id: tool_use_id.to_owned(),
-                    summary: summary.to_owned(),
-                    read_only,
-                    destructive,
-                    outside_workspace,
-                };
-                let handler = self
-                    .prompt_handler
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                if let Some(handler) = handler {
-                    return handler(&request);
+            PermissionMode::Default | PermissionMode::AcceptEdits => self.request_permission(
+                tool,
+                input,
+                tool_use_id,
+                summary,
+                read_only,
+                destructive,
+                outside_workspace,
+                targets,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_permission(
+        &self,
+        tool: &str,
+        input: &Value,
+        tool_use_id: &str,
+        summary: &str,
+        read_only: bool,
+        destructive: bool,
+        outside_workspace: bool,
+        targets: &[PermissionTarget],
+    ) -> Result<PermissionDecision> {
+        let request = PermissionRequest {
+            tool: tool.to_owned(),
+            input: input.clone(),
+            tool_use_id: tool_use_id.to_owned(),
+            summary: summary.to_owned(),
+            read_only,
+            destructive,
+            outside_workspace,
+        };
+        let handler = self
+            .prompt_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if handler.is_some() || self.interactive {
+            self.record_recent_prompt(tool, summary, read_only, destructive, outside_workspace);
+        }
+        if let Some(handler) = handler {
+            return handler(&request);
+        }
+        if !self.interactive {
+            return Ok(PermissionDecision::Deny);
+        }
+        let session_available = session_grant_is_bounded(tool, targets);
+        match prompt(tool, input, summary, session_available)? {
+            crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
+            crate::terminal::PermissionChoice::AllowForSession => {
+                if !session_available {
+                    return Ok(PermissionDecision::Deny);
                 }
-                if self.interactive {
-                    let session_available = session_grant_is_bounded(tool, targets);
-                    match prompt(tool, input, summary, session_available)? {
-                        crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
-                        crate::terminal::PermissionChoice::AllowForSession => {
-                            if !session_available {
-                                return Ok(PermissionDecision::Deny);
-                            }
-                            self.add_session_grant(tool, targets)?;
-                            // A project deny may have been hot-refreshed while the
-                            // user was deciding. Re-run the deny/plan boundary
-                            // before honoring the new exact grant.
-                            if self.invocation_blocked_by_deny_or_plan(
-                                tool,
-                                summary,
-                                read_only,
-                                outside_workspace,
-                                targets,
-                            ) {
-                                Ok(PermissionDecision::Deny)
-                            } else {
-                                Ok(PermissionDecision::Allow)
-                            }
-                        }
-                        crate::terminal::PermissionChoice::Deny => Ok(PermissionDecision::Deny),
-                        crate::terminal::PermissionChoice::Interrupt => {
-                            Ok(PermissionDecision::Interrupt)
-                        }
-                    }
-                } else {
+                self.add_session_grant(tool, targets)?;
+                // Policy may have changed while the prompt was visible.
+                if self.invocation_blocked_by_deny_or_plan(
+                    tool,
+                    summary,
+                    read_only,
+                    outside_workspace,
+                    targets,
+                ) {
                     Ok(PermissionDecision::Deny)
+                } else {
+                    Ok(PermissionDecision::Allow)
                 }
             }
+            crate::terminal::PermissionChoice::Deny => Ok(PermissionDecision::Deny),
+            crate::terminal::PermissionChoice::Interrupt => Ok(PermissionDecision::Interrupt),
         }
+    }
+
+    fn record_recent_prompt(
+        &self,
+        tool: &str,
+        summary: &str,
+        read_only: bool,
+        destructive: bool,
+        outside_workspace: bool,
+    ) {
+        let prompt = RecentPermissionPrompt {
+            tool: sanitize_public_summary(tool, 128),
+            summary: sanitize_public_summary(summary, MAX_RECENT_PERMISSION_SUMMARY_BYTES),
+            read_only,
+            destructive,
+            outside_workspace,
+        };
+        let mut recent = self
+            .recent_prompts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recent.push_front(prompt);
+        recent.truncate(MAX_RECENT_PERMISSION_PROMPTS);
     }
 
     fn invocation_matches_session_grant(
@@ -479,8 +680,16 @@ impl PermissionManager {
             .workspace_deny
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user_rules = self.user_rules();
         invocation_matches_rules(&self.deny, tool, summary, targets, RuleBehavior::Deny)
             || invocation_matches_rules(&workspace_deny, tool, summary, targets, RuleBehavior::Deny)
+            || invocation_matches_rules(
+                &user_rules.deny,
+                tool,
+                summary,
+                targets,
+                RuleBehavior::Deny,
+            )
             || self.effective_mode() == PermissionMode::Plan && (outside_workspace || !read_only)
     }
 
@@ -512,8 +721,16 @@ impl PermissionManager {
             .workspace_deny
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user_rules = self.user_rules();
         if invocation_matches_rules(&self.deny, tool, summary, targets, RuleBehavior::Deny)
             || invocation_matches_rules(&workspace_deny, tool, summary, targets, RuleBehavior::Deny)
+            || invocation_matches_rules(
+                &user_rules.deny,
+                tool,
+                summary,
+                targets,
+                RuleBehavior::Deny,
+            )
         {
             return false;
         }
@@ -529,12 +746,22 @@ impl PermissionManager {
             .workspace_deny
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user_rules = self.user_rules();
         invocation_matches_rules(&self.deny, "Read", "", &targets, RuleBehavior::Deny)
             || invocation_matches_rules(&workspace_deny, "Read", "", &targets, RuleBehavior::Deny)
+            || invocation_matches_rules(&user_rules.deny, "Read", "", &targets, RuleBehavior::Deny)
     }
 
     pub(crate) fn has_read_deny_rules(&self) -> bool {
         if self
+            .deny
+            .iter()
+            .any(|rule| parse_rule(rule).tool.eq_ignore_ascii_case("Read"))
+        {
+            return true;
+        }
+        if self
+            .user_rules()
             .deny
             .iter()
             .any(|rule| parse_rule(rule).tool.eq_ignore_ascii_case("Read"))
@@ -547,6 +774,58 @@ impl PermissionManager {
             .iter()
             .any(|rule| parse_rule(rule).tool.eq_ignore_ascii_case("Read"))
     }
+}
+
+fn validate_user_rule_list(behavior: &str, rules: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for rule in rules {
+        if rule.is_empty() || rule != rule.trim() {
+            bail!("permissionRules.{behavior} contains an empty or untrimmed rule")
+        }
+        if rule.len() > MAX_USER_PERMISSION_RULE_BYTES {
+            bail!(
+                "permissionRules.{behavior} contains a rule exceeding the {MAX_USER_PERMISSION_RULE_BYTES}-byte limit"
+            )
+        }
+        if rule.chars().any(char::is_control) {
+            bail!("permissionRules.{behavior} contains a control character")
+        }
+        let parsed = parse_rule(rule);
+        if parsed.tool.is_empty()
+            || !parsed.tool.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'*')
+            })
+            || (rule.contains('(') && !rule.ends_with(')'))
+            || (!rule.contains('(') && rule.contains(')'))
+        {
+            bail!("permissionRules.{behavior} contains an invalid rule")
+        }
+        if !seen.insert(rule) {
+            bail!("permissionRules.{behavior} contains a duplicate rule")
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_public_summary(value: &str, max_bytes: usize) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() <= max_bytes {
+        return sanitized;
+    }
+    let mut end = max_bytes;
+    while !sanitized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    sanitized[..end].to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3151,5 +3430,145 @@ mod tests {
             PermissionDecision::Deny,
             "a future invocation must match the complete normalized target set"
         );
+    }
+
+    #[test]
+    fn dynamic_user_rules_are_transactional_shared_and_deny_ask_allow_ordered() {
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let manager = PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            vec!["Write(*)".to_owned()],
+            Vec::new(),
+        );
+        let prompt_count = Arc::clone(&prompts);
+        manager.set_prompt_handler(Some(Arc::new(move |_| {
+            prompt_count.fetch_add(1, Ordering::SeqCst);
+            Ok(PermissionDecision::Allow)
+        })));
+        manager
+            .set_user_rules(UserPermissionRules {
+                allow: vec!["Bash(cargo:*)".to_owned(), "Write(*)".to_owned()],
+                ask: vec!["Write(*)".to_owned(), "Read(*)".to_owned()],
+                deny: vec!["Write(secret.txt)".to_owned()],
+            })
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .decide("Write", "secret.txt", false, true, false)
+                .unwrap(),
+            PermissionDecision::Deny,
+            "deny must override ask, user allow, trusted allow, and bypass"
+        );
+        assert_eq!(
+            manager
+                .decide("Write", "notes.txt", false, true, false)
+                .unwrap(),
+            PermissionDecision::Allow,
+            "ask must invoke the handler before either allow surface"
+        );
+        assert_eq!(
+            manager
+                .decide("Read", "workspace.txt", true, false, false)
+                .unwrap(),
+            PermissionDecision::Allow,
+            "ask must override the automatic safe-read path"
+        );
+        assert_eq!(
+            manager
+                .decide("Bash", "cargo test", false, false, false)
+                .unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompts.load(Ordering::SeqCst), 2);
+
+        let observer = manager.fork_for_context();
+        assert_eq!(observer.user_rules(), manager.user_rules());
+        let before = manager.user_rules();
+        assert!(
+            manager
+                .set_user_rules(UserPermissionRules {
+                    allow: vec![" bad".to_owned()],
+                    ask: Vec::new(),
+                    deny: Vec::new(),
+                })
+                .is_err()
+        );
+        assert_eq!(manager.user_rules(), before, "invalid updates are atomic");
+    }
+
+    #[test]
+    fn user_rule_validation_is_strict_and_bounded() {
+        for invalid in [
+            UserPermissionRules {
+                allow: vec!["Read(foo".to_owned()],
+                ..UserPermissionRules::default()
+            },
+            UserPermissionRules {
+                ask: vec!["Read(foo)\n".to_owned()],
+                ..UserPermissionRules::default()
+            },
+            UserPermissionRules {
+                deny: vec!["Read(foo)".to_owned(), "Read(foo)".to_owned()],
+                ..UserPermissionRules::default()
+            },
+            UserPermissionRules {
+                allow: vec!["X".repeat(MAX_USER_PERMISSION_RULE_BYTES + 1)],
+                ..UserPermissionRules::default()
+            },
+            UserPermissionRules {
+                ask: vec!["Read".to_owned(); MAX_USER_PERMISSION_RULES + 1],
+                ..UserPermissionRules::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        UserPermissionRules {
+            allow: vec!["Bash(printf ')' && cargo test)".to_owned()],
+            ask: vec!["mcp__server__tool(*)".to_owned()],
+            deny: vec!["Read(secrets/**)".to_owned()],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn recent_prompt_history_is_memory_only_sanitized_and_bounded() {
+        let manager = PermissionManager::new(PermissionMode::Default, false, vec![], vec![]);
+        manager.set_prompt_handler(Some(Arc::new(|_| Ok(PermissionDecision::Deny))));
+        for index in 0..=MAX_RECENT_PERMISSION_PROMPTS {
+            manager
+                .decide_invocation(
+                    "Write\nTool",
+                    &serde_json::json!({"secret": "never retain this input"}),
+                    "private-tool-use-id",
+                    &format!("{index}:{}\nend", "界".repeat(300)),
+                    false,
+                    true,
+                    false,
+                )
+                .unwrap();
+        }
+        let recent = manager.recent_permission_prompts();
+        assert_eq!(recent.len(), MAX_RECENT_PERMISSION_PROMPTS);
+        assert!(
+            recent[0]
+                .summary
+                .starts_with(&MAX_RECENT_PERMISSION_PROMPTS.to_string())
+        );
+        assert!(recent.iter().all(|item| {
+            item.summary.len() <= MAX_RECENT_PERMISSION_SUMMARY_BYTES
+                && !item.summary.contains('\n')
+                && !item.tool.contains('\n')
+        }));
+
+        let targets = vec![PermissionTarget::new("Bash", vec!["cargo test".to_owned()])];
+        manager.add_session_grant("Bash", &targets).unwrap();
+        manager.set_workspace_deny(vec!["Read(.env)".to_owned()]);
+        let catalog = manager.permission_rule_catalog();
+        assert_eq!(catalog.workspace_deny, vec!["Read(.env)"]);
+        assert_eq!(catalog.session_grants.len(), 1);
+        assert_eq!(catalog.session_grants[0].targets, targets);
     }
 }

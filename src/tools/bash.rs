@@ -714,8 +714,12 @@ async fn spawn_background(
     command_text: String,
     timeout_ms: u64,
 ) -> Result<ToolOutput> {
-    if context.tasks.lock().await.len() >= MAX_BACKGROUND_TASKS {
-        bail!("后台任务达到 {MAX_BACKGROUND_TASKS} 个限制；请先读取或停止已有任务")
+    {
+        let mut tasks = context.tasks.lock().await;
+        reclaim_completed_tasks(&mut tasks)?;
+        if tasks.len() >= MAX_BACKGROUND_TASKS {
+            bail!("后台任务达到 {MAX_BACKGROUND_TASKS} 个限制；请先读取或停止已有任务")
+        }
     }
     let id = Uuid::new_v4().to_string();
     let (mut command, sandbox_warning) = shell_command(context, shell, &command_text, None)?;
@@ -743,6 +747,7 @@ async fn spawn_background(
         notification_delivered: false,
     };
     let mut tasks = context.tasks.lock().await;
+    reclaim_completed_tasks(&mut tasks)?;
     if tasks.len() >= MAX_BACKGROUND_TASKS {
         terminate_task(&mut task).await;
         bail!("后台任务达到 {MAX_BACKGROUND_TASKS} 个限制；请先读取或停止已有任务")
@@ -785,6 +790,27 @@ async fn spawn_background(
     );
     append_sandbox_warning(&mut response, sandbox_warning.as_deref());
     Ok(ToolOutput::success(response))
+}
+
+fn reclaim_completed_tasks(
+    tasks: &mut std::collections::HashMap<String, BackgroundTask>,
+) -> Result<()> {
+    if tasks.len() < MAX_BACKGROUND_TASKS {
+        return Ok(());
+    }
+    let mut completed = Vec::new();
+    for (id, task) in tasks.iter_mut() {
+        if task.child.try_wait()?.is_some()
+            && task.drains.iter().all(tokio::task::JoinHandle::is_finished)
+        {
+            completed.push(id.clone());
+        }
+    }
+    completed.sort_unstable();
+    for id in completed {
+        tasks.remove(&id);
+    }
+    Ok(())
 }
 
 pub(crate) fn shell_command(
@@ -1681,6 +1707,37 @@ mod tests {
             .await
             .unwrap();
         assert!(polled.content.contains("notification-result"));
+    }
+
+    #[tokio::test]
+    async fn completed_background_output_can_be_read_repeatedly() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = test_context(workspace.path());
+        let started = BashTool
+            .execute(
+                &context,
+                json!({"command":"printf reusable-result", "run_in_background":true}),
+            )
+            .await
+            .unwrap();
+        let id = background_id(&started);
+
+        let first = TaskOutputTool
+            .execute(
+                &context,
+                json!({"task_id":id, "block":true, "timeout":10_000}),
+            )
+            .await
+            .unwrap();
+        let second = TaskOutputTool
+            .execute(&context, json!({"task_id":id, "block":false, "timeout":0}))
+            .await
+            .unwrap();
+
+        assert!(first.content.contains("reusable-result"));
+        assert_eq!(second.content, first.content);
+        assert!(context.tasks.lock().await.contains_key(&id));
+        context.shutdown_background_tasks().await;
     }
 
     #[tokio::test]

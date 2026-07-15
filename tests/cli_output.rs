@@ -101,11 +101,11 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
     };
     assert_eq!(response("init-camel")["response"]["subtype"], "success");
     assert_eq!(
-        response("mcp-status")["response"]["response"]["servers"],
+        response("mcp-status")["response"]["response"]["mcpServers"],
         serde_json::json!([])
     );
     assert_eq!(
-        response("settings-status")["response"]["response"]["memory_enabled"],
+        response("settings-status")["response"]["response"]["effective"]["memoryEnabled"],
         false
     );
 }

@@ -56,6 +56,11 @@ const RESERVED_COMMANDS: &[&str] = &[
     "sandbox",
     "plugin",
     "help",
+    "add-dir",
+    "files",
+    "rename",
+    "branch",
+    "agents",
 ];
 
 const DEFAULT_LOOP_MINUTES: u64 = 10;
@@ -247,6 +252,12 @@ pub enum CommandOutcome {
     ToggleVim,
     ConfigureKeybindings,
     ShowDoctor,
+    ManagePermissions(String),
+    AddDirectory(String),
+    ShowFiles(String),
+    RenameSession(String),
+    BranchSession(String),
+    ShowAgents,
     TerminalSetup,
     ConfigureUi(String),
     ConfigureTheme(String),
@@ -311,10 +322,12 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             );
             CommandOutcome::Handled
         }
-        "/permissions" => {
-            println!("Permission mode: {:?}", engine.permission_mode());
-            CommandOutcome::Handled
-        }
+        "/permissions" => CommandOutcome::ManagePermissions(argument.to_owned()),
+        "/add-dir" => CommandOutcome::AddDirectory(argument.to_owned()),
+        "/files" => CommandOutcome::ShowFiles(argument.to_owned()),
+        "/rename" => CommandOutcome::RenameSession(argument.to_owned()),
+        "/branch" => CommandOutcome::BranchSession(argument.to_owned()),
+        "/agents" => CommandOutcome::ShowAgents,
         "/context" => {
             let (used, auto_threshold, effective_window) = engine.context_status();
             println!(

@@ -63,11 +63,22 @@ used to back-port behavior introduced after 2.1.207.
 - Tool results identify collapsed output with the Ctrl-O expansion path;
   permission prompts retain the exact JSON input and add bounded Bash, file,
   edit-diff, write and network summaries. Common modals repaint on resize.
-- Deliberate remaining boundaries: rich Markdown/table/syntax rendering in the
-  primary stream, tool-specific clickable result expansion, a persistent
-  add/remove permission-rule manager, a live task-tree footer/dialog, clickable
-  file/URL links, custom themes, and exact proprietary modal layout/wording.
-  These are not claimed as complete product parity.
+- The primary stream renders a control-sanitized Markdown IR with headings,
+  lists, quotes, code fences, optional syntax highlighting and width-safe
+  tables. Fullscreen hit regions open credential-free HTTP(S) links, expand
+  bounded tool results, and open re-canonicalized files only inside trusted
+  workspace roots.
+- `/permissions`, `/config` and `/tasks` now use typed alternate-screen state
+  machines with search, navigation, cancellation and bounded frames. Permission
+  add/remove persists private user rules, tasks route stop/output through the
+  existing tool boundary, and the live footer is driven by the same bounded
+  snapshot. `/resume` switches sessions in-process; `/rename` and `/branch`
+  use strict private metadata. `/mcp enable|disable` operates only on trusted
+  preconfigured servers and refreshes discovery.
+- Deliberate remaining boundaries: custom user-authored themes, private usage-
+  frequency ranking, vendor-only command/model/account surfaces, and exact
+  proprietary modal layout/wording. These are not claimed as complete product
+  parity.
 
 ## Explicit exclusions
 

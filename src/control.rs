@@ -30,6 +30,39 @@ const NEXT_INBOUND_CAPACITY: usize = 24;
 const LATER_INBOUND_CAPACITY: usize = 8;
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CONTROL_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_CONTROL_COLLECTION_ITEMS: usize = 256;
+const MAX_CONTROL_NAME_BYTES: usize = 512;
+const MAX_CONTROL_PROMPT_BYTES: usize = 512 * 1024;
+
+const SDK_HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "UserPromptSubmit",
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Setup",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
+    "Elicitation",
+    "ElicitationResult",
+    "ConfigChange",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "InstructionsLoaded",
+    "CwdChanged",
+    "FileChanged",
+];
 
 #[derive(Debug, thiserror::Error)]
 #[error("control request interrupted")]
@@ -431,6 +464,25 @@ impl ControlHandle {
                 "subtype": "error",
                 "request_id": request_id,
                 "error": error.into(),
+            }
+        }))
+    }
+
+    pub fn respond_unsupported(
+        &self,
+        request_id: &str,
+        operation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.emit(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": request_id,
+                "error": reason,
+                "code": "unsupported_control_operation",
+                "operation": operation,
+                "supported": false,
             }
         }))
     }
@@ -1060,6 +1112,7 @@ fn parse_inbound(value: Value) -> Result<ParsedInbound> {
             if request.get("subtype").and_then(Value::as_str).is_none() {
                 bail!("control_request.request 缺少 subtype")
             }
+            validate_control_request(&request)?;
             Ok(ParsedInbound::Message(InboundMessage::ControlRequest {
                 request_id,
                 request,
@@ -1110,6 +1163,246 @@ fn parse_inbound(value: Value) -> Result<ParsedInbound> {
         "keep_alive" => Ok(ParsedInbound::Ignore),
         other => bail!("不支持的 stream-json type: {other}"),
     }
+}
+
+fn validate_control_request(request: &Value) -> Result<()> {
+    let subtype = request
+        .get("subtype")
+        .and_then(Value::as_str)
+        .context("control_request.request 缺少 subtype")?;
+    match subtype {
+        "initialize" => validate_initialize_request(request),
+        "seed_read_state" => {
+            required_bounded_string(request, "path", 4096)?;
+            let mtime = request
+                .get("mtime")
+                .and_then(Value::as_f64)
+                .context("seed_read_state.mtime 必须是 number")?;
+            if !mtime.is_finite() || mtime < 0.0 {
+                bail!("seed_read_state.mtime 必须是非负有限数")
+            }
+            Ok(())
+        }
+        "mcp_reconnect" => {
+            required_bounded_string(request, "serverName", MAX_CONTROL_NAME_BYTES)?;
+            Ok(())
+        }
+        "mcp_toggle" => {
+            required_bounded_string(request, "serverName", MAX_CONTROL_NAME_BYTES)?;
+            request
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .context("mcp_toggle.enabled 必须是 boolean")?;
+            Ok(())
+        }
+        "mcp_set_servers" => {
+            let servers = request
+                .get("servers")
+                .and_then(Value::as_object)
+                .context("mcp_set_servers.servers 必须是 object")?;
+            if servers.len() > MAX_CONTROL_COLLECTION_ITEMS {
+                bail!("mcp_set_servers.servers 超过资源限制")
+            }
+            for (name, config) in servers {
+                validate_bounded_text("mcp_set_servers server name", name, MAX_CONTROL_NAME_BYTES)?;
+                if !config.is_object() {
+                    bail!("mcp_set_servers.servers.{name} 必须是 object")
+                }
+            }
+            Ok(())
+        }
+        "mcp_status" | "reload_plugins" | "get_settings" => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn validate_initialize_request(request: &Value) -> Result<()> {
+    for field in ["systemPrompt", "appendSystemPrompt"] {
+        if let Some(value) = request.get(field) {
+            let value = value
+                .as_str()
+                .with_context(|| format!("initialize.{field} 必须是 string"))?;
+            if value.len() > MAX_CONTROL_PROMPT_BYTES {
+                bail!("initialize.{field} 超过资源限制")
+            }
+        }
+    }
+    for field in ["promptSuggestions", "agentProgressSummaries"] {
+        if request.get(field).is_some_and(|value| !value.is_boolean()) {
+            bail!("initialize.{field} 必须是 boolean")
+        }
+    }
+    if request
+        .get("jsonSchema")
+        .is_some_and(|value| !value.is_object())
+    {
+        bail!("initialize.jsonSchema 必须是 object")
+    }
+    if let Some(servers) = request.get("sdkMcpServers") {
+        validate_string_array(
+            servers,
+            "initialize.sdkMcpServers",
+            MAX_CONTROL_COLLECTION_ITEMS,
+            MAX_CONTROL_NAME_BYTES,
+        )?;
+    }
+    if let Some(hooks) = request.get("hooks") {
+        validate_initialize_hooks(hooks)?;
+    }
+    if let Some(agents) = request.get("agents") {
+        validate_initialize_agents(agents)?;
+    }
+    Ok(())
+}
+
+fn validate_initialize_hooks(value: &Value) -> Result<()> {
+    let hooks = value
+        .as_object()
+        .context("initialize.hooks 必须是 object")?;
+    if hooks.len() > SDK_HOOK_EVENTS.len() {
+        bail!("initialize.hooks 超过资源限制")
+    }
+    for (event, matchers) in hooks {
+        if !SDK_HOOK_EVENTS.contains(&event.as_str()) {
+            bail!("initialize.hooks 包含未知 hook event: {event}")
+        }
+        let matchers = matchers
+            .as_array()
+            .with_context(|| format!("initialize.hooks.{event} 必须是 array"))?;
+        if matchers.len() > MAX_CONTROL_COLLECTION_ITEMS {
+            bail!("initialize.hooks.{event} 超过资源限制")
+        }
+        for matcher in matchers {
+            let matcher = matcher
+                .as_object()
+                .with_context(|| format!("initialize.hooks.{event} matcher 必须是 object"))?;
+            if let Some(pattern) = matcher.get("matcher") {
+                let pattern = pattern
+                    .as_str()
+                    .with_context(|| format!("initialize.hooks.{event}.matcher 必须是 string"))?;
+                validate_bounded_text("initialize hook matcher", pattern, 4096)?;
+            }
+            let callback_ids = matcher
+                .get("hookCallbackIds")
+                .with_context(|| format!("initialize.hooks.{event}.hookCallbackIds 缺失"))?;
+            validate_string_array(
+                callback_ids,
+                &format!("initialize.hooks.{event}.hookCallbackIds"),
+                MAX_CONTROL_COLLECTION_ITEMS,
+                MAX_CONTROL_NAME_BYTES,
+            )?;
+            if let Some(timeout) = matcher.get("timeout") {
+                let timeout = timeout
+                    .as_f64()
+                    .with_context(|| format!("initialize.hooks.{event}.timeout 必须是 number"))?;
+                if !timeout.is_finite() || timeout < 0.0 {
+                    bail!("initialize.hooks.{event}.timeout 必须是非负有限数")
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_initialize_agents(value: &Value) -> Result<()> {
+    let agents = value
+        .as_object()
+        .context("initialize.agents 必须是 object")?;
+    if agents.len() > MAX_CONTROL_COLLECTION_ITEMS {
+        bail!("initialize.agents 超过资源限制")
+    }
+    for (name, definition) in agents {
+        validate_bounded_text("initialize agent name", name, MAX_CONTROL_NAME_BYTES)?;
+        let definition = definition
+            .as_object()
+            .with_context(|| format!("initialize.agents.{name} 必须是 object"))?;
+        for field in ["description", "prompt"] {
+            let text = definition
+                .get(field)
+                .and_then(Value::as_str)
+                .with_context(|| format!("initialize.agents.{name}.{field} 必须是 string"))?;
+            if text.len() > MAX_CONTROL_PROMPT_BYTES {
+                bail!("initialize.agents.{name}.{field} 超过资源限制")
+            }
+        }
+        for field in ["tools", "disallowedTools", "skills"] {
+            if let Some(values) = definition.get(field) {
+                validate_string_array(
+                    values,
+                    &format!("initialize.agents.{name}.{field}"),
+                    MAX_CONTROL_COLLECTION_ITEMS,
+                    MAX_CONTROL_NAME_BYTES,
+                )?;
+            }
+        }
+        for field in [
+            "model",
+            "criticalSystemReminder_EXPERIMENTAL",
+            "initialPrompt",
+        ] {
+            if let Some(text) = definition.get(field) {
+                let text = text
+                    .as_str()
+                    .with_context(|| format!("initialize.agents.{name}.{field} 必须是 string"))?;
+                if text.len() > MAX_CONTROL_PROMPT_BYTES {
+                    bail!("initialize.agents.{name}.{field} 超过资源限制")
+                }
+            }
+        }
+        if definition
+            .get("background")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            bail!("initialize.agents.{name}.background 必须是 boolean")
+        }
+        if let Some(max_turns) = definition.get("maxTurns") {
+            if max_turns.as_u64().is_none_or(|turns| turns == 0) {
+                bail!("initialize.agents.{name}.maxTurns 必须是正整数")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_array(
+    value: &Value,
+    field: &str,
+    max_items: usize,
+    max_string_bytes: usize,
+) -> Result<()> {
+    let values = value
+        .as_array()
+        .with_context(|| format!("{field} 必须是 array"))?;
+    if values.len() > max_items {
+        bail!("{field} 超过资源限制")
+    }
+    for value in values {
+        let value = value
+            .as_str()
+            .with_context(|| format!("{field} 必须只包含 string"))?;
+        validate_bounded_text(field, value, max_string_bytes)?;
+    }
+    Ok(())
+}
+
+fn required_bounded_string<'a>(
+    request: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str> {
+    let value = request
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("缺少 {field} 或字段不是 string"))?;
+    validate_bounded_text(field, value, max_bytes)?;
+    Ok(value)
+}
+
+fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        bail!("{field} 长度必须为 1..={max_bytes} 字节且不得含控制字符")
+    }
+    Ok(())
 }
 
 fn bounded_string_alias(
@@ -1633,6 +1926,163 @@ mod tests {
         };
         assert_eq!(request_id, "r1");
         assert_eq!(response["response"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn initialize_payload_accepts_provider_neutral_sdk_fields() {
+        let parsed = parse_inbound(json!({
+            "type":"control_request",
+            "request_id":"init-1",
+            "request":{
+                "subtype":"initialize",
+                "hooks":{
+                    "PreToolUse":[{
+                        "matcher":"Write|Edit",
+                        "hookCallbackIds":["callback-1"],
+                        "timeout":30
+                    }]
+                },
+                "sdkMcpServers":["filesystem"],
+                "jsonSchema":{"type":"object"},
+                "systemPrompt":"system",
+                "appendSystemPrompt":"append",
+                "agents":{
+                    "reviewer":{
+                        "description":"Reviews changes",
+                        "prompt":"Review this workspace",
+                        "tools":["Read", "Grep"],
+                        "model":"inherit",
+                        "maxTurns":3,
+                        "background":false
+                    }
+                },
+                "promptSuggestions":true,
+                "agentProgressSummaries":false
+            }
+        }))
+        .unwrap();
+        let ParsedInbound::Message(InboundMessage::ControlRequest { request, .. }) = parsed else {
+            panic!("expected control request")
+        };
+        assert_eq!(request["sdkMcpServers"][0], "filesystem");
+        assert_eq!(request["agents"]["reviewer"]["maxTurns"], 3);
+    }
+
+    #[test]
+    fn initialize_payload_rejects_invalid_nested_fields_and_collection_overflow() {
+        let invalid_hook = parse_inbound(json!({
+            "type":"control_request", "request_id":"init-bad-hook",
+            "request":{
+                "subtype":"initialize",
+                "hooks":{"PreToolUse":[{"hookCallbackIds":[7]}]}
+            }
+        }))
+        .err()
+        .expect("invalid hook must be rejected");
+        assert!(format!("{invalid_hook:#}").contains("hookCallbackIds"));
+
+        let invalid_agent = parse_inbound(json!({
+            "type":"control_request", "request_id":"init-bad-agent",
+            "request":{
+                "subtype":"initialize",
+                "agents":{"reviewer":{"description":"missing prompt"}}
+            }
+        }))
+        .err()
+        .expect("invalid agent must be rejected");
+        assert!(format!("{invalid_agent:#}").contains("prompt"));
+
+        let at_limit = (0..MAX_CONTROL_COLLECTION_ITEMS)
+            .map(|index| format!("callback-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_inbound(json!({
+                "type":"control_request", "request_id":"init-limit",
+                "request":{
+                    "subtype":"initialize",
+                    "hooks":{"PreToolUse":[{"hookCallbackIds":at_limit}]}
+                }
+            }))
+            .is_ok()
+        );
+        let over_limit = (0..=MAX_CONTROL_COLLECTION_ITEMS)
+            .map(|index| format!("callback-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_inbound(json!({
+                "type":"control_request", "request_id":"init-over-limit",
+                "request":{
+                    "subtype":"initialize",
+                    "hooks":{"PreToolUse":[{"hookCallbackIds":over_limit}]}
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn control_p1_request_fields_use_reference_names_and_types() {
+        for request in [
+            json!({"subtype":"seed_read_state", "path":"src/lib.rs", "mtime":1234}),
+            json!({"subtype":"mcp_status"}),
+            json!({"subtype":"mcp_reconnect", "serverName":"filesystem"}),
+            json!({"subtype":"get_settings"}),
+            json!({"subtype":"mcp_set_servers", "servers":{}}),
+            json!({"subtype":"mcp_toggle", "serverName":"filesystem", "enabled":false}),
+            json!({"subtype":"reload_plugins"}),
+        ] {
+            assert!(
+                parse_inbound(json!({
+                    "type":"control_request", "request_id":"p1", "request":request
+                }))
+                .is_ok()
+            );
+        }
+
+        let reconnect_alias = parse_inbound(json!({
+            "type":"control_request", "request_id":"bad-reconnect",
+            "request":{"subtype":"mcp_reconnect", "server":"filesystem"}
+        }))
+        .err()
+        .expect("legacy reconnect field must be rejected");
+        assert!(format!("{reconnect_alias:#}").contains("serverName"));
+        assert!(
+            parse_inbound(json!({
+                "type":"control_request", "request_id":"bad-mtime",
+                "request":{"subtype":"seed_read_state", "path":"src/lib.rs", "mtime":-1}
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_inbound(json!({
+                "type":"control_request", "request_id":"bad-toggle",
+                "request":{"subtype":"mcp_toggle", "serverName":"filesystem", "enabled":"yes"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_control_response_is_machine_readable() {
+        let output = SharedWriter::default();
+        let session = ControlSession::with_io(Cursor::new(Vec::<u8>::new()), output.clone());
+        session
+            .handle()
+            .respond_unsupported(
+                "unsupported-1",
+                "reload_plugins",
+                "runtime reload is unavailable",
+            )
+            .unwrap();
+        let response: Value = serde_json::from_slice(&output.wait_line()).unwrap();
+        assert_eq!(response["response"]["subtype"], "error");
+        assert_eq!(
+            response["response"]["code"],
+            "unsupported_control_operation"
+        );
+        assert_eq!(response["response"]["operation"], "reload_plugins");
+        assert_eq!(response["response"]["supported"], false);
     }
 
     #[test]

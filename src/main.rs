@@ -47,10 +47,20 @@ use open_agent_harness::{
     structured_output::StructuredOutputTool,
     terminal::{
         ConversationUi, FileSuggestion, InputEditor, InputReadActions, InputReadContext,
-        ModelPickerOutcome, SlashCommandSuggestion, TuiMode, open_file_in_external_editor,
-        select_model, select_rewind_checkpoint, select_theme, view_transcript,
+        ModelPickerOutcome, SlashCommandSuggestion, TaskUiUpdate, TuiMode, configure_ui_dialog,
+        manage_permissions_dialog, open_file_in_external_editor, select_model,
+        select_rewind_checkpoint, select_theme, show_tasks_dialog, view_transcript,
     },
-    tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
+    terminal_dialogs::{
+        PermissionDialogData, PermissionDialogItem, PermissionManagerAction,
+        PermissionManagerDialog, PermissionTab, SettingItem, SettingValue, SettingsDialog,
+        SettingsDialogAction, SettingsSnapshot, TaskCategory, TaskDialog, TaskDialogAction,
+        TaskDialogItem, TaskState,
+    },
+    tools::{
+        MemoryTool, TaskUiItem, TaskUiItemKind, TaskUiStatus, TeamTool, ToolContext, ToolRegistry,
+        ToolService,
+    },
     types::{Message, Role},
     ui_settings::{
         EditorMode, ThemePreset, TuiMode as PersistedTuiMode, UiSettingSource, UiSettings,
@@ -83,6 +93,78 @@ fn main() {
 #[derive(Debug, thiserror::Error)]
 #[error("turn interrupted by user")]
 struct CliInterrupted;
+
+struct TaskUiMonitor {
+    snapshot: Arc<Mutex<TaskUiUpdate>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl TaskUiMonitor {
+    fn start(context: ToolContext) -> Self {
+        let snapshot = Arc::new(Mutex::new(TaskUiUpdate::default()));
+        let output = Arc::clone(&snapshot);
+        let worker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Ok(snapshot) = context.task_ui_snapshot().await else {
+                    continue;
+                };
+                let active_count = snapshot
+                    .items
+                    .iter()
+                    .filter(|item| item.status != TaskUiStatus::Completed)
+                    .count();
+                let mut lines = snapshot
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let marker = match item.status {
+                            TaskUiStatus::Completed => "✓",
+                            TaskUiStatus::InProgress | TaskUiStatus::Tracked => "◐",
+                            TaskUiStatus::Scheduled => "◷",
+                            TaskUiStatus::Pending | TaskUiStatus::Unknown => "○",
+                        };
+                        let kind = match item.kind {
+                            TaskUiItemKind::PersistentTask => "task",
+                            TaskUiItemKind::Todo => "todo",
+                            TaskUiItemKind::BackgroundTask => "background",
+                            TaskUiItemKind::WorkflowTask => "workflow",
+                            TaskUiItemKind::MonitorTask => "monitor",
+                            TaskUiItemKind::CronJob => "cron",
+                            TaskUiItemKind::DynamicWakeup => "wakeup",
+                        };
+                        format!("  {marker} {kind} {} · {}", item.id, item.title)
+                    })
+                    .collect::<Vec<_>>();
+                if snapshot.truncated {
+                    lines.push("  … additional task state omitted".to_owned());
+                }
+                *output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = TaskUiUpdate {
+                    lines,
+                    active_count,
+                };
+            }
+        });
+        Self { snapshot, worker }
+    }
+
+    fn snapshot(&self) -> TaskUiUpdate {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for TaskUiMonitor {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
 
 fn bootstrap() -> Result<()> {
     let mut cli = Cli::parse();
@@ -160,12 +242,34 @@ async fn run(
     allow_rules.extend(cli.allowed_tools.iter().cloned());
     let mut deny_rules = settings.deny_rules();
     deny_rules.extend(cli.disallowed_tools.iter().cloned());
+    let ui_settings_store = if !cli.print && !cli.bare && !cli.safe_mode {
+        match UiSettingsStore::default_user() {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("UI settings persistence disabled: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut ui_settings = match &ui_settings_store {
+        Some(store) => match store.load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("UI settings rejected; using defaults: {error:#}");
+                UiSettings::default()
+            }
+        },
+        None => UiSettings::default(),
+    };
     let permissions = PermissionManager::new(
         mode,
         !cli.print && io::stdin().is_terminal(),
         allow_rules,
         deny_rules,
     );
+    permissions.set_user_rules(ui_settings.permission_rules.clone())?;
     let mut tool_context = ToolContext::new(cwd.clone(), permissions);
     if let Some(root) = &session_state_root {
         tool_context.reserve_private_state_root(root.path())?;
@@ -310,7 +414,7 @@ async fn run(
         deferred_tools.extend(integration.deferred_tools);
         services.push(integration.service);
     }
-    deferred_tools.extend(worktree.deferred_tools);
+    deferred_tools.extend(worktree.deferred_tools.iter().cloned());
     let web = match configure_web(&settings) {
         Ok(integration) => integration,
         Err(error) => {
@@ -597,29 +701,12 @@ async fn run(
         return print_outcome;
     }
 
+    let mut active_store = store.clone();
+    let mut active_file_histories = session_file_histories.clone();
     let interactive_outcome = async {
-        let ui_settings_store = if enhanced_terminal && !cli.bare {
-            match UiSettingsStore::default_user() {
-                Ok(store) => Some(store),
-                Err(error) => {
-                    eprintln!("UI settings persistence disabled: {error:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let mut ui_settings = match &ui_settings_store {
-            Some(store) => match store.load() {
-                Ok(settings) => settings,
-                Err(error) => {
-                    eprintln!("UI settings rejected; using defaults: {error:#}");
-                    UiSettings::default()
-                }
-            },
-            None => UiSettings::default(),
-        };
         let status_line_runner = StatusLineRunner::default();
+        ui.set_syntax_highlighting(ui_settings.syntax_highlighting);
+        ui.set_trusted_roots(command_context.trusted_roots());
         if enhanced_terminal && ui_settings.tui_mode == PersistedTuiMode::Fullscreen {
             ui.set_tui_mode(TuiMode::Fullscreen)?;
         }
@@ -628,13 +715,13 @@ async fn run(
             ui.banner(
                 &engine.model,
                 &command_context.cwd(),
-                store.id,
+                active_store.id,
                 engine.permission_mode(),
             )?;
         } else {
             println!(
                 "open-agent-harness · {} · session {}",
-                engine.model, store.id
+                engine.model, active_store.id
             );
         }
         let mut initial = cli.prompt.clone();
@@ -649,7 +736,7 @@ async fn run(
             let opened = InputHistoryStore::open_default().and_then(|history| {
                 let context = HistoryContext::new(
                     opaque_workspace_key(&command_context.cwd()),
-                    store.id,
+                    active_store.id,
                 )?;
                 Ok((history, context))
             });
@@ -690,6 +777,7 @@ async fn run(
             None
         };
         editor.seed_history(conversation_prompt_history(&engine.messages));
+        let task_monitor = TaskUiMonitor::start(command_context.clone());
         let mut mcp_prompt_commands = Vec::new();
         let mut mcp_prompts_refreshed_at: Option<Instant> = None;
         loop {
@@ -708,7 +796,7 @@ async fn run(
                             "open-agent-harness · {} · {:?} · {}",
                             engine.model,
                             engine.permission_mode(),
-                            store.id
+                            active_store.id
                         ))?;
                         if mcp_control.is_some()
                             && mcp_prompts_refreshed_at.is_none_or(|refreshed| {
@@ -739,24 +827,11 @@ async fn run(
                             &model_options,
                         );
                         let file_suggestions = workspace_file_suggestions(&command_context);
-                        let todo_lines = {
-                            let todos = command_context.todos.lock().await;
-                            todos
-                                .iter()
-                                .map(|todo| {
-                                    let marker = match todo.status.as_str() {
-                                        "completed" => "✓",
-                                        "in_progress" => "◐",
-                                        _ => "○",
-                                    };
-                                    format!("  {marker} {}", todo.content)
-                                })
-                                .collect::<Vec<_>>()
-                        };
+                        let task_snapshot = task_monitor.snapshot();
                         let public_status = json!({
                             "model": engine.model,
                             "permissionMode": permission_mode_name(engine.permission_mode()),
-                            "sessionId": store.id,
+                            "sessionId": active_store.id,
                             "workspaceKey": opaque_workspace_key(&command_context.cwd()),
                         });
                         let status_line = if let Some(config) = &ui_settings.status_line {
@@ -794,12 +869,12 @@ async fn run(
                                     "open-agent-harness · {} · {:?} · {}",
                                     engine.model,
                                     engine.permission_mode(),
-                                    store.id
+                                    active_store.id
                                 ))?;
                             }
                             Ok(outcome)
                         };
-                        let rewind_options = checkpoint_catalog(session_metadata.file_histories)?
+                        let rewind_options = checkpoint_catalog(&active_file_histories)?
                             .into_iter()
                             .enumerate()
                             .map(|(index, checkpoint)| ModelOption {
@@ -880,13 +955,24 @@ async fn run(
                                 }
                                 update
                             };
+                        let mut last_task_snapshot = task_snapshot.clone();
+                        let mut task_refresh = || {
+                            let current = task_monitor.snapshot();
+                            if current == last_task_snapshot {
+                                None
+                            } else {
+                                last_task_snapshot = current.clone();
+                                Some(current)
+                            }
+                        };
                         let read = editor.read(
                                 initial_mode,
                                 mode_locked,
                                 InputReadContext {
                                     commands: &slash_commands,
                                     files: &file_suggestions,
-                                    todos: &todo_lines,
+                                    todos: &task_snapshot.lines,
+                                    task_count: task_snapshot.active_count,
                                     status_line: status_line.as_deref(),
                                     theme: ui_settings.theme,
                                     copy_on_select: ui_settings.copy_on_select,
@@ -897,6 +983,7 @@ async fn run(
                                     rewind_picker: &mut rewind_picker,
                                     transcript_viewer: &mut transcript_viewer,
                                     status_line_refresh: &mut status_line_refresh,
+                                    task_refresh: &mut task_refresh,
                                 },
                             )?;
                         status_line_runner.cancel();
@@ -1054,7 +1141,7 @@ async fn run(
             if let Some(instructions) = compact_command(input.trim()) {
                 match engine.compact(instructions).await {
                     Ok(stats) => {
-                        store.replace_history(&engine.messages)?;
+                        active_store.replace_history(&engine.messages)?;
                         if !enhanced_terminal {
                             println!(
                                 "Compacted {} messages to {} (estimated tokens: {} → {}).",
@@ -1075,7 +1162,7 @@ async fn run(
             let input = match commands::handle(input.trim(), &mut engine) {
                 CommandOutcome::Exit => break,
                 CommandOutcome::Clear(name) => {
-                    match store.archive_and_clear_history() {
+                    match active_store.archive_and_clear_history() {
                         Ok(archive_id) => {
                             engine.clear();
                             if enhanced_terminal {
@@ -1184,15 +1271,273 @@ async fn run(
                     );
                     continue;
                 }
+                CommandOutcome::ManagePermissions(argument) => {
+                    if argument.trim().is_empty() && enhanced_terminal {
+                        let mut exit_requested = false;
+                        loop {
+                            let data = permission_dialog_data(
+                                &command_context.permissions,
+                                &command_context.trusted_roots(),
+                            );
+                            match manage_permissions_dialog(PermissionManagerDialog::new(data))? {
+                                PermissionManagerAction::AddRule { tab, rule } => {
+                                    let Some(behavior) = permission_tab_behavior(tab) else {
+                                        continue;
+                                    };
+                                    if let Err(error) = manage_permission_rules(
+                                        &command_context.permissions,
+                                        ui_settings_store.as_ref(),
+                                        &mut ui_settings,
+                                        &format!("add {behavior} {rule}"),
+                                    ) {
+                                        eprintln!("Permission rule unchanged: {error:#}");
+                                    }
+                                }
+                                PermissionManagerAction::DeleteRule { tab, rule, .. } => {
+                                    let Some(behavior) = permission_tab_behavior(tab) else {
+                                        continue;
+                                    };
+                                    if let Err(error) = manage_permission_rules(
+                                        &command_context.permissions,
+                                        ui_settings_store.as_ref(),
+                                        &mut ui_settings,
+                                        &format!("remove {behavior} {rule}"),
+                                    ) {
+                                        eprintln!("Permission rule unchanged: {error:#}");
+                                    }
+                                }
+                                PermissionManagerAction::AddWorkspace { path } => {
+                                    let result = command_context
+                                        .add_trusted_roots(&[PathBuf::from(path)])
+                                        .and_then(|_| {
+                                            refresh_file_histories(
+                                                &cli,
+                                                &command_context,
+                                                active_store.id,
+                                                session_state_root.as_ref(),
+                                                &mut active_file_histories,
+                                            )
+                                        });
+                                    match result {
+                                        Ok(()) => ui
+                                            .set_trusted_roots(command_context.trusted_roots()),
+                                        Err(error) => {
+                                            eprintln!("Workspace unchanged: {error:#}")
+                                        }
+                                    }
+                                }
+                                PermissionManagerAction::RemoveWorkspace { path, .. } => {
+                                    let result = command_context
+                                        .remove_trusted_root(std::path::Path::new(&path))
+                                        .and_then(|_| {
+                                            refresh_file_histories(
+                                                &cli,
+                                                &command_context,
+                                                active_store.id,
+                                                session_state_root.as_ref(),
+                                                &mut active_file_histories,
+                                            )
+                                        });
+                                    match result {
+                                        Ok(()) => ui
+                                            .set_trusted_roots(command_context.trusted_roots()),
+                                        Err(error) => {
+                                            eprintln!("Workspace unchanged: {error:#}")
+                                        }
+                                    }
+                                }
+                                PermissionManagerAction::OpenRecent { id } => {
+                                    if let Ok(index) = id.parse::<usize>() {
+                                        if let Some(prompt) = command_context
+                                            .permissions
+                                            .recent_permission_prompts()
+                                            .get(index)
+                                        {
+                                            println!("{} — {}", prompt.tool, prompt.summary);
+                                        }
+                                    }
+                                }
+                                PermissionManagerAction::Cancelled => break,
+                                PermissionManagerAction::ExitRequested => {
+                                    exit_requested = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if exit_requested {
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Err(error) = manage_permission_rules(
+                        &command_context.permissions,
+                        ui_settings_store.as_ref(),
+                        &mut ui_settings,
+                        &argument,
+                    ) {
+                        eprintln!("Permission rules unchanged: {error:#}");
+                    }
+                    continue;
+                }
+                CommandOutcome::AddDirectory(argument) => {
+                    let path = argument.trim();
+                    if path.is_empty() {
+                        eprintln!("Usage: /add-dir <path>");
+                        continue;
+                    }
+                    let added = command_context.add_trusted_roots(&[PathBuf::from(path)])?;
+                    active_file_histories = command_context
+                        .trusted_roots()
+                        .into_iter()
+                        .map(|root| {
+                            open_file_history(
+                                &cli,
+                                &root,
+                                active_store.id,
+                                session_state_root.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    command_context.set_file_histories(active_file_histories.clone())?;
+                    for root in added {
+                        println!("Added trusted workspace directory: {}", root.display());
+                    }
+                    ui.set_trusted_roots(command_context.trusted_roots());
+                    continue;
+                }
+                CommandOutcome::ShowFiles(argument) => {
+                    let query = argument.trim().to_ascii_lowercase();
+                    println!("Trusted workspace roots:");
+                    for root in command_context.trusted_roots() {
+                        println!("  {}", root.display());
+                    }
+                    let files = workspace_file_suggestions(&command_context);
+                    let mut shown = 0usize;
+                    for file in files.iter().filter(|file| {
+                        query.is_empty()
+                            || file.display_path.to_ascii_lowercase().contains(&query)
+                    }) {
+                        println!(
+                            "  @{}{}",
+                            file.display_path,
+                            if file.is_dir { "/" } else { "" }
+                        );
+                        shown = shown.saturating_add(1);
+                        if shown == 100 {
+                            break;
+                        }
+                    }
+                    if files.len() > shown {
+                        println!("  … additional files omitted; use /files <filter>");
+                    }
+                    continue;
+                }
+                CommandOutcome::ShowAgents => {
+                    if custom_agent_names.is_empty() {
+                        println!("No custom agents are configured.");
+                    } else {
+                        println!("Available agents:");
+                        for agent in &custom_agent_names {
+                            println!(
+                                "  {} — {}",
+                                agent.get("name").and_then(Value::as_str).unwrap_or("agent"),
+                                agent
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                            );
+                        }
+                    }
+                    continue;
+                }
+                CommandOutcome::RenameSession(title) => {
+                    let title = title.trim();
+                    if title.is_empty() {
+                        eprintln!("Usage: /rename <title>");
+                        continue;
+                    }
+                    match active_store.rename(title) {
+                        Ok(()) => println!("Session renamed to {title:?}."),
+                        Err(error) => eprintln!("Session title unchanged: {error:#}"),
+                    }
+                    continue;
+                }
+                CommandOutcome::BranchSession(title) => {
+                    if !active_store.persistence_enabled() {
+                        eprintln!("Branch unavailable: current session persistence is disabled.");
+                        continue;
+                    }
+                    if !command_context.background_task_ids().await.is_empty() {
+                        eprintln!(
+                            "Branch unavailable while background tasks are running; stop them first."
+                        );
+                        continue;
+                    }
+                    let title = (!title.trim().is_empty()).then_some(title.trim());
+                    let (next_store, history) = active_store.fork_from_with_title(
+                        Some(engine.messages.len()),
+                        title,
+                        true,
+                    )?;
+                    let next_histories = active_file_histories
+                        .iter()
+                        .map(|history| history.fork(next_store.id))
+                        .collect::<Result<Vec<_>>>()?;
+                    command_context.set_file_histories(next_histories.clone())?;
+                    install_session_state_recorders(&command_context, &next_store);
+                    engine.clear();
+                    engine.messages = history;
+                    active_store = next_store;
+                    active_file_histories = next_histories;
+                    editor.seed_history(conversation_prompt_history(&engine.messages));
+                    if enhanced_terminal {
+                        ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
+                        ui.set_fullscreen_header(format!(
+                            "open-agent-harness · {} · {:?} · {}",
+                            engine.model,
+                            engine.permission_mode(),
+                            active_store.id
+                        ))?;
+                    }
+                    println!("Branched into session {}.", active_store.id);
+                    continue;
+                }
                 CommandOutcome::TerminalSetup => {
                     print_terminal_setup();
                     continue;
                 }
                 CommandOutcome::ConfigureUi(argument) => {
                     if argument.is_empty() {
+                        if enhanced_terminal {
+                            match configure_ui_dialog(SettingsDialog::new(ui_settings_snapshot(
+                                &ui_settings,
+                            )))? {
+                                SettingsDialogAction::Save { changes, .. } => {
+                                    let mut next = ui_settings.clone();
+                                    for change in changes {
+                                        next.apply_setting(
+                                            UiSettingSource::User,
+                                            &change.key,
+                                            &setting_value_string(&change.after),
+                                        )?;
+                                    }
+                                    if let Some(store) = ui_settings_store.as_ref() {
+                                        store.save(&next)?;
+                                    }
+                                    ui_settings = next;
+                                    apply_ui_runtime(&ui_settings, &mut editor, &ui)?;
+                                    println!("UI settings saved.");
+                                }
+                                SettingsDialogAction::Cancel { .. } => {
+                                    println!("UI settings unchanged.");
+                                }
+                                SettingsDialogAction::ExitRequested { .. } => break,
+                            }
+                            continue;
+                        }
                         println!("{}", serde_json::to_string_pretty(&ui_settings)?);
                         println!(
-                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator"
+                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
                         );
                         continue;
                     }
@@ -1218,18 +1563,17 @@ async fn run(
                     if argument.is_empty() {
                         if !enhanced_terminal {
                             println!("Theme: {}", theme_name(ui_settings.theme));
-                            println!("Themes: auto, dark, light, daltonized, no-color");
+                            println!("Themes: auto, dark, light, dark-daltonized, light-daltonized, dark-ansi, light-ansi, no-color");
                             continue;
                         }
                         let options = [
                             ("auto", "Auto", "Follow terminal appearance"),
                             ("dark", "Dark", "Dark-background color tokens"),
                             ("light", "Light", "Light-background color tokens"),
-                            (
-                                "daltonized",
-                                "Daltonized",
-                                "Color-vision-friendly status tokens",
-                            ),
+                            ("dark-daltonized", "Dark daltonized", "Color-vision-friendly dark palette"),
+                            ("light-daltonized", "Light daltonized", "Color-vision-friendly light palette"),
+                            ("dark-ansi", "Dark ANSI", "Standard 16-color dark palette"),
+                            ("light-ansi", "Light ANSI", "Standard 16-color light palette"),
                             ("no-color", "No color", "Disable ANSI color styling"),
                         ]
                         .into_iter()
@@ -1239,16 +1583,39 @@ async fn run(
                             description: description.to_owned(),
                         })
                         .collect::<Vec<_>>();
-                        match select_theme(&options, theme_name(ui_settings.theme))? {
-                            ModelPickerOutcome::Selected(theme) => match save_ui_setting(
-                                ui_settings_store.as_ref(),
-                                &mut ui_settings,
-                                "theme",
-                                &theme,
-                            ) {
-                                Ok(()) => println!("Theme set to {}.", theme),
-                                Err(error) => eprintln!("Theme unchanged: {error:#}"),
-                            },
+                        let (outcome, syntax_highlighting) = select_theme(
+                            &options,
+                            theme_name(ui_settings.theme),
+                            ui_settings.syntax_highlighting,
+                        )?;
+                        match outcome {
+                            ModelPickerOutcome::Selected(theme) => {
+                                let result = (|| -> Result<()> {
+                                    let mut next = ui_settings.clone();
+                                    next.apply_setting(UiSettingSource::User, "theme", &theme)?;
+                                    next.apply_setting(
+                                        UiSettingSource::User,
+                                        "syntaxHighlighting",
+                                        &syntax_highlighting.to_string(),
+                                    )?;
+                                    if let Some(store) = ui_settings_store.as_ref() {
+                                        store.save(&next)?;
+                                    }
+                                    ui_settings = next;
+                                    ui.set_syntax_highlighting(syntax_highlighting);
+                                    Ok(())
+                                })();
+                                match result {
+                                    Ok(()) => {
+                                    println!(
+                                        "Theme set to {}; syntax highlighting {}.",
+                                        theme,
+                                        if syntax_highlighting { "on" } else { "off" }
+                                    );
+                                    }
+                                    Err(error) => eprintln!("Theme unchanged: {error:#}"),
+                                }
+                            }
                             ModelPickerOutcome::Cancelled => {
                                 println!("Theme unchanged: {}.", theme_name(ui_settings.theme));
                             }
@@ -1352,6 +1719,32 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::ShowTasks(argument) => {
+                    if argument.trim().is_empty() && enhanced_terminal {
+                        let snapshot = command_context.task_ui_snapshot().await?;
+                        match show_tasks_dialog(TaskDialog::new(task_dialog_items(snapshot.items)))?
+                        {
+                            TaskDialogAction::Stop { id } => {
+                                print_task_status(
+                                    &engine,
+                                    &command_context,
+                                    &format!("stop {id}"),
+                                )
+                                .await?;
+                            }
+                            TaskDialogAction::Foreground { id }
+                            | TaskDialogAction::ShowOutput { id } => {
+                                print_task_status(
+                                    &engine,
+                                    &command_context,
+                                    &format!("output {id}"),
+                                )
+                                .await?;
+                            }
+                            TaskDialogAction::Cancelled => {}
+                            TaskDialogAction::ExitRequested => break,
+                        }
+                        continue;
+                    }
                     print_task_status(&engine, &command_context, &argument).await?;
                     continue;
                 }
@@ -1362,7 +1755,7 @@ async fn run(
                 CommandOutcome::ShowDiff(argument) => {
                     if let Err(error) = print_checkpoint_diff(
                         &engine,
-                        session_metadata.file_histories,
+                        &active_file_histories,
                         &argument,
                     ) {
                         eprintln!("Diff unavailable: {error:#}");
@@ -1370,10 +1763,57 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::Rewind(argument) => {
+                    let argument = if argument.trim().is_empty() && enhanced_terminal {
+                        let options = checkpoint_catalog(&active_file_histories)?
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, checkpoint)| ModelOption {
+                                value: checkpoint.id.to_string(),
+                                display_name: format!("Message boundary {}", index + 1),
+                                description: format!(
+                                    "{} messages · {} tracked files",
+                                    checkpoint.message_count, checkpoint.tracked_files
+                                ),
+                            })
+                            .collect::<Vec<_>>();
+                        let checkpoint = match select_rewind_checkpoint(&options)? {
+                            ModelPickerOutcome::Selected(checkpoint) => checkpoint,
+                            ModelPickerOutcome::Cancelled => continue,
+                            ModelPickerOutcome::Exit => break,
+                        };
+                        let actions = [
+                            ("both", "Restore code and conversation", "Rewind both state surfaces"),
+                            ("conversation", "Restore conversation only", "Keep workspace files unchanged"),
+                            ("files", "Restore code only", "Keep conversation history unchanged"),
+                            ("preview", "Preview only", "Show the exact bounded diff without changing state"),
+                        ]
+                        .into_iter()
+                        .map(|(value, display_name, description)| ModelOption {
+                            value: value.to_owned(),
+                            display_name: display_name.to_owned(),
+                            description: description.to_owned(),
+                        })
+                        .collect::<Vec<_>>();
+                        match select_model(&actions, "both")? {
+                            ModelPickerOutcome::Selected(action) => match action.as_str() {
+                                "both" => format!("{checkpoint} --confirm"),
+                                "conversation" => {
+                                    format!("{checkpoint} --conversation-only --confirm")
+                                }
+                                "files" => format!("{checkpoint} --files-only --confirm"),
+                                "preview" => checkpoint,
+                                _ => unreachable!("fixed rewind action"),
+                            },
+                            ModelPickerOutcome::Cancelled => continue,
+                            ModelPickerOutcome::Exit => break,
+                        }
+                    } else {
+                        argument
+                    };
                     if let Err(error) = handle_rewind_command(
                         &mut engine,
-                        &store,
-                        session_metadata.file_histories,
+                        &active_store,
+                        &active_file_histories,
                         &argument,
                     ) {
                         eprintln!("Rewind failed: {error:#}");
@@ -1381,9 +1821,115 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::Resume(argument) => {
-                    if let Err(error) = print_resume_sessions(&session_metadata, &argument) {
-                        eprintln!("Resume unavailable: {error:#}");
+                    if !active_store.persistence_enabled() {
+                        eprintln!("Resume unavailable: current session persistence is disabled.");
+                        continue;
                     }
+                    if !command_context.background_task_ids().await.is_empty() {
+                        eprintln!("Resume unavailable while background tasks are running; stop them first.");
+                        continue;
+                    }
+                    let sessions = match session_state_root.as_ref() {
+                        Some(root) => SessionStore::list_in(active_store.cwd(), root, 100),
+                        None => SessionStore::list(active_store.cwd(), 100),
+                    }?;
+                    let selected = if argument.trim().is_empty() {
+                        if sessions.is_empty() {
+                            println!("No persisted sessions are available for this workspace.");
+                            continue;
+                        }
+                        if !enhanced_terminal {
+                            print_resume_sessions(&session_metadata, "")?;
+                            continue;
+                        }
+                        let options = sessions
+                            .iter()
+                            .map(|session| {
+                                let label = session
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| session.id.to_string());
+                                ModelOption {
+                                    value: session.id.to_string(),
+                                    display_name: format!(
+                                        "{label}{}",
+                                        if session.id == active_store.id {
+                                            " (current)"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                    description: format!(
+                                        "{} · {} bytes · modified {}{}",
+                                        session.id,
+                                        session.bytes,
+                                        session.modified_ms,
+                                        session.parent_session_id.map_or_else(
+                                            String::new,
+                                            |parent| format!(" · branch of {parent}")
+                                        )
+                                    ),
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        match select_model(&options, &active_store.id.to_string())? {
+                            ModelPickerOutcome::Selected(id) => id.parse::<Uuid>()?,
+                            ModelPickerOutcome::Cancelled => continue,
+                            ModelPickerOutcome::Exit => break,
+                        }
+                    } else {
+                        argument.trim().parse::<Uuid>().context("session id must be a UUID")?
+                    };
+                    if selected == active_store.id {
+                        println!("Session {} is already active.", selected);
+                        continue;
+                    }
+                    let (next_store, history) = match session_state_root.as_ref() {
+                        Some(root) => {
+                            SessionStore::resume_in(active_store.cwd(), selected, root, true)
+                        }
+                        None => SessionStore::resume(active_store.cwd(), selected, true),
+                    }?;
+                    if let Some(restored) = worktree.restore_session(&next_store.workspace_state()).await? {
+                        command_context
+                            .switch_workspace(restored.cwd, restored.root)
+                            .await?;
+                    }
+                    if let Some(current) = next_store.current_cwd_state() {
+                        command_context
+                            .restore_persisted_cwd(&current.root_key, &current.cwd)
+                            .await?;
+                    }
+                    ui.set_trusted_roots(command_context.trusted_roots());
+                    let next_histories = command_context
+                        .trusted_roots()
+                        .into_iter()
+                        .map(|root| {
+                            open_file_history(
+                                &cli,
+                                &root,
+                                next_store.id,
+                                session_state_root.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    command_context.set_file_histories(next_histories.clone())?;
+                    install_session_state_recorders(&command_context, &next_store);
+                    engine.clear();
+                    engine.messages = history;
+                    active_store = next_store;
+                    active_file_histories = next_histories;
+                    editor.seed_history(conversation_prompt_history(&engine.messages));
+                    if enhanced_terminal {
+                        ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
+                        ui.set_fullscreen_header(format!(
+                            "open-agent-harness · {} · {:?} · {}",
+                            engine.model,
+                            engine.permission_mode(),
+                            active_store.id
+                        ))?;
+                    }
+                    println!("Resumed session {} in this terminal.", active_store.id);
                     continue;
                 }
                 CommandOutcome::ShowSkills => {
@@ -1418,8 +1964,38 @@ async fn run(
                         }
                         println!("Reconnected MCP server {server}.");
                         print_mcp_status(Some(control));
+                    } else if let Some(server) = argument.strip_prefix("enable ") {
+                        let server = server.trim();
+                        let control = mcp_control
+                            .as_deref()
+                            .context("当前没有配置 MCP server")?;
+                        control.enable(server).await?;
+                        let refresh = engine
+                            .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                            .await;
+                        if refresh.is_error {
+                            bail!("MCP 已启用但工具刷新失败: {}", refresh.content)
+                        }
+                        println!("Enabled MCP server {server}.");
+                        print_mcp_status(Some(control));
+                    } else if let Some(server) = argument.strip_prefix("disable ") {
+                        let server = server.trim();
+                        let control = mcp_control
+                            .as_deref()
+                            .context("当前没有配置 MCP server")?;
+                        control.disable(server).await?;
+                        let refresh = engine
+                            .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                            .await;
+                        if refresh.is_error {
+                            bail!("MCP 已禁用但工具刷新失败: {}", refresh.content)
+                        }
+                        println!("Disabled MCP server {server}.");
+                        print_mcp_status(Some(control));
                     } else {
-                        eprintln!("Usage: /mcp [status|list|reconnect <server>]");
+                        eprintln!(
+                            "Usage: /mcp [status|list|reconnect|enable|disable <server>]"
+                        );
                     }
                     continue;
                 }
@@ -1451,7 +2027,7 @@ async fn run(
             let turn = engine.run_turn_content_interruptible(content).await;
             match turn {
                 Ok(Some(result)) => {
-                    persist_turn(&store, &engine, &result)?;
+                    persist_turn(&active_store, &engine, &result)?;
                     if enhanced_terminal {
                         if !result.streamed_text {
                             ui.response(&result.text)?;
@@ -1481,7 +2057,7 @@ async fn run(
     };
     cleanup_running_session(
         &hooks,
-        store.id,
+        active_store.id,
         &command_context.cwd(),
         reason,
         cli.debug,
@@ -2104,7 +2680,7 @@ fn emit_query_event(
         QueryEvent::RequestStarted { round } if include_partial => Some(json!({
             "type":"system", "subtype":"request_started", "round":round, "session_id":session_id
         })),
-        QueryEvent::AssistantMessage { content } => Some(json!({
+        QueryEvent::AssistantMessage { content, .. } => Some(json!({
             "type":"assistant",
             "message":{"role":"assistant", "content":content},
             "parent_tool_use_id":Value::Null,
@@ -2586,6 +3162,8 @@ async fn handle_control_slash_command(
                 "bytes":session.bytes,
                 "modifiedMs":session.modified_ms.to_string(),
                 "current":session.id == metadata.store.id,
+                "title":session.title,
+                "parentSessionId":session.parent_session_id,
             })).collect::<Vec<_>>() }))
         }
         "/skills" => handled(json!({
@@ -2622,7 +3200,29 @@ async fn handle_control_slash_command(
             }
             handled(json!({"reconnected":server,"servers":control.status()}))
         }
-        "/mcp" => bail!("Usage: /mcp [status|list|reconnect <server>]"),
+        "/mcp" if argument.starts_with("enable ") || argument.starts_with("disable ") => {
+            let (action, server) = argument
+                .split_once(' ')
+                .context("Usage: /mcp <enable|disable> <server>")?;
+            let server = server.trim();
+            if server.is_empty() {
+                bail!("Usage: /mcp <enable|disable> <server>")
+            }
+            let control = metadata.mcp_control.context("当前没有配置 MCP server")?;
+            match action {
+                "enable" => control.enable(server).await?,
+                "disable" => control.disable(server).await?,
+                _ => unreachable!("guarded MCP action"),
+            }
+            let refresh = engine
+                .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                .await;
+            if refresh.is_error {
+                bail!("MCP 状态已切换但工具刷新失败: {}", refresh.content)
+            }
+            handled(json!({"action":action,"server":server,"servers":control.status()}))
+        }
+        "/mcp" => bail!("Usage: /mcp [status|list|reconnect|enable|disable <server>]"),
         "/sandbox" => {
             let sandbox = metadata.command_context.sandbox_runtime();
             handled(json!({
@@ -2757,10 +3357,18 @@ async fn handle_control_request(
         .get("subtype")
         .and_then(Value::as_str)
         .context("control request 缺少 subtype")?;
+    if matches!(subtype, "mcp_set_servers" | "mcp_toggle" | "reload_plugins") {
+        return handle.respond_unsupported(
+            request_id,
+            subtype,
+            "This provider-neutral harness does not safely support mutating MCP server or plugin configuration at runtime.",
+        );
+    }
     let response = match subtype {
         "initialize" => Ok(json!({
             "session_id":store.id,
-            "commands":available_command_names(metadata.command_context, metadata.commands),
+            "commands":command_descriptors(metadata.command_context, metadata.commands),
+            "command_names":available_command_names(metadata.command_context, metadata.commands),
             "command_descriptors":command_descriptors(metadata.command_context, metadata.commands),
             "commandDescriptors":command_descriptors(metadata.command_context, metadata.commands),
             "agents":metadata.custom_agents,
@@ -2772,6 +3380,8 @@ async fn handle_control_request(
             "tools":engine.registered_tool_names(),
             "output_style":metadata.output_style,
             "available_output_styles":metadata.available_output_styles,
+            "account":{},
+            "pid":std::process::id(),
             "capabilities":[
                 "cancel_async_message_v1",
                 "command_lifecycle_v1",
@@ -2820,7 +3430,7 @@ async fn handle_control_request(
             }))
         }
         "mcp_status" => Ok(json!({
-            "servers": metadata
+            "mcpServers": metadata
                 .mcp_control
                 .map(|control| control.status())
                 .unwrap_or_default()
@@ -2828,10 +3438,9 @@ async fn handle_control_request(
         "mcp_reconnect" => {
             async {
                 let server = request
-                    .get("server")
-                    .or_else(|| request.get("name"))
+                    .get("serverName")
                     .and_then(Value::as_str)
-                    .context("mcp_reconnect 需要 server")?;
+                    .context("mcp_reconnect 需要 serverName")?;
                 let control = metadata.mcp_control.context("当前没有配置 MCP server")?;
                 control.reconnect(server).await?;
                 let refresh = engine
@@ -2840,7 +3449,78 @@ async fn handle_control_request(
                 if refresh.is_error {
                     bail!("MCP 已重连但工具刷新失败: {}", refresh.content)
                 }
-                Ok(json!({"server":server, "reconnected":true, "servers":control.status()}))
+                Ok(json!({
+                    "serverName":server,
+                    "reconnected":true,
+                    "mcpServers":control.status()
+                }))
+            }
+            .await
+        }
+        "seed_read_state" => {
+            async {
+                const MAX_SEEDED_READ_BYTES: usize = 256 * 1024;
+                let requested_path = request
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("seed_read_state 需要 path")?;
+                let observed_mtime = request
+                    .get("mtime")
+                    .and_then(Value::as_f64)
+                    .context("seed_read_state 需要 mtime")?;
+                let path = metadata.command_context.resolve_path(requested_path)?;
+                let permission_candidates = metadata
+                    .command_context
+                    .permission_path_candidates(requested_path)?;
+                if metadata
+                    .command_context
+                    .permissions
+                    .denies_read_path(&permission_candidates)
+                {
+                    bail!("seed_read_state path 被读取权限规则拒绝")
+                }
+                let file_metadata = match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(_) => return Ok(json!({"seeded":false, "reason":"unavailable"})),
+                };
+                if !file_metadata.is_file() {
+                    return Ok(json!({"seeded":false, "reason":"not_a_file"}));
+                }
+                if file_metadata.len() > MAX_SEEDED_READ_BYTES as u64 {
+                    return Ok(json!({"seeded":false, "reason":"file_too_large"}));
+                }
+                let disk_mtime = file_metadata.modified().ok().and_then(|value| {
+                    value
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as f64)
+                });
+                let Some(disk_mtime) = disk_mtime else {
+                    return Ok(json!({"seeded":false, "reason":"mtime_unavailable"}));
+                };
+                if disk_mtime.floor() > observed_mtime.floor() {
+                    return Ok(json!({"seeded":false, "reason":"stale_observation"}));
+                }
+                let mut bytes = Vec::with_capacity(file_metadata.len() as usize);
+                tokio::fs::File::open(&path)
+                    .await?
+                    .take((MAX_SEEDED_READ_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                if bytes.len() > MAX_SEEDED_READ_BYTES || bytes.contains(&0) {
+                    return Ok(json!({"seeded":false, "reason":"not_editable_text"}));
+                }
+                let content = match String::from_utf8(bytes) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        return Ok(json!({"seeded":false, "reason":"not_utf8"}));
+                    }
+                };
+                metadata
+                    .command_context
+                    .remember_read(path, content, false)
+                    .await?;
+                Ok(json!({"seeded":true}))
             }
             .await
         }
@@ -2866,17 +3546,22 @@ async fn handle_control_request(
         }
         "get_settings" => {
             let sandbox = metadata.command_context.sandbox_runtime();
-            Ok(json!({
+            let effective = json!({
                 "model":engine.model,
-                "permission_mode":permission_mode_name(engine.permission_mode()),
-                "output_style":metadata.output_style,
-                "available_output_styles":metadata.available_output_styles,
-                "plugin_count":metadata.plugin_count,
-                "memory_enabled":metadata.memory.enabled(),
-                "hooks_configured":!metadata.hooks.is_empty(),
+                "permissionMode":permission_mode_name(engine.permission_mode()),
+                "outputStyle":metadata.output_style,
+                "availableOutputStyles":metadata.available_output_styles,
+                "pluginCount":metadata.plugin_count,
+                "memoryEnabled":metadata.memory.enabled(),
+                "hooksConfigured":!metadata.hooks.is_empty(),
                 "sandbox":{"enabled":sandbox.enabled(), "available":sandbox.available()},
-                "trusted_root_count":metadata.command_context.trusted_roots().len(),
-                "mcp_servers":metadata.mcp_control.map(|control| control.status()).unwrap_or_default(),
+                "trustedRootCount":metadata.command_context.trusted_roots().len(),
+                "mcpServers":metadata.mcp_control.map(|control| control.status()).unwrap_or_default(),
+            });
+            Ok(json!({
+                "effective":effective,
+                "sources":[],
+                "applied":{"model":engine.model, "effort":Value::Null},
             }))
         }
         "rewind" => (|| -> Result<Value> {
@@ -3278,45 +3963,26 @@ fn print_resume_sessions(metadata: &SessionMetadata<'_>, argument: &str) -> Resu
         } else {
             ""
         };
-        println!("  {}{} — {} bytes", session.id, current, session.bytes);
+        println!(
+            "  {}{}{} — {} bytes",
+            session.id,
+            session
+                .title
+                .as_deref()
+                .map_or_else(String::new, |title| format!(" · {title}")),
+            current,
+            session.bytes
+        );
     }
-    println!("Use /resume <session-id> to print the safe restart command.");
+    println!("Use /resume <session-id>; an interactive terminal switches in-process.");
     Ok(())
 }
 
 fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalog) -> Vec<String> {
-    let mut names = [
-        "compact",
-        "clear",
-        "context",
-        "cost",
-        "diff",
-        "exit",
-        "help",
-        "hooks",
-        "init",
-        "loop",
-        "memory",
-        "mcp",
-        "model",
-        "permissions",
-        "plugin",
-        "resume",
-        "rewind",
-        "sandbox",
-        "skills",
-        "status",
-        "tasks",
-        "transcript",
-        "tui",
-        "vim",
-        "keybindings",
-    ]
-    .into_iter()
-    .map(ToOwned::to_owned)
-    .collect::<Vec<_>>();
-    names.extend(commands.iter().map(|(name, _)| name.clone()));
-    names.extend(context.skill_catalog().iter().map(|(name, _)| name.clone()));
+    let mut names = available_command_suggestions(context, commands, &[], &[])
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
     names.sort();
     names.dedup();
     names
@@ -4155,6 +4821,308 @@ fn print_sandbox_status(context: &ToolContext) {
     }
 }
 
+fn manage_permission_rules(
+    manager: &PermissionManager,
+    store: Option<&UiSettingsStore>,
+    settings: &mut UiSettings,
+    argument: &str,
+) -> Result<()> {
+    let argument = argument.trim();
+    if argument.is_empty() || matches!(argument, "list" | "show") {
+        let catalog = manager.permission_rule_catalog();
+        println!(
+            "Permission mode: {}",
+            permission_mode_name(manager.effective_mode())
+        );
+        print_permission_rule_group("User allow", &catalog.user.allow);
+        print_permission_rule_group("User ask", &catalog.user.ask);
+        print_permission_rule_group("User deny", &catalog.user.deny);
+        print_permission_rule_group("Trusted allow", &catalog.trusted_allow);
+        print_permission_rule_group("Trusted deny", &catalog.trusted_deny);
+        print_permission_rule_group("Workspace deny", &catalog.workspace_deny);
+        if !catalog.session_grants.is_empty() {
+            println!("Session grants:");
+            for (index, grant) in catalog.session_grants.iter().enumerate() {
+                println!("  {}. {}", index + 1, grant.invocation_tool);
+            }
+        }
+        let recent = manager.recent_permission_prompts();
+        if !recent.is_empty() {
+            println!("Recent permission prompts:");
+            for prompt in recent.iter().take(20) {
+                println!("  {} — {}", prompt.tool, prompt.summary);
+            }
+        }
+        println!("Manage: /permissions add <allow|ask|deny> <rule>");
+        println!("        /permissions remove <allow|ask|deny> <index|rule>");
+        println!("        /permissions clear <allow|ask|deny>");
+        return Ok(());
+    }
+
+    let mut words = argument.split_whitespace();
+    let action = words.next().unwrap_or_default();
+    let behavior = words
+        .next()
+        .context("Usage: /permissions <add|remove|clear> <allow|ask|deny> [rule|index]")?;
+    let value = words.collect::<Vec<_>>().join(" ");
+    let mut next = settings.permission_rules.clone();
+    let rules = match behavior {
+        "allow" => &mut next.allow,
+        "ask" => &mut next.ask,
+        "deny" => &mut next.deny,
+        _ => bail!("permission behavior must be allow, ask, or deny"),
+    };
+    match action {
+        "add" => {
+            if value.is_empty() {
+                bail!("a permission rule is required")
+            }
+            if !rules.iter().any(|rule| rule == &value) {
+                rules.push(value.clone());
+            }
+        }
+        "remove" => {
+            if value.is_empty() {
+                bail!("a 1-based rule index or exact rule is required")
+            }
+            if let Ok(index) = value.parse::<usize>() {
+                if index == 0 || index > rules.len() {
+                    bail!("rule index is outside 1..={}", rules.len())
+                }
+                rules.remove(index - 1);
+            } else if let Some(index) = rules.iter().position(|rule| rule == &value) {
+                rules.remove(index);
+            } else {
+                bail!("matching {behavior} rule was not found")
+            }
+        }
+        "clear" => {
+            if !value.is_empty() {
+                bail!("clear does not accept a rule value")
+            }
+            rules.clear();
+        }
+        _ => bail!("permission action must be add, remove, or clear"),
+    }
+    next.validate()?;
+    let encoded = serde_json::to_string(&next)?;
+    save_ui_setting(store, settings, "permissionRules", &encoded)?;
+    manager.set_user_rules(next)?;
+    println!("Updated user {behavior} permission rules.");
+    Ok(())
+}
+
+fn permission_dialog_data(
+    manager: &PermissionManager,
+    trusted_roots: &[PathBuf],
+) -> PermissionDialogData {
+    let catalog = manager.permission_rule_catalog();
+    let recent = manager
+        .recent_permission_prompts()
+        .into_iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let flags = [
+                prompt.read_only.then_some("read-only"),
+                prompt.destructive.then_some("destructive"),
+                prompt.outside_workspace.then_some("outside workspace"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            PermissionDialogItem::new(
+                index.to_string(),
+                prompt.tool,
+                if flags.is_empty() {
+                    prompt.summary
+                } else {
+                    format!("{} ({flags})", prompt.summary)
+                },
+            )
+        })
+        .collect();
+    let rules = |values: Vec<String>, origin: &str| {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, rule)| PermissionDialogItem::new(index.to_string(), rule, origin))
+            .collect()
+    };
+    PermissionDialogData {
+        recent,
+        allow: rules(catalog.user.allow, "user rule"),
+        ask: rules(catalog.user.ask, "user rule"),
+        deny: rules(catalog.user.deny, "user rule"),
+        workspace: trusted_roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| {
+                PermissionDialogItem::new(
+                    index.to_string(),
+                    root.display().to_string(),
+                    if index == 0 {
+                        "primary workspace"
+                    } else {
+                        "session workspace"
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn permission_tab_behavior(tab: PermissionTab) -> Option<&'static str> {
+    match tab {
+        PermissionTab::Allow => Some("allow"),
+        PermissionTab::Ask => Some("ask"),
+        PermissionTab::Deny => Some("deny"),
+        PermissionTab::Recent | PermissionTab::Workspace => None,
+    }
+}
+
+fn ui_settings_snapshot(settings: &UiSettings) -> SettingsSnapshot {
+    let choice = |selected: &str, options: &[&str]| SettingValue::Choice {
+        selected: selected.to_owned(),
+        options: options.iter().map(|value| (*value).to_owned()).collect(),
+    };
+    SettingsSnapshot::new(vec![
+        SettingItem {
+            key: "editorMode".to_owned(),
+            label: "Editor mode".to_owned(),
+            description: "Standard or Vim input editing".to_owned(),
+            value: choice(
+                match settings.editor_mode {
+                    EditorMode::Normal => "normal",
+                    EditorMode::Vim => "vim",
+                },
+                &["normal", "vim"],
+            ),
+        },
+        SettingItem {
+            key: "tuiMode".to_owned(),
+            label: "TUI mode".to_owned(),
+            description: "Inline or fullscreen conversation rendering".to_owned(),
+            value: choice(
+                match settings.tui_mode {
+                    PersistedTuiMode::Default => "default",
+                    PersistedTuiMode::Fullscreen => "fullscreen",
+                },
+                &["default", "fullscreen"],
+            ),
+        },
+        SettingItem {
+            key: "theme".to_owned(),
+            label: "Theme".to_owned(),
+            description: "Terminal color preset".to_owned(),
+            value: choice(
+                theme_name(settings.theme),
+                &[
+                    "auto",
+                    "dark",
+                    "light",
+                    "dark-daltonized",
+                    "light-daltonized",
+                    "dark-ansi",
+                    "light-ansi",
+                    "no-color",
+                ],
+            ),
+        },
+        SettingItem {
+            key: "copyOnSelect".to_owned(),
+            label: "Copy on select".to_owned(),
+            description: "Copy fullscreen mouse selection automatically".to_owned(),
+            value: SettingValue::Boolean(settings.copy_on_select),
+        },
+        SettingItem {
+            key: "syntaxHighlighting".to_owned(),
+            label: "Syntax highlighting".to_owned(),
+            description: "Highlight fenced code in Markdown responses".to_owned(),
+            value: SettingValue::Boolean(settings.syntax_highlighting),
+        },
+    ])
+}
+
+fn setting_value_string(value: &SettingValue) -> String {
+    match value {
+        SettingValue::Boolean(value) => value.to_string(),
+        SettingValue::Choice { selected, .. } => selected.clone(),
+    }
+}
+
+fn task_dialog_items(items: Vec<TaskUiItem>) -> Vec<TaskDialogItem> {
+    items
+        .into_iter()
+        .map(|item| {
+            let actionable = matches!(
+                item.kind,
+                TaskUiItemKind::BackgroundTask
+                    | TaskUiItemKind::WorkflowTask
+                    | TaskUiItemKind::MonitorTask
+            );
+            TaskDialogItem {
+                id: item.id,
+                title: item.title,
+                detail: item.detail.unwrap_or_default(),
+                category: match item.kind {
+                    TaskUiItemKind::BackgroundTask => TaskCategory::Shell,
+                    TaskUiItemKind::WorkflowTask | TaskUiItemKind::MonitorTask => {
+                        TaskCategory::Agent
+                    }
+                    _ => TaskCategory::Other,
+                },
+                state: match item.status {
+                    TaskUiStatus::InProgress | TaskUiStatus::Tracked => TaskState::Running,
+                    TaskUiStatus::Completed => TaskState::Completed,
+                    TaskUiStatus::Pending | TaskUiStatus::Scheduled | TaskUiStatus::Unknown => {
+                        TaskState::Stopped
+                    }
+                },
+                can_foreground: actionable,
+                has_output: actionable,
+            }
+        })
+        .collect()
+}
+
+fn refresh_file_histories(
+    cli: &Cli,
+    context: &ToolContext,
+    session_id: Uuid,
+    state_root: Option<&SessionStateRoot>,
+    histories: &mut Vec<FileHistory>,
+) -> Result<()> {
+    *histories = context
+        .trusted_roots()
+        .into_iter()
+        .map(|root| open_file_history(cli, &root, session_id, state_root))
+        .collect::<Result<Vec<_>>>()?;
+    context.set_file_histories(histories.clone())?;
+    Ok(())
+}
+
+fn install_session_state_recorders(context: &ToolContext, store: &SessionStore) {
+    let workspace_store = store.clone();
+    context.set_workspace_state_recorder(Some(Arc::new(move |current, root| {
+        workspace_store.record_workspace_transition(current, root)
+    })));
+    let cwd_store = store.clone();
+    context.set_current_cwd_state_recorder(Some(Arc::new(move |current, root| {
+        cwd_store.record_current_cwd_transition(current, root)
+    })));
+}
+
+fn print_permission_rule_group(label: &str, rules: &[String]) {
+    if rules.is_empty() {
+        return;
+    }
+    println!("{label}:");
+    for (index, rule) in rules.iter().enumerate() {
+        println!("  {}. {rule}", index + 1);
+    }
+}
+
 fn print_doctor(
     context: &ToolContext,
     mcp_control: Option<&dyn McpControl>,
@@ -4386,6 +5354,19 @@ fn available_command_suggestions(
 ) -> Vec<SlashCommandSuggestion> {
     let mut suggestions = [
         (
+            "add-dir",
+            &[][..],
+            "Add an explicit trusted workspace directory for this session",
+            Some("<path>"),
+        ),
+        ("agents", &[][..], "List configured custom agents", None),
+        (
+            "branch",
+            &[][..],
+            "Fork the current conversation into a new session",
+            Some("[title]"),
+        ),
+        (
             "clear",
             &["reset", "new"][..],
             "Start a new conversation and preserve this one for resume",
@@ -4430,6 +5411,12 @@ fn available_command_suggestions(
             "Export the conversation to a workspace file or clipboard",
             Some("[filename]"),
         ),
+        (
+            "files",
+            &[][..],
+            "List trusted workspace roots and file references",
+            Some("[filter]"),
+        ),
         ("help", &[][..], "Show available commands", None),
         ("hooks", &[][..], "Show hook configuration status", None),
         ("init", &[][..], "Create or improve AGENTS.md", None),
@@ -4448,8 +5435,8 @@ fn available_command_suggestions(
         (
             "mcp",
             &[][..],
-            "Show or reconnect MCP servers",
-            Some("[status|reconnect <server>]"),
+            "Show, reconnect, enable, or disable trusted MCP servers",
+            Some("[status|reconnect|enable|disable <server>]"),
         ),
         (
             "model",
@@ -4460,14 +5447,20 @@ fn available_command_suggestions(
         (
             "permissions",
             &[][..],
-            "Show the current permission mode",
-            None,
+            "Inspect or update persistent user permission rules",
+            Some("[list|add|remove|clear <allow|ask|deny> [rule|index]]"),
         ),
         ("plugin", &[][..], "Show trusted plugin status", None),
         (
+            "rename",
+            &[][..],
+            "Set a private local title for the current session",
+            Some("<title>"),
+        ),
+        (
             "resume",
             &["continue"][..],
-            "List resumable sessions or print a safe restart command",
+            "Switch to a resumable session in this terminal",
             Some("[session-id]"),
         ),
         (
@@ -4501,7 +5494,9 @@ fn available_command_suggestions(
             "theme",
             &[][..],
             "Show or choose the terminal theme",
-            Some("[auto|dark|light|daltonized|no-color]"),
+            Some(
+                "[auto|dark|light|dark-daltonized|light-daltonized|dark-ansi|light-ansi|no-color]",
+            ),
         ),
         (
             "transcript",
@@ -4547,18 +5542,38 @@ fn available_command_suggestions(
                 .iter()
                 .map(|option| option.value.clone())
                 .collect(),
-            "theme" => ["auto", "dark", "light", "daltonized", "no-color"]
-                .into_iter()
-                .map(ToOwned::to_owned)
-                .collect(),
+            "theme" => [
+                "auto",
+                "dark",
+                "light",
+                "dark-daltonized",
+                "light-daltonized",
+                "dark-ansi",
+                "light-ansi",
+                "no-color",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
             "tui" => ["default", "fullscreen"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
-            "mcp" => ["status", "reconnect"]
+            "mcp" => ["status", "reconnect", "enable", "disable"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+            "permissions" => [
+                "list",
+                "add allow",
+                "add ask",
+                "add deny",
+                "remove",
+                "clear",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
             "tasks" => ["output", "stop"]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -4677,7 +5692,10 @@ fn theme_name(theme: ThemePreset) -> &'static str {
         ThemePreset::Auto => "auto",
         ThemePreset::Dark => "dark",
         ThemePreset::Light => "light",
-        ThemePreset::Daltonized => "daltonized",
+        ThemePreset::DarkDaltonized => "dark-daltonized",
+        ThemePreset::LightDaltonized => "light-daltonized",
+        ThemePreset::DarkAnsi => "dark-ansi",
+        ThemePreset::LightAnsi => "light-ansi",
         ThemePreset::NoColor => "no-color",
     }
 }
@@ -4710,6 +5728,7 @@ fn apply_ui_runtime(
         PersistedTuiMode::Default => TuiMode::Default,
         PersistedTuiMode::Fullscreen => TuiMode::Fullscreen,
     })?;
+    ui.set_syntax_highlighting(settings.syntax_highlighting);
     Ok(())
 }
 
@@ -4783,8 +5802,25 @@ mod tests {
         let names = available_command_names(&context, &commands);
         let suggestions = available_command_suggestions(&context, &commands, &[], &[]);
         for expected in [
-            "diff", "hooks", "mcp", "memory", "plugin", "resume", "rewind", "sandbox", "skills",
-            "status", "tasks",
+            "add-dir",
+            "agents",
+            "branch",
+            "config",
+            "diff",
+            "files",
+            "hooks",
+            "mcp",
+            "memory",
+            "permissions",
+            "plugin",
+            "rename",
+            "resume",
+            "rewind",
+            "sandbox",
+            "skills",
+            "status",
+            "tasks",
+            "theme",
         ] {
             assert!(names.iter().any(|name| name == expected));
             assert!(

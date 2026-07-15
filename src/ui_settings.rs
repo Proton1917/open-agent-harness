@@ -15,6 +15,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::permissions::UserPermissionRules;
+
 pub const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const MAX_UI_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_STATUS_LINE_COMMAND_BYTES: usize = 4 * 1024;
@@ -44,7 +46,11 @@ pub enum ThemePreset {
     Auto,
     Dark,
     Light,
-    Daltonized,
+    #[serde(alias = "daltonized")]
+    DarkDaltonized,
+    LightDaltonized,
+    DarkAnsi,
+    LightAnsi,
     NoColor,
 }
 
@@ -101,8 +107,12 @@ pub struct UiSettings {
     pub theme: ThemePreset,
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
+    #[serde(default = "default_true")]
+    pub syntax_highlighting: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_line: Option<StatusLineConfig>,
+    #[serde(default, skip_serializing_if = "UserPermissionRules::is_empty")]
+    pub permission_rules: UserPermissionRules,
 }
 
 impl Default for UiSettings {
@@ -112,7 +122,9 @@ impl Default for UiSettings {
             tui_mode: TuiMode::default(),
             theme: ThemePreset::default(),
             copy_on_select: true,
+            syntax_highlighting: true,
             status_line: None,
+            permission_rules: UserPermissionRules::default(),
         }
     }
 }
@@ -122,6 +134,7 @@ impl UiSettings {
         if let Some(status_line) = &self.status_line {
             status_line.validate()?;
         }
+        self.permission_rules.validate()?;
         Ok(())
     }
 
@@ -142,6 +155,11 @@ impl UiSettings {
                 next.copy_on_select = value
                     .parse::<bool>()
                     .context("copyOnSelect must be true or false")?;
+            }
+            "syntaxHighlighting" => {
+                next.syntax_highlighting = value
+                    .parse::<bool>()
+                    .context("syntaxHighlighting must be true or false")?;
             }
             "statusLine" => {
                 next.status_line = if value.trim() == "null" {
@@ -180,12 +198,29 @@ impl UiSettings {
                     .context("statusLine.hideVimModeIndicator must be true or false")?;
                 status_line_mut_existing(&mut next)?.hide_vim_mode_indicator = hide;
             }
+            "permissionRules" => {
+                next.permission_rules = serde_json::from_str(value)
+                    .context("permissionRules must be a strict JSON object")?;
+            }
+            "permissionRules.allow" => {
+                next.permission_rules.allow = parse_permission_rule_array(value, key)?;
+            }
+            "permissionRules.ask" => {
+                next.permission_rules.ask = parse_permission_rule_array(value, key)?;
+            }
+            "permissionRules.deny" => {
+                next.permission_rules.deny = parse_permission_rule_array(value, key)?;
+            }
             _ => bail!("unknown or unsafe UI setting key: {key}"),
         }
         next.validate()?;
         *self = next;
         Ok(())
     }
+}
+
+fn parse_permission_rule_array(value: &str, key: &str) -> Result<Vec<String>> {
+    serde_json::from_str(value).with_context(|| format!("{key} must be a JSON string array"))
 }
 
 fn status_line_mut<'a>(
@@ -231,9 +266,14 @@ fn parse_theme(value: &str) -> Result<ThemePreset> {
         "auto" => Ok(ThemePreset::Auto),
         "dark" => Ok(ThemePreset::Dark),
         "light" => Ok(ThemePreset::Light),
-        "daltonized" => Ok(ThemePreset::Daltonized),
+        "daltonized" | "dark-daltonized" => Ok(ThemePreset::DarkDaltonized),
+        "light-daltonized" => Ok(ThemePreset::LightDaltonized),
+        "dark-ansi" => Ok(ThemePreset::DarkAnsi),
+        "light-ansi" => Ok(ThemePreset::LightAnsi),
         "no-color" => Ok(ThemePreset::NoColor),
-        _ => bail!("theme must be auto, dark, light, daltonized, or no-color"),
+        _ => bail!(
+            "theme must be auto, dark, light, dark-daltonized, light-daltonized, dark-ansi, light-ansi, or no-color"
+        ),
     }
 }
 
@@ -257,6 +297,8 @@ pub enum UiSettingValueKind {
     UnsignedInteger,
     OptionalUnsignedInteger,
     Boolean,
+    PermissionRulesJson,
+    StringArray,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,8 +308,8 @@ pub struct UiSettingSpec {
 }
 
 /// The complete mutable UI surface. Absence from this registry is a hard
-/// rejection; model, endpoint, environment, tool, and permission settings are
-/// intentionally not representable here.
+/// rejection. Only bounded user-authored permission rules are representable;
+/// permission mode, model, endpoint, environment, and tool settings are not.
 pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     UiSettingSpec {
         key: "editorMode",
@@ -304,6 +346,22 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     UiSettingSpec {
         key: "statusLine.hideVimModeIndicator",
         value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "permissionRules",
+        value_kind: UiSettingValueKind::PermissionRulesJson,
+    },
+    UiSettingSpec {
+        key: "permissionRules.allow",
+        value_kind: UiSettingValueKind::StringArray,
+    },
+    UiSettingSpec {
+        key: "permissionRules.ask",
+        value_kind: UiSettingValueKind::StringArray,
+    },
+    UiSettingSpec {
+        key: "permissionRules.deny",
+        value_kind: UiSettingValueKind::StringArray,
     },
 ];
 
@@ -660,6 +718,7 @@ impl Drop for TemporaryFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::{MAX_USER_PERMISSION_RULE_BYTES, MAX_USER_PERMISSION_RULES};
 
     fn store_in(temp: &tempfile::TempDir) -> UiSettingsStore {
         UiSettingsStore::new_user(temp.path().join("private-ui")).unwrap()
@@ -669,14 +728,20 @@ mod tests {
         UiSettings {
             editor_mode: EditorMode::Vim,
             tui_mode: TuiMode::Fullscreen,
-            theme: ThemePreset::Daltonized,
+            theme: ThemePreset::DarkDaltonized,
             copy_on_select: false,
+            syntax_highlighting: false,
             status_line: Some(StatusLineConfig {
                 command: "status-helper --json".to_owned(),
                 padding: 2,
                 refresh_interval: Some(30),
                 hide_vim_mode_indicator: true,
             }),
+            permission_rules: UserPermissionRules {
+                allow: vec!["Bash(cargo test:*)".to_owned()],
+                ask: vec!["Write(**)".to_owned()],
+                deny: vec!["Read(.env)".to_owned()],
+            },
         }
     }
 
@@ -747,7 +812,8 @@ mod tests {
     fn registry_is_finite_transactional_and_user_only() {
         assert!(UI_SETTING_REGISTRY.iter().all(|spec| {
             !spec.key.contains("model")
-                && !spec.key.contains("permission")
+                && (!spec.key.to_ascii_lowercase().contains("permission")
+                    || spec.key.starts_with("permissionRules"))
                 && !spec.key.contains("env")
                 && !spec.key.contains("endpoint")
         }));
@@ -774,6 +840,84 @@ mod tests {
         );
         assert_eq!(settings, before);
         assert!(UiSettingsStore::for_scope(UiSettingsScope::Project, "/tmp/project-ui").is_err());
+    }
+
+    #[test]
+    fn permission_rules_round_trip_and_default_stays_absent() {
+        let default_json = serde_json::to_value(UiSettings::default()).unwrap();
+        assert!(default_json.get("permissionRules").is_none());
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_in(&temp);
+        let expected = configured();
+        store.save(&expected).unwrap();
+        assert_eq!(
+            store.load().unwrap().permission_rules,
+            expected.permission_rules
+        );
+
+        let mut settings = UiSettings::default();
+        settings
+            .apply_setting(
+                UiSettingSource::User,
+                "permissionRules",
+                r#"{"allow":["Bash(cargo:*)"],"ask":["Write(*)"],"deny":["Read(.env)"]}"#,
+            )
+            .unwrap();
+        assert_eq!(settings.permission_rules.ask, vec!["Write(*)"]);
+        settings
+            .apply_setting(
+                UiSettingSource::User,
+                "permissionRules.allow",
+                r#"["Read(src/**)"]"#,
+            )
+            .unwrap();
+        assert_eq!(settings.permission_rules.allow, vec!["Read(src/**)"]);
+    }
+
+    #[test]
+    fn permission_rule_updates_are_strict_bounded_and_transactional() {
+        let mut settings = configured();
+        let before = settings.clone();
+        for invalid in [
+            r#"{"allow":[" Read"]}"#.to_owned(),
+            r#"{"allow":["Read(foo)"],"unexpected":[]}"#.to_owned(),
+            format!(
+                r#"{{"deny":["{}"]}}"#,
+                "X".repeat(MAX_USER_PERMISSION_RULE_BYTES + 1)
+            ),
+        ] {
+            assert!(
+                settings
+                    .apply_setting(UiSettingSource::User, "permissionRules", &invalid)
+                    .is_err()
+            );
+            assert_eq!(settings, before);
+        }
+
+        let too_many = (0..=MAX_USER_PERMISSION_RULES)
+            .map(|index| format!("Read(file-{index})"))
+            .collect::<Vec<_>>();
+        assert!(
+            settings
+                .apply_setting(
+                    UiSettingSource::User,
+                    "permissionRules.ask",
+                    &serde_json::to_string(&too_many).unwrap(),
+                )
+                .is_err()
+        );
+        assert_eq!(settings, before);
+        assert!(
+            settings
+                .apply_setting(
+                    UiSettingSource::Project,
+                    "permissionRules",
+                    r#"{"allow":["Bash(*)"]}"#,
+                )
+                .is_err()
+        );
+        assert_eq!(settings, before);
     }
 
     #[test]

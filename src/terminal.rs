@@ -1,11 +1,12 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     cursor,
     event::{
@@ -27,13 +28,22 @@ use crate::{
     clipboard::{ClipboardImage, read_clipboard_image, write_clipboard_text},
     config::ModelOption,
     fullscreen::{
-        ClickKind, FrameSpec, FullscreenLimits, FullscreenState, SelectionFocusMove, ViewportPoint,
-        WheelDirection,
+        ClickKind, FrameSpec, FullscreenLimits, FullscreenState, SelectionFocusMove,
+        TranscriptAction, ViewportPoint, WheelDirection,
     },
     input_history::HistoryScope,
     keybindings::{KeyResolution, KeybindingManager},
+    markdown::{
+        MarkdownRenderOptions, RenderedLine, RenderedMarkdown, StreamingMarkdown,
+        StreamingMarkdownFrame, SyntaxClass, TextStyle,
+    },
     permissions::PermissionMode,
     query::QueryEvent,
+    terminal_dialogs::{
+        AlternateScreenRenderer, DialogInput, DialogUpdate, PermissionManagerAction,
+        PermissionManagerDialog, SettingsDialog, SettingsDialogAction, TaskDialog,
+        TaskDialogAction,
+    },
     ui_settings::ThemePreset,
     vim::{VimAction, VimEvent, VimKey, VimMode, VimState},
 };
@@ -113,6 +123,21 @@ struct OutputState {
     fullscreen_header: String,
     fullscreen_stream: String,
     fullscreen_composer_reserve: u16,
+    tool_displays: HashMap<String, ToolDisplay>,
+    markdown_stream: StreamingMarkdown,
+    markdown_committed_lines: usize,
+    final_markdown: Option<RenderedMarkdown>,
+    syntax_highlighting: bool,
+    trusted_roots: Vec<PathBuf>,
+}
+
+struct ToolDisplay {
+    name: String,
+    content: String,
+    preview: String,
+    is_error: bool,
+    elapsed_ms: u128,
+    expanded: bool,
 }
 
 impl Default for OutputState {
@@ -125,6 +150,12 @@ impl Default for OutputState {
             fullscreen_header: "open-agent-harness".to_owned(),
             fullscreen_stream: String::new(),
             fullscreen_composer_reserve: 1,
+            tool_displays: HashMap::new(),
+            markdown_stream: StreamingMarkdown::new(MarkdownRenderOptions::default()),
+            markdown_committed_lines: 0,
+            final_markdown: None,
+            syntax_highlighting: true,
+            trusted_roots: Vec::new(),
         }
     }
 }
@@ -164,6 +195,28 @@ impl ConversationUi {
 
     pub fn interactive(&self) -> bool {
         io::stdin().is_terminal() && io::stdout().is_terminal()
+    }
+
+    pub fn set_syntax_highlighting(&self, enabled: bool) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.syntax_highlighting = enabled;
+        let columns = terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+        state.markdown_stream = StreamingMarkdown::new(MarkdownRenderOptions {
+            columns: columns.max(1),
+            syntax_highlighting: enabled,
+        });
+        state.markdown_committed_lines = 0;
+        state.final_markdown = None;
+    }
+
+    pub fn set_trusted_roots(&self, roots: Vec<PathBuf>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trusted_roots = roots;
     }
 
     pub fn tui_mode(&self) -> TuiMode {
@@ -298,6 +351,78 @@ impl ConversationUi {
             },
             kind,
         )
+    }
+
+    fn fullscreen_action_at(&self, row: u16, column: u16) -> Option<TranscriptAction> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fullscreen_guard.is_none() || row == 0 {
+            return None;
+        }
+        state.fullscreen.action_at(ViewportPoint {
+            row: usize::from(row - 1),
+            column: usize::from(column),
+        })
+    }
+
+    fn perform_fullscreen_action(&self, action: &TranscriptAction) -> Result<String> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match action {
+            TranscriptAction::ToggleTool(id) => {
+                let Some(display) = state.tool_displays.get_mut(id) else {
+                    return Ok("Tool result is no longer available".to_owned());
+                };
+                display.expanded = !display.expanded;
+                let expanded = display.expanded;
+                let symbol = if display.is_error { "✗" } else { "✓" };
+                let mut text = format!(
+                    "  ╰─ {symbol} {} {}",
+                    display.name,
+                    format_duration(display.elapsed_ms)
+                );
+                if expanded {
+                    for line in display.content.lines() {
+                        text.push_str("\n      ");
+                        text.push_str(line);
+                    }
+                    text.push_str("\n      (click to collapse)");
+                } else {
+                    if !display.preview.is_empty() {
+                        text.push_str(" · ");
+                        text.push_str(&display.preview);
+                    }
+                    text.push_str(" (click to expand)");
+                }
+                let action = TranscriptAction::ToggleTool(id.clone());
+                state.fullscreen.replace_action_message(&action, &text);
+                if state.fullscreen_guard.is_some() {
+                    render_fullscreen_locked(&mut state, None)?;
+                }
+                Ok(if expanded {
+                    "Expanded tool result".to_owned()
+                } else {
+                    "Collapsed tool result".to_owned()
+                })
+            }
+            TranscriptAction::OpenUrl(target) => {
+                let target = target.clone();
+                drop(state);
+                open_external_url(&target)?;
+                Ok("Opened link".to_owned())
+            }
+            TranscriptAction::OpenFile(path) => {
+                let path = trusted_file_path(path, &state.trusted_roots)
+                    .context("file is outside the trusted workspace or no longer exists")?;
+                drop(state);
+                open_external_file(&path)?;
+                Ok("Opened file".to_owned())
+            }
+        }
     }
 
     fn fullscreen_selection_drag(&self, row: u16, column: u16) -> bool {
@@ -443,7 +568,19 @@ impl ConversationUi {
                 let _ = styled_status(&mut out, self.color, &label);
                 state.status_open = true;
             }
-            QueryEvent::AssistantMessage { .. } => {}
+            QueryEvent::AssistantMessage { .. } => {
+                let rendered = state.final_markdown.take().unwrap_or_default();
+                let start = state.markdown_committed_lines.min(rendered.lines.len());
+                if start < rendered.lines.len() {
+                    let _ = write_assistant_markdown_lines(
+                        &mut out,
+                        self.color,
+                        &mut state.assistant_open,
+                        &rendered.lines[start..],
+                    );
+                }
+                state.markdown_committed_lines = rendered.lines.len();
+            }
             QueryEvent::CheckpointCreated { .. } => {}
             QueryEvent::ToolStarted { name, summary, .. } => {
                 clear_status(&mut out, &mut state);
@@ -551,28 +688,23 @@ impl ConversationUi {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        append_bounded_fullscreen_stream(&mut state, delta);
+        let frame = append_bounded_fullscreen_stream(&mut state, delta);
         if state.fullscreen_guard.is_some() {
             let _ = render_fullscreen_locked(&mut state, None);
             return;
         }
         let mut out = io::stdout().lock();
         clear_status(&mut out, &mut state);
-        if !state.assistant_open {
-            if self.color {
-                let _ = queue!(
-                    out,
-                    SetForegroundColor(Color::Cyan),
-                    SetAttribute(Attribute::Bold)
-                );
-            }
-            let _ = queue!(out, Print("◆ "));
-            if self.color {
-                let _ = queue!(out, ResetColor, SetAttribute(Attribute::Reset));
-            }
-            state.assistant_open = true;
+        let start = state.markdown_committed_lines.min(frame.stable.lines.len());
+        if start < frame.stable.lines.len() {
+            let _ = write_assistant_markdown_lines(
+                &mut out,
+                self.color,
+                &mut state.assistant_open,
+                &frame.stable.lines[start..],
+            );
+            state.markdown_committed_lines = frame.stable.lines.len();
         }
-        let _ = queue!(out, Print(sanitize_multiline(delta)));
         let _ = out.flush();
     }
 
@@ -588,12 +720,24 @@ impl ConversationUi {
         finish_fullscreen_stream(&mut state);
         if state.fullscreen_guard.is_some() {
             render_fullscreen_locked(&mut state, None)?;
+            reset_markdown_stream(&mut state);
             return Ok(());
         }
         let mut out = io::stdout().lock();
+        let rendered = state.markdown_stream.finish();
+        let start = state.markdown_committed_lines.min(rendered.lines.len());
+        if start < rendered.lines.len() {
+            write_assistant_markdown_lines(
+                &mut out,
+                self.color,
+                &mut state.assistant_open,
+                &rendered.lines[start..],
+            )?;
+        }
         close_assistant(&mut out, &mut state);
         queue!(out, Print("\n"))?;
         out.flush()?;
+        reset_markdown_stream(&mut state);
         Ok(())
     }
 }
@@ -637,7 +781,20 @@ fn finish_fullscreen_stream(state: &mut OutputState) {
     state.fullscreen_stream.clear();
 }
 
-fn append_bounded_fullscreen_stream(state: &mut OutputState, delta: &str) {
+fn reset_markdown_stream(state: &mut OutputState) {
+    let columns = terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+    state.markdown_stream = StreamingMarkdown::new(MarkdownRenderOptions {
+        columns: columns.max(1),
+        syntax_highlighting: state.syntax_highlighting,
+    });
+    state.markdown_committed_lines = 0;
+    state.final_markdown = None;
+}
+
+fn append_bounded_fullscreen_stream(
+    state: &mut OutputState,
+    delta: &str,
+) -> StreamingMarkdownFrame {
     let delta = sanitize_multiline(delta);
     let available = MAX_FULLSCREEN_STREAM_BYTES.saturating_sub(state.fullscreen_stream.len());
     let mut end = available.min(delta.len());
@@ -645,8 +802,10 @@ fn append_bounded_fullscreen_stream(state: &mut OutputState, delta: &str) {
         end = end.saturating_sub(1);
     }
     state.fullscreen_stream.push_str(&delta[..end]);
-    let visible = format!("Assistant · {}", state.fullscreen_stream);
+    let frame = state.markdown_stream.append(&delta);
+    let visible = format!("Assistant · {}", frame.combined().plain_text());
     state.fullscreen.set_streaming_line(Some(&visible));
+    frame
 }
 
 fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
@@ -654,6 +813,13 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
         QueryEvent::TurnStarted => {
             finish_fullscreen_stream(state);
             state.fullscreen.set_status(None);
+            let columns = terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+            state.markdown_stream = StreamingMarkdown::new(MarkdownRenderOptions {
+                columns: columns.max(1),
+                syntax_highlighting: state.syntax_highlighting,
+            });
+            state.markdown_committed_lines = 0;
+            state.final_markdown = None;
         }
         QueryEvent::RequestStarted { round } => {
             let status = if *round == 1 {
@@ -663,20 +829,39 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
             };
             state.fullscreen.set_status(Some(&status));
         }
-        QueryEvent::AssistantMessage { content } => {
+        QueryEvent::AssistantMessage { display_text, .. } => {
+            state.markdown_stream.replace(display_text);
+            let rendered = state.markdown_stream.finish();
+            state.final_markdown = Some(rendered.clone());
             if !state.fullscreen_stream.is_empty() {
-                let complete = assistant_content_text(content);
                 state.fullscreen.set_streaming_line(None);
                 state.fullscreen_stream.clear();
-                if !complete.is_empty() {
-                    state
-                        .fullscreen
-                        .push_message(&format!("Assistant · {complete}"));
+            }
+            if !display_text.is_empty() {
+                for (index, line) in rendered.lines.iter().enumerate() {
+                    let text = if index == 0 {
+                        format!("Assistant · {}", line.plain)
+                    } else {
+                        line.plain.clone()
+                    };
+                    if let Some(link) = line.links.first() {
+                        state.fullscreen.push_action_message(
+                            &text,
+                            TranscriptAction::OpenUrl(link.target.clone()),
+                        );
+                    } else {
+                        state.fullscreen.push_message(&text);
+                    }
                 }
             }
         }
         QueryEvent::CheckpointCreated { .. } => {}
-        QueryEvent::ToolStarted { name, summary, .. } => {
+        QueryEvent::ToolStarted {
+            name,
+            summary,
+            path,
+            ..
+        } => {
             finish_fullscreen_stream(state);
             state.fullscreen.set_status(None);
             let summary = single_line(summary, 120);
@@ -685,10 +870,22 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
             } else {
                 format!("● {name} · {summary}")
             };
-            state.fullscreen.push_message(&line);
+            if let Some(path) = path
+                .as_deref()
+                .and_then(|path| trusted_file_path(path, &state.trusted_roots))
+            {
+                state.fullscreen.push_action_message(
+                    &line,
+                    TranscriptAction::OpenFile(path.display().to_string()),
+                );
+            } else {
+                state.fullscreen.push_message(&line);
+            }
         }
         QueryEvent::ToolFinished {
+            id,
             name,
+            content,
             preview,
             collapsed,
             is_error,
@@ -705,10 +902,29 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
             if *collapsed {
                 suffix.push_str(" (Ctrl-O to expand)");
             }
-            state.fullscreen.push_message(&format!(
+            let line = format!(
                 "  ╰─ {symbol} {name} {}{suffix}",
                 format_duration(*elapsed_ms)
-            ));
+            );
+            if *collapsed {
+                state.tool_displays.insert(
+                    id.clone(),
+                    ToolDisplay {
+                        name: name.clone(),
+                        content: content.clone(),
+                        preview: preview.clone(),
+                        is_error: *is_error,
+                        elapsed_ms: *elapsed_ms,
+                        expanded: false,
+                    },
+                );
+                state.fullscreen.push_action_message(
+                    &line.replace("(Ctrl-O to expand)", "(click to expand)"),
+                    TranscriptAction::ToggleTool(id.clone()),
+                );
+            } else {
+                state.fullscreen.push_message(&line);
+            }
         }
         QueryEvent::CompactStarted => {
             finish_fullscreen_stream(state);
@@ -740,15 +956,6 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
                 .push_message(&format!("Error: {}", single_line(message, 180)));
         }
     }
-}
-
-fn assistant_content_text(content: &[serde_json::Value]) -> String {
-    content
-        .iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 pub struct InputEditor {
@@ -1010,6 +1217,75 @@ pub fn open_file_in_external_editor(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn open_external_url(target: &str) -> Result<()> {
+    let parsed =
+        url::Url::parse(target).map_err(|error| anyhow::anyhow!("invalid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host_str().is_none()
+        || target.chars().any(char::is_control)
+    {
+        anyhow::bail!("only credential-free http/https URLs can be opened")
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("open");
+        command.arg(target);
+        command
+    } else if cfg!(windows) {
+        let mut command = std::process::Command::new("rundll32");
+        command.args(["url.dll,FileProtocolHandler", target]);
+        command
+    } else {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(target);
+        command
+    };
+    command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("cannot open URL: {error}"))?;
+    Ok(())
+}
+
+fn trusted_file_path(candidate: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    if candidate.is_empty() || candidate.len() > 4_096 || candidate.chars().any(char::is_control) {
+        return None;
+    }
+    let candidate = Path::new(candidate);
+    let candidates = if candidate.is_absolute() {
+        vec![candidate.to_owned()]
+    } else {
+        roots.iter().map(|root| root.join(candidate)).collect()
+    };
+    candidates.into_iter().find_map(|candidate| {
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return None;
+        }
+        roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| canonical.starts_with(root))
+            .then_some(canonical)
+    })
+}
+
+fn open_external_file(path: &Path) -> Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        std::process::Command::new("explorer")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command
+        .arg(path)
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("cannot open file: {error}"))?;
+    Ok(())
+}
+
 fn edit_prompt_externally(prompt: &str) -> Result<String> {
     let path = std::env::temp_dir().join(format!(
         "open-agent-harness-prompt-{}.md",
@@ -1055,6 +1331,7 @@ pub struct InputReadContext<'a> {
     pub commands: &'a [SlashCommandSuggestion],
     pub files: &'a [FileSuggestion],
     pub todos: &'a [String],
+    pub task_count: usize,
     pub status_line: Option<&'a str>,
     pub theme: ThemePreset,
     pub copy_on_select: bool,
@@ -1069,6 +1346,14 @@ pub struct InputReadActions<'a> {
     /// The inner `None` clears an existing status line.
     pub status_line_refresh:
         &'a mut dyn FnMut(PermissionMode, Option<VimMode>) -> Option<Option<String>>,
+    /// Returns a new bounded task/todo snapshot only when live state changed.
+    pub task_refresh: &'a mut dyn FnMut() -> Option<TaskUiUpdate>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskUiUpdate {
+    pub lines: Vec<String>,
+    pub active_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1851,6 +2136,7 @@ struct PickerText<'a> {
     title: &'a str,
     help: &'a str,
     preview_theme: bool,
+    syntax_highlighting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1960,14 +2246,128 @@ pub fn select_rewind_checkpoint(options: &[ModelOption]) -> Result<ModelPickerOu
     )
 }
 
-pub fn select_theme(options: &[ModelOption], current: &str) -> Result<ModelPickerOutcome> {
-    select_option(
+pub fn select_theme(
+    options: &[ModelOption],
+    current: &str,
+    syntax_highlighting: bool,
+) -> Result<(ModelPickerOutcome, bool)> {
+    select_option_with_syntax(
         options,
         current,
         "Select theme",
-        "Choose a provider-neutral terminal color preset. Escape keeps the current preset.",
+        "Choose a color preset. Ctrl-T toggles code syntax highlighting; Escape cancels.",
         true,
+        syntax_highlighting,
     )
+}
+
+trait TerminalDialog {
+    type Action;
+
+    fn render_dialog(&self, width: u16, height: u16) -> crate::terminal_dialogs::DialogFrame;
+    fn handle_dialog(&mut self, input: DialogInput, now_millis: u64) -> DialogUpdate<Self::Action>;
+}
+
+impl TerminalDialog for PermissionManagerDialog {
+    type Action = PermissionManagerAction;
+
+    fn render_dialog(&self, width: u16, height: u16) -> crate::terminal_dialogs::DialogFrame {
+        self.render(width, height)
+    }
+
+    fn handle_dialog(&mut self, input: DialogInput, now_millis: u64) -> DialogUpdate<Self::Action> {
+        self.handle_at(input, now_millis)
+    }
+}
+
+impl TerminalDialog for TaskDialog {
+    type Action = TaskDialogAction;
+
+    fn render_dialog(&self, width: u16, height: u16) -> crate::terminal_dialogs::DialogFrame {
+        self.render(width, height)
+    }
+
+    fn handle_dialog(&mut self, input: DialogInput, now_millis: u64) -> DialogUpdate<Self::Action> {
+        self.handle_at(input, now_millis)
+    }
+}
+
+impl TerminalDialog for SettingsDialog {
+    type Action = SettingsDialogAction;
+
+    fn render_dialog(&self, width: u16, height: u16) -> crate::terminal_dialogs::DialogFrame {
+        self.render(width, height)
+    }
+
+    fn handle_dialog(&mut self, input: DialogInput, now_millis: u64) -> DialogUpdate<Self::Action> {
+        self.handle_at(input, now_millis)
+    }
+}
+
+struct DialogScreenGuard {
+    renderer: AlternateScreenRenderer,
+}
+
+impl DialogScreenGuard {
+    fn enter() -> Result<Self> {
+        let (width, height) = terminal::size().unwrap_or((80, 24));
+        let mut renderer = AlternateScreenRenderer::new(width, height);
+        renderer.enter(&mut io::stdout())?;
+        Ok(Self { renderer })
+    }
+}
+
+impl Drop for DialogScreenGuard {
+    fn drop(&mut self) {
+        let _ = self.renderer.leave(&mut io::stdout());
+    }
+}
+
+fn run_terminal_dialog<D: TerminalDialog>(mut dialog: D) -> Result<D::Action> {
+    let _raw = RawModeGuard::enter()?;
+    let mut screen = DialogScreenGuard::enter()?;
+    let started = Instant::now();
+    let mut exit_hint = None;
+
+    loop {
+        let (width, height) = screen.renderer.size();
+        let mut frame = dialog.render_dialog(width, height);
+        if let Some(hint) = exit_hint.take() {
+            let mut lines = frame.lines().to_vec();
+            lines.push(hint);
+            frame = crate::terminal_dialogs::DialogFrame::new(lines, frame.cursor(), width, height);
+        }
+        screen.renderer.draw(&mut io::stdout(), &frame)?;
+        match event::read()? {
+            Event::Resize(width, height) => screen.renderer.resize(width, height),
+            Event::Key(key) => {
+                let Some(input) = DialogInput::from_key_event(key) else {
+                    continue;
+                };
+                let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                match dialog.handle_dialog(input, millis) {
+                    DialogUpdate::Continue => {}
+                    DialogUpdate::ExitHint(key) => exit_hint = Some(key.hint().to_owned()),
+                    DialogUpdate::Action(action) => return Ok(action),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn manage_permissions_dialog(
+    dialog: PermissionManagerDialog,
+) -> Result<PermissionManagerAction> {
+    run_terminal_dialog(dialog)
+}
+
+pub fn show_tasks_dialog(dialog: TaskDialog) -> Result<TaskDialogAction> {
+    run_terminal_dialog(dialog)
+}
+
+pub fn configure_ui_dialog(dialog: SettingsDialog) -> Result<SettingsDialogAction> {
+    run_terminal_dialog(dialog)
 }
 
 fn select_option(
@@ -1977,18 +2377,31 @@ fn select_option(
     help: &str,
     preview_theme: bool,
 ) -> Result<ModelPickerOutcome> {
+    select_option_with_syntax(options, current, title, help, preview_theme, true)
+        .map(|(outcome, _)| outcome)
+}
+
+fn select_option_with_syntax(
+    options: &[ModelOption],
+    current: &str,
+    title: &str,
+    help: &str,
+    preview_theme: bool,
+    syntax_highlighting: bool,
+) -> Result<(ModelPickerOutcome, bool)> {
     if options.is_empty() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(ModelPickerOutcome::Cancelled);
+        return Ok((ModelPickerOutcome::Cancelled, syntax_highlighting));
     }
     let _raw = RawModeGuard::enter()?;
     let mut out = io::stdout();
     let mut state = ModelPickerState::new(options, current);
     let mut rendered = RenderedPicker::default();
     let mut exit_pending: Option<(KeyCode, Instant)> = None;
-    let text = PickerText {
+    let mut text = PickerText {
         title,
         help,
         preview_theme,
+        syntax_highlighting,
     };
 
     loop {
@@ -2023,13 +2436,20 @@ fn select_option(
                         *pending == code && armed.elapsed() <= EXIT_WINDOW
                     }) {
                         rendered.erase(&mut out)?;
-                        return Ok(ModelPickerOutcome::Exit);
+                        return Ok((ModelPickerOutcome::Exit, text.syntax_highlighting));
                     }
                     exit_pending = Some((code, Instant::now()));
                     continue;
                 }
                 exit_pending = None;
                 match key {
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    } if preview_theme => {
+                        text.syntax_highlighting = !text.syntax_highlighting;
+                    }
                     KeyEvent {
                         code: KeyCode::Up | KeyCode::Char('k'),
                         modifiers: KeyModifiers::NONE,
@@ -2066,7 +2486,10 @@ fn select_option(
                         let index = digit.to_digit(10).unwrap_or_default() as usize - 1;
                         if let Some(option) = options.get(index) {
                             rendered.erase(&mut out)?;
-                            return Ok(ModelPickerOutcome::Selected(option.value.clone()));
+                            return Ok((
+                                ModelPickerOutcome::Selected(option.value.clone()),
+                                text.syntax_highlighting,
+                            ));
                         }
                     }
                     KeyEvent {
@@ -2075,13 +2498,16 @@ fn select_option(
                     } => {
                         let selected = options[state.focused].value.clone();
                         rendered.erase(&mut out)?;
-                        return Ok(ModelPickerOutcome::Selected(selected));
+                        return Ok((
+                            ModelPickerOutcome::Selected(selected),
+                            text.syntax_highlighting,
+                        ));
                     }
                     KeyEvent {
                         code: KeyCode::Esc, ..
                     } => {
                         rendered.erase(&mut out)?;
-                        return Ok(ModelPickerOutcome::Cancelled);
+                        return Ok((ModelPickerOutcome::Cancelled, text.syntax_highlighting));
                     }
                     _ => {}
                 }
@@ -2385,6 +2811,7 @@ impl InputEditor {
             commands,
             files,
             todos,
+            task_count,
             status_line,
             theme,
             copy_on_select,
@@ -2395,6 +2822,7 @@ impl InputEditor {
             rewind_picker,
             transcript_viewer,
             status_line_refresh,
+            task_refresh,
         } = actions;
         let mut raw_guard = Some(RawModeGuard::enter()?);
         #[cfg(unix)]
@@ -2413,6 +2841,8 @@ impl InputEditor {
         let mut draft = String::new();
         let mut mode = initial_mode;
         let mut live_status_line = status_line.map(ToOwned::to_owned);
+        let mut live_tasks = todos.to_vec();
+        let mut live_task_count = task_count;
         let mut exit_pending: Option<ExitPending> = None;
         let mut last_escape: Option<Instant> = None;
         let mut hint = String::new();
@@ -2424,6 +2854,7 @@ impl InputEditor {
         let mut show_todos = false;
         let mut selected_attachment: Option<usize> = None;
         let mut fullscreen_last_click: Option<(Instant, u16, u16, u8)> = None;
+        let mut pending_fullscreen_action: Option<(Instant, u16, u16, TranscriptAction)> = None;
         let mut fullscreen_selecting = false;
         let mut fullscreen_composer_hit_map = FullscreenComposerHitMap::default();
         let mut clipboard_images = std::mem::take(&mut self.stashed_clipboard_images);
@@ -2468,6 +2899,24 @@ impl InputEditor {
                 if live_status_line != refreshed {
                     live_status_line = refreshed;
                     needs_redraw = true;
+                }
+            }
+            if let Some(refreshed) = task_refresh() {
+                if live_tasks != refreshed.lines || live_task_count != refreshed.active_count {
+                    live_tasks = refreshed.lines;
+                    live_task_count = refreshed.active_count;
+                    needs_redraw = true;
+                }
+            }
+            if pending_fullscreen_action
+                .as_ref()
+                .is_some_and(|(at, _, _, _)| at.elapsed() >= FULLSCREEN_CLICK_WINDOW)
+            {
+                if let Some((_, _, _, action)) = pending_fullscreen_action.take() {
+                    if let Some(ui) = self.ui.as_ref() {
+                        hint = ui.perform_fullscreen_action(&action)?;
+                        needs_redraw = true;
+                    }
                 }
             }
             if self.keybindings.reload_if_due(false) {
@@ -2587,7 +3036,8 @@ impl InputEditor {
                     argument_suggestions: &argument_suggestions,
                     selected_argument_suggestion,
                     argument_hint,
-                    todos: show_todos.then_some(todos),
+                    todos: show_todos.then_some(live_tasks.as_slice()),
+                    task_count: live_task_count,
                     status_line: live_status_line.as_deref(),
                     theme,
                     vim_mode,
@@ -2670,6 +3120,24 @@ impl InputEditor {
                             2 => ClickKind::Double,
                             _ => ClickKind::Triple,
                         };
+                        if count == 1 {
+                            if let Some(action) = ui.fullscreen_action_at(mouse.row, mouse.column) {
+                                if let Some((_, _, _, prior)) = pending_fullscreen_action.replace((
+                                    now,
+                                    mouse.row,
+                                    mouse.column,
+                                    action,
+                                )) {
+                                    hint = ui.perform_fullscreen_action(&prior)?;
+                                }
+                                fullscreen_selecting = false;
+                                continue;
+                            }
+                        } else if pending_fullscreen_action.as_ref().is_some_and(
+                            |(_, row, column, _)| *row == mouse.row && *column == mouse.column,
+                        ) {
+                            pending_fullscreen_action = None;
+                        }
                         fullscreen_selecting =
                             ui.fullscreen_selection_start(mouse.row, mouse.column, kind);
                         if fullscreen_selecting {
@@ -2678,9 +3146,19 @@ impl InputEditor {
                     }
                     Event::Mouse(mouse)
                         if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
-                            && fullscreen_selecting =>
+                            && (fullscreen_selecting || pending_fullscreen_action.is_some()) =>
                     {
+                        if let Some((_, row, column, _)) = pending_fullscreen_action.take() {
+                            fullscreen_selecting =
+                                ui.fullscreen_selection_start(row, column, ClickKind::Single);
+                        }
                         ui.fullscreen_selection_drag(mouse.row, mouse.column);
+                        continue;
+                    }
+                    Event::Mouse(mouse)
+                        if mouse.kind == MouseEventKind::Up(MouseButton::Left)
+                            && pending_fullscreen_action.is_some() =>
+                    {
                         continue;
                     }
                     Event::Mouse(mouse)
@@ -2803,6 +3281,7 @@ impl InputEditor {
             let previous_buffer = buffer.clone();
             let previous_cursor_byte = cursor_byte;
             let mut restored_undo = false;
+            let mut accepted_file_reference = false;
             let mut open_external_editor = false;
             let previous_selected_name = suggestions
                 .get(selected_suggestion)
@@ -3271,8 +3750,17 @@ impl InputEditor {
                             ..
                         } if !file_suggestions.is_empty() => {
                             let token = file_token.as_ref().expect("file suggestions have a token");
+                            let exact_file = files
+                                .iter()
+                                .any(|file| !file.is_dir && file.display_path == token.query);
                             let common = common_file_prefix(&file_suggestions);
-                            if file_suggestions.len() > 1 && common.len() > token.query.len() {
+                            if exact_file {
+                                accepted_file_reference = true;
+                                dismissed_file_suggestions_for =
+                                    Some((buffer.clone(), cursor_byte));
+                                hint = "File reference inserted".to_owned();
+                            } else if file_suggestions.len() > 1 && common.len() > token.query.len()
+                            {
                                 cursor_byte = replace_file_token(
                                     &mut buffer,
                                     cursor_byte,
@@ -3292,6 +3780,11 @@ impl InputEditor {
                                     suggestion.is_dir,
                                     false,
                                 );
+                                if !suggestion.is_dir {
+                                    accepted_file_reference = true;
+                                    dismissed_file_suggestions_for =
+                                        Some((buffer.clone(), cursor_byte));
+                                }
                                 hint = "File reference inserted".to_owned();
                             }
                         }
@@ -3301,15 +3794,29 @@ impl InputEditor {
                             ..
                         } if !file_suggestions.is_empty() => {
                             let token = file_token.as_ref().expect("file suggestions have a token");
-                            let suggestion = file_suggestions[selected_file_suggestion];
-                            cursor_byte = replace_file_token(
-                                &mut buffer,
-                                cursor_byte,
-                                token,
-                                &suggestion.display_path,
-                                suggestion.is_dir,
-                                false,
-                            );
+                            if files
+                                .iter()
+                                .any(|file| !file.is_dir && file.display_path == token.query)
+                            {
+                                accepted_file_reference = true;
+                                dismissed_file_suggestions_for =
+                                    Some((buffer.clone(), cursor_byte));
+                            } else {
+                                let suggestion = file_suggestions[selected_file_suggestion];
+                                cursor_byte = replace_file_token(
+                                    &mut buffer,
+                                    cursor_byte,
+                                    token,
+                                    &suggestion.display_path,
+                                    suggestion.is_dir,
+                                    false,
+                                );
+                                if !suggestion.is_dir {
+                                    accepted_file_reference = true;
+                                    dismissed_file_suggestions_for =
+                                        Some((buffer.clone(), cursor_byte));
+                                }
+                            }
                             hint = "File reference inserted".to_owned();
                         }
                         KeyEvent {
@@ -4093,7 +4600,9 @@ impl InputEditor {
                     }
                 }
                 dismissed_suggestions_for = None;
-                dismissed_file_suggestions_for = None;
+                if !accepted_file_reference {
+                    dismissed_file_suggestions_for = None;
+                }
                 dismissed_argument_suggestions_for = None;
                 if buffer != previous_buffer {
                     // Filtering establishes a new ranked list. Focus its best
@@ -4220,6 +4729,7 @@ struct InputRenderState<'a> {
     selected_argument_suggestion: usize,
     argument_hint: Option<&'a str>,
     todos: Option<&'a [String]>,
+    task_count: usize,
     status_line: Option<&'a str>,
     theme: ThemePreset,
     vim_mode: Option<VimMode>,
@@ -4312,6 +4822,7 @@ impl RenderedInput {
             selected_argument_suggestion,
             argument_hint,
             todos,
+            task_count,
             status_line,
             theme,
             vim_mode,
@@ -4337,12 +4848,15 @@ impl RenderedInput {
         let mut rendered_cursor_column = active_column;
         let color = std::env::var_os("NO_COLOR").is_none() && theme != ThemePreset::NoColor;
         let accent = match theme {
-            ThemePreset::Light => Color::Blue,
-            ThemePreset::Daltonized => Color::Magenta,
-            ThemePreset::Auto | ThemePreset::Dark | ThemePreset::NoColor => Color::Cyan,
+            ThemePreset::Light | ThemePreset::LightAnsi => Color::Blue,
+            ThemePreset::DarkDaltonized | ThemePreset::LightDaltonized => Color::Magenta,
+            ThemePreset::Auto
+            | ThemePreset::Dark
+            | ThemePreset::DarkAnsi
+            | ThemePreset::NoColor => Color::Cyan,
         };
         let muted = match theme {
-            ThemePreset::Dark => Color::Grey,
+            ThemePreset::Dark | ThemePreset::DarkDaltonized | ThemePreset::DarkAnsi => Color::Grey,
             _ => Color::DarkGrey,
         };
         let shell_mode = buffer.starts_with('!');
@@ -4436,7 +4950,7 @@ impl RenderedInput {
             queue!(out, SetForegroundColor(muted))?;
         }
         queue!(out, Print(&rule), Print(RAW_LINE_END))?;
-        let footer = if lines.len() > visible_limit {
+        let mut footer = if lines.len() > visible_limit {
             if hint.is_empty() {
                 format!(
                     "  {} · line {}/{} · Shift+Tab mode · Ctrl+J newline",
@@ -4465,6 +4979,18 @@ impl RenderedInput {
                 mode_label(mode)
             )
         };
+        if task_count > 0 && todos.is_none() {
+            let task_status = format!(
+                "{} task{} · Ctrl-T view",
+                task_count,
+                if task_count == 1 { "" } else { "s" }
+            );
+            footer = if width < 80 {
+                format!("  {} · {task_status}", mode_label(mode))
+            } else {
+                format!("{footer} · {task_status}")
+            };
+        }
         let rendered_suggestions = if !file_suggestions.is_empty() {
             let count = suggestion_limit.min(height.saturating_sub(3).max(1));
             let start = selected_file_suggestion
@@ -4710,8 +5236,9 @@ impl RenderedPicker {
         text: PickerText<'_>,
     ) -> Result<()> {
         let width = terminal::size()
-            .map(|(width, _)| usize::from(width).max(20))
+            .map(|(width, _)| usize::from(width).max(4))
             .unwrap_or(80);
+        let compact = width < 40;
         let color = std::env::var_os("NO_COLOR").is_none();
         let accent = if text.preview_theme {
             picker_theme_accent(&options[state.focused].value)
@@ -4724,20 +5251,28 @@ impl RenderedPicker {
             }
             queue!(out, SetAttribute(Attribute::Bold))?;
         }
-        queue!(out, Print("  "), Print(text.title))?;
+        queue!(
+            out,
+            Print(visible_line(
+                &format!("  {}", text.title),
+                width.saturating_sub(1)
+            ))
+        )?;
         if color {
             queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
         }
-        queue!(
-            out,
-            Print(RAW_LINE_END),
-            Print(visible_line(
-                &format!("  {}", text.help),
-                width.saturating_sub(1)
-            )),
-            Print(RAW_LINE_END),
-            Print(RAW_LINE_END)
-        )?;
+        queue!(out, Print(RAW_LINE_END))?;
+        if !compact {
+            queue!(
+                out,
+                Print(visible_line(
+                    &format!("  {}", text.help),
+                    width.saturating_sub(1)
+                )),
+                Print(RAW_LINE_END)
+            )?;
+        }
+        queue!(out, Print(RAW_LINE_END))?;
 
         let visible_to = (state.visible_from + state.visible_count).min(options.len());
         let index_width = options.len().to_string().len();
@@ -4795,18 +5330,31 @@ impl RenderedPicker {
             }
             queue!(
                 out,
-                Print(format!("    and {hidden} more…")),
+                Print(visible_line(
+                    &format!("    and {hidden} more…"),
+                    width.saturating_sub(1)
+                )),
                 Print(RAW_LINE_END)
             )?;
             if color {
                 queue!(out, ResetColor)?;
             }
         }
-        let preview_rows = if text.preview_theme {
+        let preview_rows = if text.preview_theme && width >= 24 {
             queue!(
                 out,
                 Print(RAW_LINE_END),
-                Print("  Preview · demo.rs"),
+                Print(visible_line(
+                    &format!(
+                        "  Preview · demo.rs · syntax {}",
+                        if text.syntax_highlighting {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ),
+                    width.saturating_sub(1)
+                )),
                 Print(RAW_LINE_END)
             )?;
             if color && options[state.focused].value != "no-color" {
@@ -4814,7 +5362,10 @@ impl RenderedPicker {
             }
             queue!(
                 out,
-                Print("  - let message = \"before\";"),
+                Print(visible_line(
+                    "  - let message = \"before\";",
+                    width.saturating_sub(1)
+                )),
                 Print(RAW_LINE_END)
             )?;
             if color && options[state.focused].value != "no-color" {
@@ -4822,7 +5373,10 @@ impl RenderedPicker {
             }
             queue!(
                 out,
-                Print("  + let message = \"after\";"),
+                Print(visible_line(
+                    "  + let message = \"after\";",
+                    width.saturating_sub(1)
+                )),
                 Print(RAW_LINE_END)
             )?;
             if color {
@@ -4849,10 +5403,12 @@ impl RenderedPicker {
         }
 
         let hidden_row = usize::from(hidden > 0);
-        self.rows =
-            u16::try_from(5 + state.visible_count + hidden_row + preview_rows).unwrap_or(u16::MAX);
+        let help_rows = usize::from(!compact);
+        self.rows = u16::try_from(4 + help_rows + state.visible_count + hidden_row + preview_rows)
+            .unwrap_or(u16::MAX);
         self.cursor_row =
-            u16::try_from(3 + state.focused.saturating_sub(state.visible_from)).unwrap_or(u16::MAX);
+            u16::try_from(2 + help_rows + state.focused.saturating_sub(state.visible_from))
+                .unwrap_or(u16::MAX);
         queue!(
             out,
             cursor::MoveUp(self.rows.saturating_sub(self.cursor_row)),
@@ -4864,8 +5420,8 @@ impl RenderedPicker {
 
 fn picker_theme_accent(theme: &str) -> Option<Color> {
     match theme {
-        "light" => Some(Color::Blue),
-        "daltonized" => Some(Color::Magenta),
+        "light" | "light-ansi" => Some(Color::Blue),
+        "daltonized" | "dark-daltonized" | "light-daltonized" => Some(Color::Magenta),
         "no-color" => None,
         _ => Some(Color::Cyan),
     }
@@ -5019,6 +5575,108 @@ fn clear_status(out: &mut impl Write, state: &mut OutputState) {
         let _ = queue!(out, Print("\r"), Clear(ClearType::CurrentLine));
         state.status_open = false;
     }
+}
+
+fn write_assistant_markdown_lines(
+    out: &mut impl Write,
+    color: bool,
+    assistant_open: &mut bool,
+    lines: &[RenderedLine],
+) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    if !*assistant_open {
+        if color {
+            queue!(
+                out,
+                SetForegroundColor(Color::Cyan),
+                SetAttribute(Attribute::Bold)
+            )?;
+        }
+        queue!(out, Print("◆ "))?;
+        if color {
+            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
+        *assistant_open = true;
+    } else {
+        queue!(out, Print(RAW_LINE_END))?;
+    }
+    for (line_index, line) in lines.iter().enumerate() {
+        if line_index > 0 {
+            queue!(out, Print(RAW_LINE_END))?;
+        }
+        write_rendered_markdown_line(out, color, line)?;
+    }
+    Ok(())
+}
+
+fn write_rendered_markdown_line(
+    out: &mut impl Write,
+    color: bool,
+    line: &RenderedLine,
+) -> io::Result<()> {
+    let mut boundaries = vec![0, line.plain.len()];
+    for span in &line.styles {
+        boundaries.extend([span.range.start, span.range.end]);
+    }
+    for link in &line.links {
+        boundaries.extend([link.range.start, link.range.end]);
+    }
+    boundaries
+        .retain(|boundary| *boundary <= line.plain.len() && line.plain.is_char_boundary(*boundary));
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    for range in boundaries.windows(2) {
+        let start = range[0];
+        let end = range[1];
+        if start == end {
+            continue;
+        }
+        if color {
+            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+            for span in line
+                .styles
+                .iter()
+                .filter(|span| span.range.start <= start && span.range.end >= end)
+            {
+                match span.style {
+                    TextStyle::Bold | TextStyle::Heading(_) => {
+                        queue!(out, SetAttribute(Attribute::Bold))?;
+                    }
+                    TextStyle::Italic => queue!(out, SetAttribute(Attribute::Italic))?,
+                    TextStyle::Underline => queue!(out, SetAttribute(Attribute::Underlined))?,
+                    TextStyle::Quote => queue!(out, SetForegroundColor(Color::DarkGrey))?,
+                    TextStyle::InlineCode | TextStyle::Code => {
+                        queue!(out, SetForegroundColor(Color::Yellow))?;
+                    }
+                    TextStyle::Syntax(class) => {
+                        let syntax = match class {
+                            SyntaxClass::Keyword => Color::Blue,
+                            SyntaxClass::String => Color::Green,
+                            SyntaxClass::Number => Color::Magenta,
+                            SyntaxClass::Comment => Color::DarkGrey,
+                        };
+                        queue!(out, SetForegroundColor(syntax))?;
+                    }
+                }
+            }
+        }
+        let text = &line.plain[start..end];
+        if let Some(link) = line
+            .links
+            .iter()
+            .find(|link| link.range.start <= start && link.range.end >= end)
+        {
+            write!(out, "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", link.target, text)?;
+        } else {
+            queue!(out, Print(text))?;
+        }
+    }
+    if color {
+        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    }
+    Ok(())
 }
 
 fn close_assistant(out: &mut impl Write, state: &mut OutputState) {
@@ -5892,6 +6550,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -5940,7 +6599,8 @@ mod tests {
         apply_fullscreen_event(
             &mut state,
             &QueryEvent::AssistantMessage {
-                content: vec![serde_json::json!({"type":"text", "text":complete})],
+                content: vec![serde_json::json!({"type":"text", "text":complete.clone()})],
+                display_text: complete,
             },
         );
         assert!(state.fullscreen_stream.is_empty());
@@ -5982,6 +6642,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -6011,6 +6672,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -6049,6 +6711,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -6080,6 +6743,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -6104,6 +6768,7 @@ mod tests {
                     selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
+                    task_count: 0,
                     status_line: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
@@ -6121,5 +6786,38 @@ mod tests {
         assert_eq!(lines.len(), 4, "final screen was {lines:#?}");
         assert_eq!(lines[1], "› ab");
         assert!(!lines.iter().any(|line| line.contains("abc")));
+    }
+
+    #[test]
+    fn clickable_file_paths_are_canonical_and_workspace_bounded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "nope\n").unwrap();
+
+        assert_eq!(
+            trusted_file_path("inside.rs", &[workspace.path().to_owned()]),
+            Some(workspace.path().join("inside.rs").canonicalize().unwrap())
+        );
+        assert_eq!(
+            trusted_file_path(
+                outside.path().join("secret.txt").to_str().unwrap(),
+                &[workspace.path().to_owned()]
+            ),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                workspace.path().join("escape"),
+            )
+            .unwrap();
+            assert_eq!(
+                trusted_file_path("escape", &[workspace.path().to_owned()]),
+                None
+            );
+        }
     }
 }

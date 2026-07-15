@@ -113,6 +113,8 @@ pub struct McpIntegration {
 pub trait McpControl: Send + Sync {
     fn status(&self) -> Vec<McpServerStatus>;
     async fn reconnect(&self, server: &str) -> Result<()>;
+    async fn enable(&self, server: &str) -> Result<()>;
+    async fn disable(&self, server: &str) -> Result<()>;
     async fn list_prompts(&self, context: &ToolContext) -> Result<Value>;
     async fn get_prompt(
         &self,
@@ -530,6 +532,15 @@ impl McpServerStates {
         }
     }
 
+    fn get(&self, name: &str) -> Option<McpServerState> {
+        self.values
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|state| state.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
     fn pending_names(&self) -> Vec<String> {
         self.values
             .read()
@@ -670,12 +681,21 @@ pub async fn connect_mcp(
     if configured_states.is_empty() {
         return Ok(None);
     }
-    let configs = parse_server_configs(settings, workspace)?;
-    let reconnect_configs = configs
+    let all_configs = parse_server_configs(settings, workspace)?;
+    let reconnect_configs = all_configs
         .iter()
         .map(|config| (config.name.to_ascii_lowercase(), config.clone()))
         .collect();
-    let has_enabled_servers = !configs.is_empty();
+    let disabled_names = configured_states
+        .iter()
+        .filter(|state| state.kind == McpServerStateKind::Disabled)
+        .map(|state| state.name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let configs = all_configs
+        .into_iter()
+        .filter(|config| !disabled_names.contains(&config.name.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let has_configured_servers = !configured_states.is_empty();
     let strict = settings
         .raw
         .get("strictMcpConfig")
@@ -751,8 +771,7 @@ pub async fn connect_mcp(
         states: Arc::clone(&manager.server_states),
         wait_timeout: WAIT_FOR_MCP_SERVERS_TIMEOUT,
     }));
-    let clients = manager.clients_snapshot();
-    if (!strict && has_enabled_servers) || clients.iter().any(|client| client.supports_resources) {
+    if has_configured_servers {
         active_tools.push(Arc::new(ListMcpResourcesTool {
             manager: Arc::clone(&manager),
         }));
@@ -763,7 +782,7 @@ pub async fn connect_mcp(
             manager: Arc::clone(&manager),
         }));
     }
-    if (!strict && has_enabled_servers) || clients.iter().any(|client| client.supports_prompts) {
+    if has_configured_servers {
         active_tools.push(Arc::new(ListMcpPromptsTool {
             manager: Arc::clone(&manager),
         }));
@@ -868,9 +887,6 @@ fn parse_server_configs(settings: &Settings, workspace: &Path) -> Result<Vec<Ser
         }
         let raw: RawServerConfig = serde_json::from_value(value.clone())
             .with_context(|| format!("MCP server {name} 配置无效"))?;
-        if raw.disabled {
-            continue;
-        }
         validate_server_config(name, &raw)?;
         let roots = resolve_mcp_roots(&raw.roots, workspace)
             .with_context(|| format!("MCP server {name} roots 无效"))?;
@@ -4038,6 +4054,12 @@ fn safe_resource_uri_metadata(uri: &str) -> Result<Value> {
 }
 
 impl ResourceHandleStore {
+    fn remove_server(&mut self, server: &str) {
+        self.entries
+            .retain(|_, entry| !entry.server.eq_ignore_ascii_case(server));
+        self.raw_bytes = self.entries.values().map(|entry| entry.raw.len()).sum();
+    }
+
     fn replace_server_kind(
         &mut self,
         server: &str,
@@ -4545,6 +4567,64 @@ impl McpManager {
         previous
     }
 
+    fn remove_connected_client(&self, name: &str) -> Option<Arc<McpClient>> {
+        let mut clients = self
+            .clients
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clients
+            .iter()
+            .position(|client| client.name.eq_ignore_ascii_case(name))
+            .map(|index| clients.remove(index))
+    }
+
+    fn configured_server(&self, server: &str) -> Result<(McpServerState, ServerConfig)> {
+        if server.is_empty()
+            || server.len() > MAX_SERVER_NAME_BYTES
+            || server.chars().any(char::is_control)
+        {
+            bail!("MCP server 名称无效")
+        }
+        let state = self
+            .server_states
+            .get(server)
+            .with_context(|| format!("MCP server {server:?} 不存在或已禁用"))?;
+        let config = self
+            .reconnect_configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&state.name.to_ascii_lowercase())
+            .cloned()
+            .with_context(|| format!("MCP server {:?} 配置不可用", state.name))?;
+        Ok((state, config))
+    }
+
+    async fn connect_configured(
+        &self,
+        state: McpServerState,
+        config: ServerConfig,
+        operation: &str,
+    ) -> Result<()> {
+        let name = state.name;
+        let auth_configured = server_config_uses_auth(&config);
+        self.server_states.set(&name, McpServerStateKind::Pending);
+        match McpClient::connect(config).await {
+            Ok(client) => {
+                let previous = self.replace_connected_client(client);
+                self.server_states.set(&name, McpServerStateKind::Connected);
+                if let Some(previous) = previous {
+                    previous.shutdown().await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.server_states
+                    .set(&name, classify_connection_failure(&error, auth_configured));
+                Err(error).with_context(|| format!("MCP server {name} {operation} 失败"))
+            }
+        }
+    }
+
     async fn start_background_connections(self: &Arc<Self>, configs: Vec<ServerConfig>) {
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
@@ -4561,6 +4641,17 @@ impl McpManager {
                             }
                             return;
                         };
+                        let _transition = manager.reconnect_lock.lock().await;
+                        if manager
+                            .server_states
+                            .get(&name)
+                            .is_some_and(|state| state.kind == McpServerStateKind::Disabled)
+                        {
+                            if let Ok(client) = attempt {
+                                client.shutdown().await;
+                            }
+                            return;
+                        }
                         match attempt {
                             Ok(client) => {
                                 manager.insert_connected_client(client);
@@ -4817,35 +4908,43 @@ impl McpControl for McpManager {
     }
 
     async fn reconnect(&self, server: &str) -> Result<()> {
-        if server.is_empty() || server.len() > MAX_SERVER_NAME_BYTES {
-            bail!("MCP reconnect server 名称无效")
-        }
         let _reconnect = self.reconnect_lock.lock().await;
-        let config = self
-            .reconnect_configs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&server.to_ascii_lowercase())
-            .cloned()
-            .with_context(|| format!("MCP server {server:?} 不存在或已禁用"))?;
-        let name = config.name.clone();
-        let auth_configured = server_config_uses_auth(&config);
-        self.server_states.set(&name, McpServerStateKind::Pending);
-        match McpClient::connect(config).await {
-            Ok(client) => {
-                let previous = self.replace_connected_client(client);
-                self.server_states.set(&name, McpServerStateKind::Connected);
-                if let Some(previous) = previous {
-                    previous.shutdown().await;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                self.server_states
-                    .set(&name, classify_connection_failure(&error, auth_configured));
-                Err(error).with_context(|| format!("MCP server {name} reconnect 失败"))
-            }
+        let (state, config) = self.configured_server(server)?;
+        if state.kind == McpServerStateKind::Disabled {
+            bail!("MCP server {:?} 已禁用；请先 enable", state.name)
         }
+        self.connect_configured(state, config, "reconnect").await
+    }
+
+    async fn enable(&self, server: &str) -> Result<()> {
+        let _transition = self.reconnect_lock.lock().await;
+        let (state, config) = self.configured_server(server)?;
+        if matches!(
+            state.kind,
+            McpServerStateKind::Connected | McpServerStateKind::Pending
+        ) {
+            return Ok(());
+        }
+        self.connect_configured(state, config, "enable").await
+    }
+
+    async fn disable(&self, server: &str) -> Result<()> {
+        let _transition = self.reconnect_lock.lock().await;
+        let (state, _) = self.configured_server(server)?;
+        if state.kind == McpServerStateKind::Disabled {
+            return Ok(());
+        }
+        let previous = self.remove_connected_client(&state.name);
+        self.server_states
+            .set(&state.name, McpServerStateKind::Disabled);
+        self.resource_handles
+            .lock()
+            .await
+            .remove_server(&state.name);
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        Ok(())
     }
 
     async fn list_prompts(&self, context: &ToolContext) -> Result<Value> {
@@ -4954,21 +5053,29 @@ impl ToolDiscovery for McpManager {
     }
 
     async fn refresh(&self) -> Result<ToolRefresh> {
-        let changed = self
-            .clients_snapshot()
+        let clients = self.clients_snapshot();
+        let active_servers = clients
+            .iter()
+            .map(|client| client.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let changed = clients
             .iter()
             .filter(|client| client.tools_changed.load(Ordering::Acquire))
             .cloned()
             .collect::<Vec<_>>();
-        if changed.is_empty() {
-            return Ok(ToolRefresh {
-                upsert: Vec::new(),
-                remove: Vec::new(),
-            });
-        }
         let mut known = self.known_tools.lock().await;
         let mut upsert = Vec::new();
         let mut remove = Vec::new();
+        let disconnected = known
+            .keys()
+            .filter(|name| !active_servers.contains(&name.to_ascii_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for server in disconnected {
+            if let Some(names) = known.remove(&server) {
+                remove.extend(names);
+            }
+        }
         for client in changed {
             match client.list_tools(Arc::clone(&self.resource_handles)).await {
                 Ok(tools) => {
@@ -5516,6 +5623,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn write_toggle_test_server(script: &Path) {
+        std::fs::write(
+            script,
+            r#"printf x >> "$MCP_TEST_COUNTER"
+while IFS= read -r line; do
+case "$line" in
+  *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"toggle-test","version":"1"}}}' ;;
+  *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","additionalProperties":false}}]}}' ;;
+esac
+done
+"#,
+        )
+        .unwrap();
+    }
+
     struct HookTestRpc {
         events: broadcast::Sender<Value>,
         requests: Mutex<Vec<(String, Option<Value>)>>,
@@ -5991,6 +6114,140 @@ done
         );
         let unknown = integration.control.reconnect("missing").await.unwrap_err();
         assert!(unknown.to_string().contains("不存在或已禁用"));
+        integration.service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabled_server_can_be_enabled_disabled_and_enabled_again_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("toggle-mcp.sh");
+        let counter = temp.path().join("starts.txt");
+        write_toggle_test_server(&script);
+        let settings = Settings {
+            raw: json!({
+                "mcpServers": {
+                    "ToggleServer": {
+                        "command":"/bin/sh",
+                        "args":[script],
+                        "env":{"MCP_TEST_COUNTER":counter},
+                        "disabled":true
+                    }
+                }
+            }),
+        };
+        let integration = connect_mcp(&settings, temp.path(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            integration.control.status(),
+            [McpServerStatus {
+                name: "ToggleServer".to_owned(),
+                status: McpServerStatusKind::Disabled,
+            }]
+        );
+        let reconnect = integration
+            .control
+            .reconnect("toggleserver")
+            .await
+            .unwrap_err();
+        assert!(reconnect.to_string().contains("已禁用"));
+
+        integration.control.enable("TOGGLESERVER").await.unwrap();
+        integration.control.enable("toggleserver").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Connected
+        );
+        let added = integration.discovery.refresh().await.unwrap();
+        assert!(
+            added
+                .upsert
+                .iter()
+                .any(|tool| tool.name() == "mcp__toggleserver__echo")
+        );
+
+        integration.control.disable("toggleSERVER").await.unwrap();
+        integration.control.disable("ToggleServer").await.unwrap();
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Disabled
+        );
+        let removed = integration.discovery.refresh().await.unwrap();
+        assert_eq!(removed.remove, ["mcp__toggleserver__echo"]);
+
+        integration.control.enable("ToggleServer").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "xx");
+        assert!(integration.control.enable("missing").await.is_err());
+        assert!(integration.control.disable("missing").await.is_err());
+        integration.service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_enable_calls_connect_a_disabled_server_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("concurrent-toggle-mcp.sh");
+        let counter = temp.path().join("starts.txt");
+        write_toggle_test_server(&script);
+        let settings = Settings {
+            raw: json!({
+                "mcpServers": {
+                    "Concurrent": {
+                        "command":"/bin/sh",
+                        "args":[script],
+                        "env":{"MCP_TEST_COUNTER":counter},
+                        "disabled":true
+                    }
+                }
+            }),
+        };
+        let integration = connect_mcp(&settings, temp.path(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = Arc::clone(&integration.control);
+        let second = Arc::clone(&integration.control);
+        let (first, second) = tokio::join!(first.enable("concurrent"), second.enable("CONCURRENT"));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Connected
+        );
+        integration.service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enable_failure_sets_failed_and_disable_recovers_to_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("failed-toggle-mcp.sh");
+        std::fs::write(&script, "exit 1\n").unwrap();
+        let settings = Settings {
+            raw: json!({
+                "mcpServers": {
+                    "Failing": {"command":"/bin/sh", "args":[script], "disabled":true}
+                }
+            }),
+        };
+        let integration = connect_mcp(&settings, temp.path(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(integration.control.enable("failing").await.is_err());
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Failed
+        );
+        integration.control.disable("FAILING").await.unwrap();
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Disabled
+        );
         integration.service.shutdown().await;
     }
 

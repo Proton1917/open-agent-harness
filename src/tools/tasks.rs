@@ -134,9 +134,6 @@ impl Tool for TaskOutputTool {
                 "Status: {status}\nCommand: {}\nOutput:\n{}",
                 task.command, output
             ));
-            if finished {
-                tasks.remove(&input.task_id);
-            }
             return Ok(result);
         }
     }

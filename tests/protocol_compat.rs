@@ -69,7 +69,7 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
     let emitted = emitted.lock().unwrap();
     assert!(emitted.iter().any(|event| matches!(
         event,
-        QueryEvent::AssistantMessage { content }
+        QueryEvent::AssistantMessage { content, .. }
             if content.iter().any(|block| block["type"] == "tool_use")
     )));
     assert!(!format!("{emitted:?}").contains("raw private state"));

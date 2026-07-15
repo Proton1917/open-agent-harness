@@ -47,6 +47,11 @@ pub enum QueryEvent {
     },
     AssistantMessage {
         content: Vec<Value>,
+        /// Exact public text sent to the interactive display after any trusted
+        /// display-only hook. This never replaces the protocol/transcript
+        /// `content`; it only lets a renderer reconcile a bounded stream
+        /// without reverting the visible hook result.
+        display_text: String,
     },
     CheckpointCreated {
         id: String,
@@ -56,10 +61,18 @@ pub enum QueryEvent {
         id: String,
         name: String,
         summary: String,
+        /// Candidate path from a file-oriented tool input. Renderers must
+        /// canonicalize it against trusted workspace roots before exposing an
+        /// open action.
+        path: Option<String>,
     },
     ToolFinished {
         id: String,
         name: String,
+        /// Full bounded public tool output retained for local expansion. It is
+        /// never added to progress/control JSON and is already subject to the
+        /// global tool-result ceiling.
+        content: String,
         preview: String,
         collapsed: bool,
         is_error: bool,
@@ -644,6 +657,7 @@ impl QueryEngine {
                 self.messages.extend(new_messages.clone());
                 self.emit(QueryEvent::AssistantMessage {
                     content: assistant_content,
+                    display_text: output.content.clone(),
                 });
                 return Ok(TurnResult {
                     text: output.content,
@@ -862,9 +876,10 @@ impl QueryEngine {
                     assistant_text.push_str(text);
                 }
             }
+            let mut displayed_text = assistant_text.clone();
             if message_display_enabled {
                 let message_id = uuid::Uuid::new_v4().to_string();
-                let displayed = match active_tool_context
+                displayed_text = match active_tool_context
                     .hooks()
                     .run(
                         "MessageDisplay",
@@ -889,12 +904,13 @@ impl QueryEngine {
                     }
                 };
                 if let Some(sink) = self.text_delta_sink.as_deref() {
-                    sink(&displayed);
+                    sink(&displayed_text);
                     streamed_text = true;
                 }
             }
             self.emit(QueryEvent::AssistantMessage {
                 content: public_content_blocks(&response.content),
+                display_text: displayed_text,
             });
             self.messages
                 .push(Message::assistant(response.content.clone()));
@@ -997,6 +1013,7 @@ impl QueryEngine {
                             id.clone(),
                             name.clone(),
                             active_registry.summary(name, input),
+                            public_tool_file_path(name, input),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -1008,20 +1025,22 @@ impl QueryEngine {
                 let finished_calls = Arc::clone(&call_events);
                 ToolExecutionObserver::new(
                     Arc::new(move |index| {
-                        if let Some((id, name, summary)) = started_calls.get(index) {
+                        if let Some((id, name, summary, path)) = started_calls.get(index) {
                             started_sink(&QueryEvent::ToolStarted {
                                 id: id.clone(),
                                 name: name.clone(),
                                 summary: summary.clone(),
+                                path: path.clone(),
                             });
                         }
                     }),
                     Arc::new(move |index, output, elapsed| {
-                        if let Some((id, name, _)) = finished_calls.get(index) {
+                        if let Some((id, name, _, _)) = finished_calls.get(index) {
                             let (preview, collapsed) = output_preview(&output.content);
                             finished_sink(&QueryEvent::ToolFinished {
                                 id: id.clone(),
                                 name: name.clone(),
+                                content: output.content.clone(),
                                 preview,
                                 collapsed,
                                 is_error: output.is_error,
@@ -1544,6 +1563,19 @@ fn truncate_compaction_history(messages: &[Message]) -> Option<Vec<Message>> {
         }
     }
     None
+}
+
+fn public_tool_file_path(name: &str, input: &Value) -> Option<String> {
+    let key = match name {
+        "Read" | "Write" | "Edit" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+    let path = input.get(key)?.as_str()?;
+    (!path.is_empty()
+        && path.len() <= 4_096
+        && !path.chars().any(|character| character.is_control()))
+    .then(|| path.to_owned())
 }
 
 fn output_preview(content: &str) -> (String, bool) {

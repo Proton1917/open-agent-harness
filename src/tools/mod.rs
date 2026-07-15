@@ -101,7 +101,10 @@ pub use skill::SkillTool;
 pub use tasks::{TaskOutputTool, TaskStopTool};
 pub use team::TeamTool;
 pub use wakeup::ScheduleWakeupTool;
-pub use work_items::{TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool, TodoWriteTool};
+pub use work_items::{
+    TaskCreateTool, TaskGetTool, TaskListTool, TaskUiItem, TaskUiItemKind, TaskUiSnapshot,
+    TaskUiStatus, TaskUpdateTool, TodoWriteTool,
+};
 pub use workflow::RunWorkflowTool;
 pub use write::WriteTool;
 
@@ -773,6 +776,36 @@ impl ToolContext {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Removes a directory that was explicitly added to this session. The
+    /// primary workspace root is immutable, and project settings cannot call
+    /// this surface.
+    pub fn remove_trusted_root(&self, requested: &Path) -> Result<PathBuf> {
+        let canonical = std::fs::canonicalize(requested)
+            .with_context(|| format!("无法解析可信工作区 {}", requested.display()))?;
+        if canonical == self.workspace_root() {
+            bail!("不能移除当前会话的主工作区")
+        }
+        let mut explicit = self
+            .explicit_context_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !explicit.contains(&canonical) {
+            bail!("该目录不是本会话显式添加的工作区")
+        }
+        explicit.remove(&canonical);
+
+        self.trusted_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|root| root != &canonical);
+        self.workspace_security
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trusted_roots
+            .retain(|root| root != &canonical);
+        Ok(canonical)
     }
 
     pub fn reserve_private_state_root(&self, root: &Path) -> Result<()> {
@@ -1713,6 +1746,13 @@ impl ToolContext {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Returns a bounded, read-only snapshot for local terminal rendering.
+    /// This bypasses the model-facing tool dispatch path and grants no task
+    /// mutation capability.
+    pub async fn task_ui_snapshot(&self) -> Result<TaskUiSnapshot> {
+        work_items::task_ui_snapshot(self).await
     }
 
     pub fn skill(&self, name: &str) -> Option<SkillDefinition> {
@@ -6709,6 +6749,27 @@ mod tests {
         assert!(!rendered.contains("automatic-root"));
         assert!(rendered.contains("explicit-root"));
         assert!(rendered.contains("scope=\"explicit/**\""));
+    }
+
+    #[test]
+    fn explicit_trusted_root_can_be_removed_but_primary_root_cannot() {
+        let primary = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            primary.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        context
+            .add_trusted_roots(&[additional.path().to_owned()])
+            .unwrap();
+        assert_eq!(context.trusted_roots().len(), 2);
+        let removed = context.remove_trusted_root(additional.path()).unwrap();
+        assert_eq!(removed, additional.path().canonicalize().unwrap());
+        assert_eq!(
+            context.trusted_roots(),
+            vec![primary.path().canonicalize().unwrap()]
+        );
+        assert!(context.remove_trusted_root(primary.path()).is_err());
     }
 
     #[cfg(unix)]
