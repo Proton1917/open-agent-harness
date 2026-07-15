@@ -226,7 +226,7 @@ impl PtySession {
     }
 
     fn read_until(&mut self, needle: &str, timeout: Duration) -> String {
-        read_until(&mut self.terminal, needle, timeout)
+        read_until(&mut self.terminal, &mut self.child, needle, timeout)
     }
 
     fn read_available(&mut self, timeout: Duration) -> String {
@@ -312,7 +312,7 @@ fn spawn_terminal(home: &Path) -> PtySession {
     }
 }
 
-fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
+fn read_until(terminal: &mut File, child: &mut Child, needle: &str, timeout: Duration) -> String {
     let started = Instant::now();
     let mut output = Vec::new();
     let mut buffer = [0u8; 8192];
@@ -329,13 +329,17 @@ fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) => panic!("terminal read failed: {error}"),
         }
     }
+    let status = child.try_wait().unwrap();
     panic!(
-        "terminal output did not contain {needle:?}: {}",
+        "terminal output did not contain {needle:?}; child_status={status:?}: {}",
         String::from_utf8_lossy(&output)
     )
 }
