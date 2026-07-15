@@ -5051,7 +5051,13 @@ pub(crate) fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
 }
 
 pub(crate) fn reject_windows_network_or_device_resolved_path(path: &Path) -> Result<()> {
-    reject_windows_network_or_device_resolved_text(&path.to_string_lossy())
+    // Paths at this boundary were assembled by the harness (for example
+    // `cwd.join(".")`), rather than supplied as an authoritative raw spelling.
+    // Remove real `.`/`..` path components before applying the Windows
+    // trailing-dot/device-name checks. Normal components such as `file.` and
+    // `...` remain intact and are still rejected below.
+    let lexical = normalize_lexical_path(path);
+    reject_windows_network_or_device_resolved_text(&lexical.to_string_lossy())
 }
 
 fn reject_windows_network_or_device_resolved_text(value: &str) -> Result<()> {
@@ -5297,6 +5303,27 @@ mod tests {
                 "resolved network/device namespace path was accepted: {path}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolved_paths_allow_harness_inserted_current_directory_components() {
+        assert!(
+            reject_windows_network_or_device_resolved_path(Path::new(r"C:\Users\user\workspace\."))
+                .is_ok()
+        );
+        assert!(
+            reject_windows_network_or_device_resolved_path(Path::new(
+                r"C:\Users\user\workspace\nested\.."
+            ))
+            .is_ok()
+        );
+        assert!(
+            reject_windows_network_or_device_resolved_path(Path::new(
+                r"C:\Users\user\workspace\file."
+            ))
+            .is_err()
+        );
     }
 
     struct BarrierTool {

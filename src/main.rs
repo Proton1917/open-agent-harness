@@ -32,15 +32,16 @@ use open_agent_harness::{
     plan::plan_tools,
     plugin_manager::run_plugin_command,
     plugins::PluginCatalog,
-    prompt::default_system_prompt,
+    prompt::{default_system_prompt, init_prompt},
     query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
     session::{SessionStateRoot, SessionStore},
     structured_output::StructuredOutputTool,
     terminal::{
         ConversationUi, FileSuggestion, InputEditor, ModelPickerOutcome, SlashCommandSuggestion,
-        select_model,
+        select_model, view_transcript,
     },
     tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
+    types::{Message, Role},
     web_tools::configure_web,
     worktree::configure_worktree,
 };
@@ -598,6 +599,7 @@ async fn run(
         }
         let mut initial = cli.prompt.clone();
         let mut editor = InputEditor::default();
+        editor.seed_history(conversation_prompt_history(&engine.messages));
         loop {
             let input = match initial.take() {
                 Some(prompt) => prompt,
@@ -615,12 +617,14 @@ async fn run(
                         let slash_commands =
                             available_command_suggestions(&command_context, &custom_commands);
                         let file_suggestions = workspace_file_suggestions(&command_context);
+                        let mut scheduled_prompt = || command_context.take_scheduled_prompt();
                         let Some(read) = editor
                             .read(
                                 engine.permission_mode(),
                                 engine.permission_mode_locked(),
                                 &slash_commands,
                                 &file_suggestions,
+                                &mut scheduled_prompt,
                             )?
                         else {
                             break;
@@ -649,6 +653,48 @@ async fn run(
                         continue;
                     }
                 };
+            let mut direct_content = None;
+            if let Some(command) = input.strip_prefix('!').map(str::trim) {
+                if command.is_empty() {
+                    if enhanced_terminal {
+                        ui.response("Shell mode cancelled: type a command after !")?;
+                    } else {
+                        eprintln!("Shell mode cancelled: type a command after !");
+                    }
+                    continue;
+                }
+                let output = engine
+                    .execute_command_tool(
+                        "Bash",
+                        json!({
+                            "command":command,
+                            "description":"Direct shell command from the interactive prompt",
+                        }),
+                    )
+                    .await;
+                let shell_transcript = format!("$ {command}\n{}", output.content);
+                if enhanced_terminal {
+                    if output.is_error {
+                        ui.event(&QueryEvent::TurnFailed {
+                            message: shell_transcript,
+                        });
+                    } else {
+                        ui.response(&shell_transcript)?;
+                    }
+                } else if output.is_error {
+                    eprintln!("{shell_transcript}");
+                } else {
+                    println!("{shell_transcript}");
+                }
+                if output.is_error {
+                    continue;
+                }
+                direct_content = Some(Value::String(format!(
+                    "The user ran this shell command through the permission-checked direct shell interface. Explain or act on its bounded output if useful.\n\n<shell-command>\n{command}\n</shell-command>\n<shell-output>\n{}\n</shell-output>",
+                    output.content
+                )));
+                input = "Direct shell command completed".to_owned();
+            }
             match commands::parse_loop_command(input.trim()) {
                 Ok(Some(request)) => {
                     let output = engine
@@ -769,8 +815,12 @@ async fn run(
                     print_session_status(&engine, &session_metadata);
                     continue;
                 }
-                CommandOutcome::ShowTasks => {
-                    print_task_status(&command_context).await?;
+                CommandOutcome::ShowTasks(argument) => {
+                    print_task_status(&engine, &command_context, &argument).await?;
+                    continue;
+                }
+                CommandOutcome::ShowTranscript => {
+                    view_transcript(&transcript_lines(&engine.messages))?;
                     continue;
                 }
                 CommandOutcome::ShowDiff(argument) => {
@@ -851,11 +901,15 @@ async fn run(
                 CommandOutcome::Submit(prompt) => prompt,
                 CommandOutcome::NotCommand => input,
             };
-            let content = match expand_explicit_file_mentions(&engine, input).await {
-                Ok(content) => content,
-                Err(error) => {
-                    eprintln!("Attachment failed: {error:#}");
-                    continue;
+            let content = if let Some(content) = direct_content {
+                content
+            } else {
+                match expand_explicit_file_mentions(&engine, input).await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!("Attachment failed: {error:#}");
+                        continue;
+                    }
                 }
             };
             let turn = engine.run_turn_content_interruptible(content).await;
@@ -1623,7 +1677,38 @@ async fn run_control_session(
                         )
                         .await
                         {
-                            Ok(resolved) => Value::String(resolved),
+                            Ok(resolved) => {
+                                match handle_control_slash_command(&resolved, engine, metadata)
+                                    .await
+                                {
+                                    Ok(ControlSlashOutcome::NotCommand) => Value::String(resolved),
+                                    Ok(ControlSlashOutcome::Submit(prompt)) => {
+                                        Value::String(prompt)
+                                    }
+                                    Ok(ControlSlashOutcome::Handled(result)) => {
+                                        emit_control_slash_result(
+                                            &handle, store, uuid, result, false,
+                                        )?;
+                                        continue;
+                                    }
+                                    Ok(ControlSlashOutcome::Exit(result)) => {
+                                        emit_control_slash_result(
+                                            &handle, store, uuid, result, false,
+                                        )?;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        emit_control_slash_result(
+                                            &handle,
+                                            store,
+                                            uuid,
+                                            json!({"error":format!("{error:#}")}),
+                                            true,
+                                        )?;
+                                        continue;
+                                    }
+                                }
+                            }
                             Err(error) => {
                                 let error = open_agent_harness::session::sanitize_transport_text(
                                     &format!("{error:#}"),
@@ -1682,6 +1767,344 @@ async fn run_control_session(
         }
     }
     Ok(())
+}
+
+enum ControlSlashOutcome {
+    NotCommand,
+    Submit(String),
+    Handled(Value),
+    Exit(Value),
+}
+
+fn emit_control_slash_result(
+    handle: &ControlHandle,
+    store: &SessionStore,
+    uuid: Uuid,
+    result: Value,
+    is_error: bool,
+) -> Result<()> {
+    handle.command_lifecycle(uuid, "started")?;
+    let result = open_agent_harness::session::sanitize_transport_value(&result, store.cwd());
+    emit_json_line(
+        Some(handle),
+        &json!({
+            "type":"result",
+            "subtype":if is_error { "error_during_execution" } else { "success" },
+            "is_error":is_error,
+            "result":if is_error { Value::Null } else { result.clone() },
+            "command_result":result,
+            "session_id":store.id,
+        }),
+    )?;
+    handle.command_lifecycle(uuid, if is_error { "cancelled" } else { "completed" })
+}
+
+async fn handle_control_slash_command(
+    input: &str,
+    engine: &mut QueryEngine,
+    metadata: &SessionMetadata<'_>,
+) -> Result<ControlSlashOutcome> {
+    let input = input.trim();
+    if !input.starts_with('/') {
+        return Ok(ControlSlashOutcome::NotCommand);
+    }
+    let split = input.find(char::is_whitespace).unwrap_or(input.len());
+    let command = &input[..split];
+    let argument = input[split..].trim();
+    let handled = |value| Ok(ControlSlashOutcome::Handled(value));
+    match command {
+        "/exit" | "/quit" => Ok(ControlSlashOutcome::Exit(json!({"exiting":true}))),
+        "/clear" => {
+            engine.clear();
+            metadata.store.clear_history()?;
+            handled(json!({"cleared":true}))
+        }
+        "/compact" => {
+            let stats = engine
+                .compact((!argument.is_empty()).then_some(argument))
+                .await?;
+            metadata.store.replace_history(&engine.messages)?;
+            handled(json!({
+                "messagesBefore":stats.messages_before,
+                "messagesAfter":stats.messages_after,
+                "tokensBefore":stats.before_tokens,
+                "tokensAfter":stats.after_tokens,
+            }))
+        }
+        "/context" => {
+            let (used, threshold, window) = engine.context_status();
+            handled(json!({"estimatedTokens":used,"autoCompactAt":threshold,"window":window}))
+        }
+        "/cost" => handled(json!({
+            "inputTokens":engine.usage.input_tokens,
+            "outputTokens":engine.usage.output_tokens,
+            "cacheCreationInputTokens":engine.usage.cache_creation_input_tokens,
+            "cacheReadInputTokens":engine.usage.cache_read_input_tokens,
+        })),
+        "/permissions" => handled(json!({
+            "permissionMode":permission_mode_name(engine.permission_mode())
+        })),
+        "/model" if argument.is_empty() => handled(json!({
+            "model":engine.model,
+            "models":metadata.model_options.iter().map(|option| json!({
+                "value":option.value,
+                "displayName":option.display_name,
+                "description":option.description,
+            })).collect::<Vec<_>>()
+        })),
+        "/model" if matches!(argument, "current" | "status") => {
+            handled(json!({"model":engine.model}))
+        }
+        "/model" if matches!(argument, "help" | "?") => handled(json!({
+            "usage":"/model [model-id]"
+        })),
+        "/model" => {
+            if argument.is_empty() || argument.len() > 512 || argument.contains(char::is_whitespace)
+            {
+                bail!("model id 长度或格式无效")
+            }
+            engine.set_model(argument.to_owned());
+            handled(json!({"model":engine.model}))
+        }
+        "/init" => Ok(ControlSlashOutcome::Submit(init_prompt().to_owned())),
+        "/loop" => {
+            let request =
+                commands::parse_loop_command(input)?.context("Usage: /loop [interval] <prompt>")?;
+            let output = engine
+                .execute_command_tool(
+                    "CronCreate",
+                    json!({
+                        "cron":request.cron,
+                        "prompt":request.prompt,
+                        "recurring":true,
+                        "durable":false,
+                    }),
+                )
+                .await;
+            if output.is_error {
+                bail!("{}", output.content)
+            }
+            handled(json!({
+                "scheduled":true,
+                "message":output.content,
+                "requestedInterval":request.requested_interval,
+                "effectiveInterval":request.effective_interval,
+                "rounded":request.rounded,
+            }))
+        }
+        "/status" => {
+            let (used, threshold, window) = engine.context_status();
+            handled(json!({
+                "sessionId":metadata.store.id,
+                "model":engine.model,
+                "permissionMode":permission_mode_name(engine.permission_mode()),
+                "context":{"estimatedTokens":used,"autoCompactAt":threshold,"window":window},
+                "toolCount":engine.registered_tool_names().len(),
+                "trustedRootCount":metadata.command_context.trusted_roots().len(),
+                "skillCount":metadata.command_context.skill_catalog().len(),
+                "pluginCount":metadata.plugin_count,
+            }))
+        }
+        "/tasks" | "/bashes" => {
+            let mut words = argument.split_whitespace();
+            if let Some(action) = words.next() {
+                let task_id = words
+                    .next()
+                    .context("Usage: /tasks [output|stop] <task-id>")?;
+                if words.next().is_some() {
+                    bail!("Usage: /tasks [output|stop] <task-id>")
+                }
+                let output = match action {
+                    "output" | "show" | "foreground" => {
+                        engine
+                            .execute_command_tool(
+                                "TaskOutput",
+                                json!({"task_id":task_id,"block":false,"timeout":0}),
+                            )
+                            .await
+                    }
+                    "stop" | "kill" => {
+                        engine
+                            .execute_command_tool("TaskStop", json!({"task_id":task_id}))
+                            .await
+                    }
+                    _ => bail!("Usage: /tasks [output|stop] <task-id>"),
+                };
+                if output.is_error {
+                    bail!("{}", output.content)
+                }
+                return handled(json!({"taskId":task_id,"action":action,"result":output.content}));
+            }
+            let persistent = engine.execute_command_tool("TaskList", json!({})).await;
+            let mut background = metadata
+                .command_context
+                .background_task_ids()
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
+            background.sort();
+            let cron = metadata.command_context.cron_service().list()?;
+            handled(json!({
+                "persistent":persistent.content,
+                "persistentError":persistent.is_error,
+                "background":background,
+                "cron":cron.iter().map(|job| json!({
+                    "id":job.id,
+                    "schedule":job.human_schedule,
+                    "nextFireAtMs":job.next_fire_at_ms,
+                    "durable":job.durable,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        "/diff" => {
+            if argument == "list" {
+                let checkpoints = checkpoint_catalog(metadata.file_histories)?;
+                return handled(
+                    json!({"checkpoints":checkpoints.iter().map(|checkpoint| json!({
+                    "id":checkpoint.id,
+                    "messageCount":checkpoint.message_count,
+                    "trackedFiles":checkpoint.tracked_files,
+                    "timestampMs":checkpoint.timestamp_ms.to_string(),
+                })).collect::<Vec<_>>() }),
+                );
+            }
+            if argument.split_whitespace().count() > 1 {
+                bail!("Usage: /diff [list|checkpoint-id|number]")
+            }
+            let checkpoint = resolve_checkpoint(
+                engine,
+                metadata.file_histories,
+                (!argument.is_empty()).then_some(argument),
+            )?;
+            let (stats, message_count) = engine.diff_files(checkpoint)?;
+            handled(json!({
+                "checkpointId":checkpoint,
+                "filesChanged":stats.files_changed,
+                "insertions":stats.insertions,
+                "deletions":stats.deletions,
+                "messageCount":message_count,
+            }))
+        }
+        "/rewind" | "/checkpoint" => {
+            if argument == "list" {
+                let checkpoints = checkpoint_catalog(metadata.file_histories)?;
+                return handled(
+                    json!({"checkpoints":checkpoints.iter().map(|checkpoint| json!({
+                    "id":checkpoint.id,
+                    "messageCount":checkpoint.message_count,
+                    "trackedFiles":checkpoint.tracked_files,
+                })).collect::<Vec<_>>() }),
+                );
+            }
+            let options = parse_rewind_options(engine, metadata.file_histories, argument)?;
+            let (stats, message_count) = engine.diff_files(options.checkpoint)?;
+            if !options.confirm {
+                return handled(json!({
+                    "preview":true,
+                    "checkpointId":options.checkpoint,
+                    "files":options.files,
+                    "conversation":options.conversation,
+                    "filesChanged":stats.files_changed,
+                    "insertions":stats.insertions,
+                    "deletions":stats.deletions,
+                    "messageCount":message_count,
+                }));
+            }
+            let (report, _) = apply_rewind(
+                engine,
+                metadata.store,
+                options.checkpoint,
+                options.files,
+                options.conversation,
+            )?;
+            handled(json!({
+                "rewound":true,
+                "checkpointId":options.checkpoint,
+                "filesChanged":report.as_ref().map(|report| &report.files_changed),
+                "restored":report.as_ref().map_or(0, |report| report.restored),
+                "deleted":report.as_ref().map_or(0, |report| report.deleted),
+                "messageCount":engine.messages.len(),
+            }))
+        }
+        "/resume" | "/continue" => {
+            if !metadata.store.persistence_enabled() {
+                bail!("当前使用 --no-session-persistence，无法 resume")
+            }
+            if !argument.is_empty() {
+                let id = argument.parse::<Uuid>().context("session id 必须是 UUID")?;
+                return handled(json!({
+                    "sessionId":id,
+                    "requiresRestart":true,
+                    "command":format!("oah --resume {id}"),
+                }));
+            }
+            let sessions = match metadata.session_state_root {
+                Some(root) => SessionStore::list_in(metadata.store.cwd(), root, 20)?,
+                None => SessionStore::list(metadata.store.cwd(), 20)?,
+            };
+            handled(json!({"sessions":sessions.iter().map(|session| json!({
+                "id":session.id,
+                "bytes":session.bytes,
+                "modifiedMs":session.modified_ms.to_string(),
+                "current":session.id == metadata.store.id,
+            })).collect::<Vec<_>>() }))
+        }
+        "/skills" => handled(json!({
+            "skills":metadata.command_context.skill_catalog().iter().map(|(name, skill)| json!({
+                "name":name,
+                "description":skill.description,
+                "argumentHint":skill.argument_hint,
+            })).collect::<Vec<_>>()
+        })),
+        "/hooks" => handled(json!({"configured":!metadata.hooks.is_empty()})),
+        "/memory" => handled(json!({
+            "enabled":metadata.memory.enabled(),
+            "entries":if metadata.memory.enabled() {
+                metadata.memory.index()?.into_iter().map(|entry| json!({
+                    "title":entry.title,"tags":entry.tags
+                })).collect::<Vec<_>>()
+            } else { Vec::new() }
+        })),
+        "/mcp" if argument.is_empty() || matches!(argument, "status" | "list") => handled(json!({
+            "servers":metadata.mcp_control.map_or_else(Vec::new, |control| control.status())
+        })),
+        "/mcp" if argument.starts_with("reconnect ") => {
+            let server = argument["reconnect ".len()..].trim();
+            if server.is_empty() {
+                bail!("Usage: /mcp reconnect <server>")
+            }
+            let control = metadata.mcp_control.context("当前没有配置 MCP server")?;
+            control.reconnect(server).await?;
+            let refresh = engine
+                .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                .await;
+            if refresh.is_error {
+                bail!("MCP 已重连但工具刷新失败: {}", refresh.content)
+            }
+            handled(json!({"reconnected":server,"servers":control.status()}))
+        }
+        "/mcp" => bail!("Usage: /mcp [status|list|reconnect <server>]"),
+        "/sandbox" => {
+            let sandbox = metadata.command_context.sandbox_runtime();
+            handled(json!({
+                "enabled":sandbox.enabled(),
+                "available":sandbox.available(),
+                "unavailableReason":sandbox.unavailable_reason(),
+            }))
+        }
+        "/plugin" => handled(json!({
+            "loaded":metadata.plugin_count,
+            "lifecycleCommand":"open-agent-harness plugin --help"
+        })),
+        "/transcript" => handled(json!({
+            "messageCount":engine.messages.len(),
+            "viewer":"Ctrl-O transcript viewer is available in an interactive TTY"
+        })),
+        "/help" => handled(json!({
+            "commands":command_descriptors(metadata.command_context, metadata.commands)
+        })),
+        _ => bail!("unknown local command: {command}"),
+    }
 }
 
 enum ControlWake {
@@ -2340,6 +2763,7 @@ fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalo
         "skills",
         "status",
         "tasks",
+        "transcript",
     ]
     .into_iter()
     .map(ToOwned::to_owned)
@@ -2689,7 +3113,175 @@ fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
     );
 }
 
-async fn print_task_status(context: &ToolContext) -> Result<()> {
+fn transcript_lines(messages: &[Message]) -> Vec<String> {
+    const MAX_TRANSCRIPT_LINES: usize = 10_000;
+    const MAX_TRANSCRIPT_LINE_BYTES: usize = 16 * 1024;
+    let mut lines = Vec::new();
+    for message in messages {
+        if lines.len() >= MAX_TRANSCRIPT_LINES {
+            break;
+        }
+        lines.push(match message.role {
+            Role::User => "You".to_owned(),
+            Role::Assistant => "Assistant".to_owned(),
+        });
+        match &message.content {
+            Value::String(text) => push_transcript_text(
+                &mut lines,
+                text,
+                MAX_TRANSCRIPT_LINES,
+                MAX_TRANSCRIPT_LINE_BYTES,
+            ),
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if lines.len() >= MAX_TRANSCRIPT_LINES {
+                        break;
+                    }
+                    let kind = block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("content");
+                    match kind {
+                        "text" => push_transcript_text(
+                            &mut lines,
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            MAX_TRANSCRIPT_LINES,
+                            MAX_TRANSCRIPT_LINE_BYTES,
+                        ),
+                        "tool_use" => {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                            lines.push(format!("  [tool call: {name}]"));
+                        }
+                        "tool_result" => {
+                            let status = if block
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                "error"
+                            } else {
+                                "result"
+                            };
+                            lines.push(format!("  [tool {status}]"));
+                            if let Some(content) = block.get("content").and_then(Value::as_str) {
+                                push_transcript_text(
+                                    &mut lines,
+                                    content,
+                                    MAX_TRANSCRIPT_LINES,
+                                    MAX_TRANSCRIPT_LINE_BYTES,
+                                );
+                            }
+                        }
+                        "image" | "document" => {
+                            lines.push(format!("  [{kind} attachment]"));
+                        }
+                        "thinking" | "reasoning" => lines.push("  [reasoning hidden]".to_owned()),
+                        other => lines.push(format!("  [{other}]")),
+                    }
+                }
+            }
+            _ => lines.push("  [unsupported content]".to_owned()),
+        }
+        lines.push(String::new());
+    }
+    if messages.is_empty() {
+        lines.push("Transcript is empty.".to_owned());
+    } else if lines.len() >= MAX_TRANSCRIPT_LINES {
+        lines.push("… transcript line limit reached".to_owned());
+    }
+    lines
+}
+
+fn conversation_prompt_history(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .filter_map(|message| match &message.content {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(blocks)
+                if !blocks.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_result")
+                }) =>
+            {
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| {
+                        (block.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| block.get("text").and_then(Value::as_str))
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .rev()
+        .take(200)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn push_transcript_text(
+    lines: &mut Vec<String>,
+    text: &str,
+    max_lines: usize,
+    max_line_bytes: usize,
+) {
+    for source in text.lines() {
+        if lines.len() >= max_lines {
+            return;
+        }
+        let mut end = source.len().min(max_line_bytes);
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        let suffix = if end < source.len() { "…" } else { "" };
+        lines.push(format!("  {}{suffix}", &source[..end]));
+    }
+}
+
+async fn print_task_status(
+    engine: &QueryEngine,
+    context: &ToolContext,
+    argument: &str,
+) -> Result<()> {
+    let mut words = argument.split_whitespace();
+    if let Some(action) = words.next() {
+        let task_id = words
+            .next()
+            .context("Usage: /tasks [output|stop] <task-id>")?;
+        if words.next().is_some() {
+            bail!("Usage: /tasks [output|stop] <task-id>")
+        }
+        let output = match action {
+            "output" | "show" | "foreground" => {
+                engine
+                    .execute_command_tool(
+                        "TaskOutput",
+                        json!({"task_id":task_id,"block":false,"timeout":0}),
+                    )
+                    .await
+            }
+            "stop" | "kill" => {
+                engine
+                    .execute_command_tool("TaskStop", json!({"task_id":task_id}))
+                    .await
+            }
+            _ => bail!("Usage: /tasks [output|stop] <task-id>"),
+        };
+        if output.is_error {
+            bail!("{}", output.content)
+        }
+        println!("{}", output.content);
+        return Ok(());
+    }
+    let persistent = engine.execute_command_tool("TaskList", json!({})).await;
     let mut task_ids = context
         .background_task_ids()
         .await
@@ -2697,9 +3289,18 @@ async fn print_task_status(context: &ToolContext) -> Result<()> {
         .collect::<Vec<_>>();
     task_ids.sort();
     let cron = context.cron_service().list()?;
-    if task_ids.is_empty() && cron.is_empty() {
-        println!("No background tasks or cron jobs.");
+    let has_persistent = !persistent.is_error && persistent.content != "No tasks found";
+    if !has_persistent && task_ids.is_empty() && cron.is_empty() {
+        println!("No persistent tasks, background tasks, or cron jobs.");
         return Ok(());
+    }
+    if persistent.is_error {
+        println!("Persistent tasks unavailable: {}", persistent.content);
+    } else if has_persistent {
+        println!("Persistent tasks:");
+        for line in persistent.content.lines().take(100) {
+            println!("  {line}");
+        }
     }
     if !task_ids.is_empty() {
         println!("Background tasks:");
@@ -2866,13 +3467,13 @@ fn available_command_suggestions(
         ("plugin", &[][..], "Show trusted plugin status", None),
         (
             "resume",
-            &[][..],
+            &["continue"][..],
             "List resumable sessions or print a safe restart command",
             Some("[session-id]"),
         ),
         (
             "rewind",
-            &[][..],
+            &["checkpoint"][..],
             "Preview or confirm a workspace and conversation rewind",
             Some("[list|checkpoint-id|number] [--files-only|--conversation-only] [--confirm]"),
         ),
@@ -2882,7 +3483,13 @@ fn available_command_suggestions(
         (
             "tasks",
             &["bashes"][..],
-            "List background tasks and cron jobs",
+            "List or manage persistent tasks, background work, and cron jobs",
+            Some("[output|stop <task-id>]"),
+        ),
+        (
+            "transcript",
+            &[][..],
+            "Open the bounded searchable transcript viewer",
             None,
         ),
     ]

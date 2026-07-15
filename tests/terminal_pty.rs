@@ -31,7 +31,11 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
 
     set_terminal_size(&terminal, 40, 8);
     let resized = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
-    assert!(resized.contains("\x1b[2J"));
+    assert!(
+        !resized.contains("\x1b[2J"),
+        "resize must not clear the committed transcript"
+    );
+    assert!(resized.contains("XY"));
     assert_no_bare_line_feeds(resized.as_bytes());
     output.push_str(&resized);
     set_terminal_size(&terminal, 100, 30);
@@ -62,12 +66,17 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
         Duration::from_secs(3),
     ));
     terminal.write_all(b"/help\r").unwrap();
-    output.push_str(&read_until(
-        &mut terminal,
-        "Available commands:",
-        Duration::from_secs(3),
-    ));
-    thread::sleep(Duration::from_millis(250));
+    let help = read_until(&mut terminal, "Available commands:", Duration::from_secs(3));
+    let composer_ready = help.contains("Shift+Tab mode");
+    output.push_str(&help);
+    if !composer_ready {
+        output.push_str(&read_until(
+            &mut terminal,
+            "Shift+Tab mode",
+            Duration::from_secs(3),
+        ));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
         &mut terminal,
@@ -107,8 +116,8 @@ fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
     assert!(child.try_wait().unwrap().is_none());
 
     thread::sleep(Duration::from_millis(1_700));
-    let expired = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
-    assert!(!expired.contains("Press Ctrl-D again to exit"));
+    // The old hint may remain painted while idle, but an EOF after the
+    // reference's 800 ms window must re-arm rather than exit.
     terminal.write_all(b"\x04").unwrap();
     let rearmed = read_until(
         &mut terminal,
@@ -214,13 +223,109 @@ fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
 }
 
 #[test]
+fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"/status\r").unwrap();
+    let _ = read_until(&mut terminal, "Session status:", Duration::from_secs(3));
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    terminal.write_all(b"\x12").unwrap();
+    let search = read_until(&mut terminal, "reverse-i-search", Duration::from_secs(3));
+    assert!(search.contains("/status"));
+    terminal.write_all(b"\x03").unwrap();
+    let cancelled = read_until(
+        &mut terminal,
+        "History search cancelled",
+        Duration::from_secs(3),
+    );
+    assert!(cancelled.contains("History search cancelled"));
+
+    terminal.write_all(b"first\\\rsecond").unwrap();
+    let multiline = read_until(&mut terminal, "second", Duration::from_secs(3));
+    assert!(multiline.contains("first"));
+    terminal.write_all(b"\x13").unwrap();
+    let stashed = read_until(&mut terminal, "Prompt stashed", Duration::from_secs(3));
+    assert!(stashed.contains("Prompt stashed"));
+    terminal.write_all(b"\x13").unwrap();
+    let restored = read_until(
+        &mut terminal,
+        "Restored stashed prompt",
+        Duration::from_secs(3),
+    );
+    assert!(restored.contains("second"));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+
+    terminal.write_all(b"\x0f").unwrap();
+    let viewer = read_until(&mut terminal, "transcript", Duration::from_secs(3));
+    assert!(viewer.contains("Transcript is empty."));
+    terminal.write_all(b"q").unwrap();
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(3),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
+fn direct_shell_mode_uses_the_tool_path_and_returns_output_to_the_model() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        assert!(request.contains("&lt;shell-command&gt;") || request.contains("shell-command"));
+        assert!(request.contains("pwd"));
+        let response = text_stream("SHELL_MODE_OK");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    terminal.write_all(b"! pwd\r").unwrap();
+    let output = read_until(&mut terminal, "SHELL_MODE_OK", Duration::from_secs(10));
+    assert!(output.contains("$ pwd"));
+    assert!(!output.contains("Permission required"));
+
+    if !output.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(3),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
 fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
     let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        read_request(&mut stream);
+        let _ = read_request(&mut stream);
         let response = tool_use_stream();
         write!(
             stream,
@@ -267,7 +372,7 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
             text_stream("SESSION_GRANT_OK"),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -534,7 +639,7 @@ fn text_stream(text: &str) -> String {
     .collect()
 }
 
-fn read_request(stream: &mut std::net::TcpStream) {
+fn read_request(stream: &mut std::net::TcpStream) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -559,4 +664,5 @@ fn read_request(stream: &mut std::net::TcpStream) {
         assert!(count > 0);
         buffer.extend_from_slice(&chunk[..count]);
     }
+    String::from_utf8_lossy(&buffer).into_owned()
 }

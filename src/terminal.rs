@@ -1,5 +1,6 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    collections::VecDeque,
+    io::{self, IsTerminal, Read, Write},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -14,14 +15,14 @@ use crossterm::{
     },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{config::ModelOption, permissions::PermissionMode, query::QueryEvent};
 
-const EXIT_WINDOW: Duration = Duration::from_millis(1_500);
+const EXIT_WINDOW: Duration = Duration::from_millis(800);
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_VISIBLE_INPUT_LINES: usize = 10;
 const MAX_FILE_CANDIDATES_SCANNED: usize = 4_096;
@@ -29,6 +30,10 @@ const MAX_FILE_SUGGESTIONS: usize = 100;
 const RAW_LINE_END: &str = "\r\n";
 const SYNC_OUTPUT_START: &[u8] = b"\x1b[?2026h";
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+const KILL_RING_LIMIT: usize = 10;
+const MAX_HISTORY_SEARCH_QUERY_BYTES: usize = 4 * 1024;
+const MAX_HISTORY_SEARCH_ENTRY_BYTES: usize = 64 * 1024;
+const EXTERNAL_EDITOR_CHORD_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitKey {
@@ -308,11 +313,334 @@ impl ConversationUi {
 pub struct InputEditor {
     history: Vec<String>,
     history_limit: usize,
+    stashed_prompt: Option<EditorSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct EditorSnapshot {
+    text: String,
+    cursor_byte: usize,
+}
+
+#[derive(Debug)]
+struct HistorySearch {
+    original: EditorSnapshot,
+    query: String,
+    matches: Vec<String>,
+    selected: usize,
+}
+
+impl HistorySearch {
+    fn new(history: &[String], text: String, cursor_byte: usize) -> Self {
+        let mut search = Self {
+            original: EditorSnapshot { text, cursor_byte },
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+        };
+        search.refresh(history);
+        search
+    }
+
+    fn refresh(&mut self, history: &[String]) {
+        let mut seen = std::collections::HashSet::new();
+        self.matches = history
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry.len() <= MAX_HISTORY_SEARCH_ENTRY_BYTES
+                    && entry.contains(&self.query)
+                    && seen.insert((*entry).clone())
+            })
+            .take(100)
+            .cloned()
+            .collect();
+        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+    }
+
+    fn current(&self) -> &str {
+        self.matches
+            .get(self.selected)
+            .map_or(self.original.text.as_str(), String::as_str)
+    }
+
+    fn hint(&self) -> String {
+        if self.matches.is_empty() {
+            format!("reverse-i-search `{}`: no match", self.query)
+        } else {
+            format!(
+                "reverse-i-search `{}`: {}/{} · Ctrl-R next · Enter run · Esc accept · Ctrl-C cancel",
+                self.query,
+                self.selected + 1,
+                self.matches.len()
+            )
+        }
+    }
+}
+
+fn push_kill(ring: &mut VecDeque<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if ring.front() != Some(&text) {
+        ring.push_front(text);
+        ring.truncate(KILL_RING_LIMIT);
+    }
+}
+
+struct TemporaryPromptFile(std::path::PathBuf);
+
+impl Drop for TemporaryPromptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn edit_prompt_externally(prompt: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!(
+        "open-agent-harness-prompt-{}.md",
+        uuid::Uuid::new_v4()
+    ));
+    let cleanup = TemporaryPromptFile(path.clone());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| anyhow::anyhow!("cannot create private prompt file: {error}"))?;
+    file.write_all(prompt.as_bytes())?;
+    file.flush()?;
+    drop(file);
+
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_owned()
+            } else {
+                "vi".to_owned()
+            }
+        });
+    let mut parts = editor.split_whitespace();
+    let executable = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("external editor command is empty"))?;
+    let arguments = parts.take(31).collect::<Vec<_>>();
+    let status = std::process::Command::new(executable)
+        .args(arguments)
+        .arg(&path)
+        .status()
+        .map_err(|error| anyhow::anyhow!("cannot launch external editor: {error}"))?;
+    if !status.success() {
+        anyhow::bail!("external editor exited with {status}")
+    }
+
+    let mut edited = Vec::new();
+    std::fs::File::open(&path)?
+        .take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut edited)?;
+    if edited.len() > MAX_INPUT_BYTES {
+        anyhow::bail!("external editor result exceeds the input limit")
+    }
+    let edited = String::from_utf8(edited)
+        .map_err(|_| anyhow::anyhow!("external editor result is not valid UTF-8"))?;
+    drop(cleanup);
+    Ok(sanitize_paste(&edited))
 }
 
 pub struct PromptRead {
     pub text: String,
     pub permission_mode: PermissionMode,
+}
+
+pub fn view_transcript(lines: &[String]) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    let _raw = RawModeGuard::enter()?;
+    let _alternate = AlternateScreenGuard::enter()?;
+    let mut out = io::stdout();
+    let bounded = lines.iter().take(10_000).collect::<Vec<_>>();
+    let mut top = bounded.len().saturating_sub(1);
+    let mut search = None::<String>;
+    let mut matches = Vec::<usize>::new();
+    let mut selected_match = 0usize;
+    let mut dump_to_scrollback = false;
+
+    loop {
+        let (width, height) = terminal::size()
+            .map(|(width, height)| (usize::from(width).max(4), usize::from(height).max(4)))
+            .unwrap_or((80, 24));
+        let viewport = height.saturating_sub(2).max(1);
+        top = top.min(bounded.len().saturating_sub(viewport));
+        let mut frame = Vec::new();
+        if synchronized_output_supported() {
+            frame.extend_from_slice(SYNC_OUTPUT_START);
+        }
+        queue!(frame, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        for line in bounded.iter().skip(top).take(viewport) {
+            queue!(
+                frame,
+                Print(visible_line(line, width.saturating_sub(1))),
+                Print(RAW_LINE_END)
+            )?;
+        }
+        let footer = if let Some(query) = &search {
+            format!(
+                "/{query} · {}/{} · Enter accept · Esc close search",
+                selected_match.saturating_add(usize::from(!matches.is_empty())),
+                matches.len()
+            )
+        } else {
+            format!(
+                "transcript · {}/{} · ↑↓/PgUp/PgDn scroll · / search · n/N match · [ dump · q exit",
+                top.saturating_add(1),
+                bounded.len().max(1)
+            )
+        };
+        queue!(
+            frame,
+            SetForegroundColor(Color::DarkGrey),
+            Print(visible_line(&footer, width.saturating_sub(1))),
+            ResetColor
+        )?;
+        if synchronized_output_supported() {
+            frame.extend_from_slice(SYNC_OUTPUT_END);
+        }
+        out.write_all(&frame)?;
+        out.flush()?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if let Some(query) = search.as_mut() {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Esc | KeyCode::Enter,
+                    ..
+                } => search = None,
+                KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                } => {
+                    query.pop();
+                }
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => search = None,
+                KeyEvent {
+                    code: KeyCode::Char(character),
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                } if query.len().saturating_add(character.len_utf8()) <= 4 * 1024 => {
+                    query.push(character);
+                }
+                _ => {}
+            }
+            if let Some(query) = &search {
+                matches = if query.is_empty() {
+                    Vec::new()
+                } else {
+                    bounded
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, line)| line.contains(query).then_some(index))
+                        .take(1_000)
+                        .collect()
+                };
+                selected_match = 0;
+                if let Some(index) = matches.first() {
+                    top = (*index).min(bounded.len().saturating_sub(viewport));
+                }
+            }
+            continue;
+        }
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('q') | KeyCode::Esc,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => break,
+            KeyEvent {
+                code: KeyCode::Up | KeyCode::Char('k'),
+                ..
+            } => top = top.saturating_sub(1),
+            KeyEvent {
+                code: KeyCode::Down | KeyCode::Char('j'),
+                ..
+            } => top = (top + 1).min(bounded.len().saturating_sub(viewport)),
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => top = top.saturating_sub(viewport),
+            KeyEvent {
+                code: KeyCode::PageDown | KeyCode::Char(' '),
+                ..
+            } => top = (top + viewport).min(bounded.len().saturating_sub(viewport)),
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => top = 0,
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => top = bounded.len().saturating_sub(viewport),
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => search = Some(String::new()),
+            KeyEvent {
+                code: KeyCode::Char('n' | 'N'),
+                modifiers,
+                ..
+            } if !matches.is_empty() => {
+                selected_match = if modifiers.contains(KeyModifiers::SHIFT) {
+                    selected_match.checked_sub(1).unwrap_or(matches.len() - 1)
+                } else {
+                    (selected_match + 1) % matches.len()
+                };
+                top = matches[selected_match].min(bounded.len().saturating_sub(viewport));
+            }
+            KeyEvent {
+                code: KeyCode::Char('['),
+                ..
+            } => {
+                dump_to_scrollback = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(_alternate);
+    drop(_raw);
+    if dump_to_scrollback {
+        for line in bounded {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +661,7 @@ pub struct FileSuggestion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileToken {
     start: usize,
+    end: usize,
     query: String,
     quoted: bool,
 }
@@ -347,6 +676,7 @@ fn file_token_at_cursor(buffer: &str, cursor_byte: usize) -> Option<FileToken> {
         if let Some(query) = unescape_open_quoted_path(raw_query) {
             return Some(FileToken {
                 start,
+                end: quoted_file_token_end(buffer, cursor_byte),
                 query,
                 quoted: true,
             });
@@ -364,9 +694,33 @@ fn file_token_at_cursor(buffer: &str, cursor_byte: usize) -> Option<FileToken> {
     }
     Some(FileToken {
         start,
+        end: plain_file_token_end(buffer, cursor_byte),
         query: query.to_owned(),
         quoted: false,
     })
+}
+
+fn quoted_file_token_end(buffer: &str, cursor_byte: usize) -> usize {
+    let mut escaped = false;
+    for (offset, character) in buffer[cursor_byte..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => return cursor_byte + offset + character.len_utf8(),
+            _ => {}
+        }
+    }
+    cursor_byte
+}
+
+fn plain_file_token_end(buffer: &str, cursor_byte: usize) -> usize {
+    buffer[cursor_byte..]
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace() || matches!(character, ')' | ']' | '}'))
+        .map_or(buffer.len(), |(offset, _)| cursor_byte + offset)
 }
 
 fn file_reference_boundary(previous: Option<char>) -> bool {
@@ -440,7 +794,7 @@ fn common_file_prefix(files: &[&FileSuggestion]) -> String {
 
 fn replace_file_token(
     buffer: &mut String,
-    cursor_byte: usize,
+    _cursor_byte: usize,
     token: &FileToken,
     path: &str,
     is_dir: bool,
@@ -456,7 +810,7 @@ fn replace_file_token(
     } else {
         format!("@{path}")
     };
-    buffer.replace_range(token.start..cursor_byte, &replacement);
+    buffer.replace_range(token.start..token.end, &replacement);
     let end = token.start + replacement.len();
     if quote && (partial || is_dir) {
         end - 1
@@ -664,6 +1018,21 @@ impl ModelPickerState {
         self.focused = self.focused.saturating_sub(self.visible_count);
         self.visible_from = self.focused;
     }
+
+    fn fit_terminal(&mut self) {
+        let rows = terminal::size()
+            .map(|(_, rows)| usize::from(rows))
+            .unwrap_or(24);
+        self.visible_count = self.option_count.min(rows.saturating_sub(6).clamp(1, 10));
+        if self.focused < self.visible_from {
+            self.visible_from = self.focused;
+        } else if self.focused >= self.visible_from + self.visible_count {
+            self.visible_from = self.focused + 1 - self.visible_count;
+        }
+        self.visible_from = self
+            .visible_from
+            .min(self.option_count.saturating_sub(self.visible_count));
+    }
 }
 
 pub fn select_model(options: &[ModelOption], current: &str) -> Result<ModelPickerOutcome> {
@@ -677,6 +1046,7 @@ pub fn select_model(options: &[ModelOption], current: &str) -> Result<ModelPicke
     let mut exit_pending: Option<(KeyCode, Instant)> = None;
 
     loop {
+        state.fit_terminal();
         let exit_hint = exit_pending.as_ref().and_then(|(code, armed)| {
             (armed.elapsed() <= EXIT_WINDOW).then_some(match code {
                 KeyCode::Char('d') => "Press Ctrl-D again to exit",
@@ -878,19 +1248,29 @@ impl Default for InputEditor {
         Self {
             history: Vec::new(),
             history_limit: 200,
+            stashed_prompt: None,
         }
     }
 }
 
 impl InputEditor {
+    pub fn seed_history(&mut self, entries: impl IntoIterator<Item = String>) {
+        for entry in entries {
+            if !entry.trim().is_empty() && entry.len() <= MAX_INPUT_BYTES {
+                self.push_history(entry);
+            }
+        }
+    }
+
     pub fn read(
         &mut self,
         initial_mode: PermissionMode,
         mode_locked: bool,
         commands: &[SlashCommandSuggestion],
         files: &[FileSuggestion],
+        scheduled_prompt: &mut dyn FnMut() -> Result<Option<String>>,
     ) -> Result<Option<PromptRead>> {
-        let _raw = RawModeGuard::enter()?;
+        let mut raw_guard = Some(RawModeGuard::enter()?);
         let mut out = io::stdout();
         let mut buffer = String::new();
         let mut cursor_byte = 0usize;
@@ -901,18 +1281,26 @@ impl InputEditor {
         let mut exit_pending: Option<ExitPending> = None;
         let mut last_escape: Option<Instant> = None;
         let mut hint = String::new();
-        let mut kill_buffer = String::new();
+        let mut kill_ring = VecDeque::<String>::new();
+        let mut last_yank: Option<(usize, usize, usize)> = None;
+        let mut undo_stack = Vec::<EditorSnapshot>::new();
+        let mut history_search: Option<HistorySearch> = None;
+        let mut ctrl_x_pending: Option<Instant> = None;
         let mut selected_suggestion = 0usize;
         let mut dismissed_suggestions_for: Option<String> = None;
         let mut selected_file_suggestion = 0usize;
         let mut dismissed_file_suggestions_for: Option<(String, usize)> = None;
+        let mut needs_redraw = true;
 
         loop {
             if exit_pending.is_some_and(|pending| pending.remaining(Instant::now()).is_none()) {
                 exit_pending = None;
                 hint.clear();
+                needs_redraw = true;
             }
-            let suggestions = if dismissed_suggestions_for.as_deref() == Some(buffer.as_str()) {
+            let suggestions = if history_search.is_some()
+                || dismissed_suggestions_for.as_deref() == Some(buffer.as_str())
+            {
                 Vec::new()
             } else {
                 command_matches(&buffer, commands)
@@ -922,10 +1310,12 @@ impl InputEditor {
             } else {
                 selected_suggestion = selected_suggestion.min(suggestions.len() - 1);
             }
-            let file_token = if dismissed_file_suggestions_for
-                .as_ref()
-                .is_some_and(|(dismissed, cursor)| dismissed == &buffer && *cursor == cursor_byte)
-            {
+            let file_token = if history_search.is_some()
+                || dismissed_file_suggestions_for
+                    .as_ref()
+                    .is_some_and(|(dismissed, cursor)| {
+                        dismissed == &buffer && *cursor == cursor_byte
+                    }) {
                 None
             } else {
                 file_token_at_cursor(&buffer, cursor_byte)
@@ -939,38 +1329,56 @@ impl InputEditor {
                 selected_file_suggestion = selected_file_suggestion.min(file_suggestions.len() - 1);
             }
             let argument_hint = command_argument_hint(&buffer, commands);
-            rendered.redraw(
-                &mut out,
-                InputRenderState {
-                    buffer: &buffer,
-                    cursor_byte,
-                    mode,
-                    hint: &hint,
-                    suggestions: &suggestions,
-                    selected_suggestion,
-                    file_suggestions: &file_suggestions,
-                    selected_file_suggestion,
-                    argument_hint,
-                },
-            )?;
+            if needs_redraw {
+                rendered.redraw(
+                    &mut out,
+                    InputRenderState {
+                        buffer: &buffer,
+                        cursor_byte,
+                        mode,
+                        hint: &hint,
+                        suggestions: &suggestions,
+                        selected_suggestion,
+                        file_suggestions: &file_suggestions,
+                        selected_file_suggestion,
+                        argument_hint,
+                    },
+                )?;
+                needs_redraw = false;
+            }
 
-            let event = if let Some(pending) = exit_pending {
-                let Some(remaining) = pending.remaining(Instant::now()) else {
-                    exit_pending = None;
-                    hint.clear();
-                    continue;
-                };
-                if !event::poll(remaining)? {
+            let poll_for = exit_pending
+                .and_then(|pending| pending.remaining(Instant::now()))
+                .map_or(Duration::from_millis(100), |remaining| {
+                    remaining.min(Duration::from_millis(100))
+                });
+            if !event::poll(poll_for)? {
+                if exit_pending.is_some_and(|pending| pending.remaining(Instant::now()).is_none()) {
                     exit_pending = None;
                     hint.clear();
                     continue;
                 }
-                event::read()?
-            } else {
-                event::read()?
-            };
+                if let Some(prompt) = scheduled_prompt()? {
+                    if !buffer.trim().is_empty() {
+                        self.stashed_prompt = Some(EditorSnapshot {
+                            text: buffer.clone(),
+                            cursor_byte,
+                        });
+                    }
+                    rendered.erase(&mut out)?;
+                    return Ok(Some(PromptRead {
+                        text: prompt,
+                        permission_mode: mode,
+                    }));
+                }
+                continue;
+            }
+            let event = event::read()?;
+            needs_redraw = true;
             let previous_buffer = buffer.clone();
             let previous_cursor_byte = cursor_byte;
+            let mut restored_undo = false;
+            let mut open_external_editor = false;
             let previous_selected_name = suggestions
                 .get(selected_suggestion)
                 .map(|suggestion| suggestion.name.clone());
@@ -981,6 +1389,123 @@ impl InputEditor {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    if let Some(search) = history_search.as_mut() {
+                        match key {
+                            KeyEvent {
+                                code: KeyCode::Char('r'),
+                                modifiers: KeyModifiers::CONTROL,
+                                ..
+                            } => {
+                                if !search.matches.is_empty() {
+                                    search.selected = (search.selected + 1) % search.matches.len();
+                                }
+                            }
+                            KeyEvent {
+                                code: KeyCode::Backspace,
+                                ..
+                            } if search.query.is_empty() => {
+                                buffer.clone_from(&search.original.text);
+                                cursor_byte = search.original.cursor_byte.min(buffer.len());
+                                history_search = None;
+                                hint = "History search cancelled".to_owned();
+                                continue;
+                            }
+                            KeyEvent {
+                                code: KeyCode::Backspace,
+                                ..
+                            } => {
+                                search.query.pop();
+                                search.selected = 0;
+                                search.refresh(&self.history);
+                            }
+                            KeyEvent {
+                                code: KeyCode::Char('c'),
+                                modifiers: KeyModifiers::CONTROL,
+                                ..
+                            } => {
+                                buffer.clone_from(&search.original.text);
+                                cursor_byte = search.original.cursor_byte.min(buffer.len());
+                                history_search = None;
+                                hint = "History search cancelled".to_owned();
+                                continue;
+                            }
+                            KeyEvent {
+                                code: KeyCode::Esc | KeyCode::Tab,
+                                ..
+                            } => {
+                                buffer = search.current().to_owned();
+                                cursor_byte = buffer.len();
+                                history_search = None;
+                                hint = "History match accepted".to_owned();
+                                continue;
+                            }
+                            KeyEvent {
+                                code: KeyCode::Enter,
+                                modifiers: KeyModifiers::NONE,
+                                ..
+                            } => {
+                                let Some(found) = search.matches.get(search.selected) else {
+                                    hint = "History search has no executable match".to_owned();
+                                    continue;
+                                };
+                                let text = found.trim_end().to_owned();
+                                if text.trim().is_empty() {
+                                    hint = "History search has no executable match".to_owned();
+                                    continue;
+                                }
+                                rendered.erase(&mut out)?;
+                                self.push_history(text.clone());
+                                print_committed_prompt(&mut out, &text)?;
+                                return Ok(Some(PromptRead {
+                                    text,
+                                    permission_mode: mode,
+                                }));
+                            }
+                            KeyEvent {
+                                code: KeyCode::Char(character),
+                                modifiers,
+                                ..
+                            } if !modifiers.intersects(
+                                KeyModifiers::CONTROL
+                                    | KeyModifiers::ALT
+                                    | KeyModifiers::SUPER
+                                    | KeyModifiers::HYPER,
+                            ) && search.query.len().saturating_add(character.len_utf8())
+                                <= MAX_HISTORY_SEARCH_QUERY_BYTES =>
+                            {
+                                search.query.push(character);
+                                search.selected = 0;
+                                search.refresh(&self.history);
+                            }
+                            _ => {}
+                        }
+                        buffer = search.current().to_owned();
+                        cursor_byte = buffer.len();
+                        hint = search.hint();
+                        continue;
+                    }
+                    let is_yank_key = matches!(
+                        key,
+                        KeyEvent {
+                            code: KeyCode::Char('y'),
+                            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+                            ..
+                        }
+                    );
+                    if !is_yank_key {
+                        last_yank = None;
+                    }
+                    let continues_external_editor_chord = matches!(
+                        key,
+                        KeyEvent {
+                            code: KeyCode::Char('e' | 'x'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        }
+                    );
+                    if !continues_external_editor_chord {
+                        ctrl_x_pending = None;
+                    }
                     hint.clear();
                     let is_exit_key = matches!(
                         key,
@@ -1130,6 +1655,22 @@ impl InputEditor {
                             last_escape = None;
                         }
                         KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if buffer.starts_with('!') => {
+                            if let Some(completed) = self
+                                .history
+                                .iter()
+                                .rev()
+                                .find(|entry| entry.starts_with(&buffer) && *entry != &buffer)
+                            {
+                                buffer.clone_from(completed);
+                                cursor_byte = buffer.len();
+                                hint = "Completed from shell history".to_owned();
+                            }
+                        }
+                        KeyEvent {
                             code: KeyCode::Enter,
                             modifiers,
                             ..
@@ -1140,6 +1681,16 @@ impl InputEditor {
                             } else {
                                 hint = "Input limit reached".to_owned();
                             }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if buffer[..cursor_byte].ends_with('\\') => {
+                            buffer.remove(cursor_byte - 1);
+                            cursor_byte -= 1;
+                            buffer.insert(cursor_byte, '\n');
+                            cursor_byte += 1;
                         }
                         KeyEvent {
                             code: KeyCode::Enter,
@@ -1236,17 +1787,147 @@ impl InputEditor {
                         }
                         KeyEvent {
                             code: KeyCode::Esc, ..
+                        } if buffer == "!" => {
+                            buffer.clear();
+                            cursor_byte = 0;
+                            hint = "Shell mode cancelled".to_owned();
+                            last_escape = None;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
                         } => {
                             if last_escape.is_some_and(|at| at.elapsed() <= EXIT_WINDOW) {
+                                if buffer.is_empty() {
+                                    rendered.erase(&mut out)?;
+                                    let command = "/rewind".to_owned();
+                                    print_committed_prompt(&mut out, &command)?;
+                                    return Ok(Some(PromptRead {
+                                        text: command,
+                                        permission_mode: mode,
+                                    }));
+                                }
+                                if !buffer.trim().is_empty() {
+                                    self.push_history(buffer.clone());
+                                }
                                 buffer.clear();
                                 cursor_byte = 0;
-                                hint = "Input cleared".to_owned();
+                                hint = "Input cleared and saved to history".to_owned();
                                 last_escape = None;
                             } else {
                                 hint = "Press Esc again to clear input".to_owned();
                                 last_escape = Some(Instant::now());
                             }
                         }
+                        KeyEvent {
+                            code: KeyCode::Char('_' | '-'),
+                            modifiers,
+                            ..
+                        } if modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(snapshot) = undo_stack.pop() {
+                                buffer = snapshot.text;
+                                cursor_byte = snapshot.cursor_byte.min(buffer.len());
+                                restored_undo = true;
+                                hint = "Undid last edit".to_owned();
+                            } else {
+                                hint = "Nothing to undo".to_owned();
+                            }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('s'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            if buffer.is_empty() {
+                                if let Some(snapshot) = self.stashed_prompt.take() {
+                                    buffer = snapshot.text;
+                                    cursor_byte = snapshot.cursor_byte.min(buffer.len());
+                                    hint = "Restored stashed prompt".to_owned();
+                                } else {
+                                    hint = "No stashed prompt".to_owned();
+                                }
+                            } else {
+                                self.stashed_prompt = Some(EditorSnapshot {
+                                    text: std::mem::take(&mut buffer),
+                                    cursor_byte,
+                                });
+                                cursor_byte = 0;
+                                hint = "Prompt stashed; Ctrl-S restores it".to_owned();
+                            }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('r'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            let search =
+                                HistorySearch::new(&self.history, buffer.clone(), cursor_byte);
+                            buffer = search.current().to_owned();
+                            cursor_byte = buffer.len();
+                            hint = search.hint();
+                            history_search = Some(search);
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::ALT,
+                            ..
+                        } => {
+                            rendered.erase(&mut out)?;
+                            let command = "/model".to_owned();
+                            print_committed_prompt(&mut out, &command)?;
+                            return Ok(Some(PromptRead {
+                                text: command,
+                                permission_mode: mode,
+                            }));
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('t'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            rendered.erase(&mut out)?;
+                            let command = "/tasks".to_owned();
+                            print_committed_prompt(&mut out, &command)?;
+                            return Ok(Some(PromptRead {
+                                text: command,
+                                permission_mode: mode,
+                            }));
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('o'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            rendered.erase(&mut out)?;
+                            let command = "/transcript".to_owned();
+                            return Ok(Some(PromptRead {
+                                text: command,
+                                permission_mode: mode,
+                            }));
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('e'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if ctrl_x_pending.is_some_and(|started| {
+                            started.elapsed() <= EXTERNAL_EDITOR_CHORD_WINDOW
+                        }) =>
+                        {
+                            ctrl_x_pending = None;
+                            open_external_editor = true;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('x'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => {
+                            ctrl_x_pending = Some(Instant::now());
+                            hint = "Ctrl-X: press Ctrl-E to edit externally".to_owned();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('g'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } => open_external_editor = true,
                         KeyEvent {
                             code: KeyCode::Char('a'),
                             modifiers: KeyModifiers::CONTROL,
@@ -1300,7 +1981,7 @@ impl InputEditor {
                             && cursor_byte > 0 =>
                         {
                             let previous = previous_word_boundary(&buffer, cursor_byte);
-                            kill_buffer = buffer[previous..cursor_byte].to_owned();
+                            push_kill(&mut kill_ring, buffer[previous..cursor_byte].to_owned());
                             buffer.drain(previous..cursor_byte);
                             cursor_byte = previous;
                         }
@@ -1310,7 +1991,7 @@ impl InputEditor {
                             ..
                         } if cursor_byte > 0 => {
                             let previous = previous_word_boundary(&buffer, cursor_byte);
-                            kill_buffer = buffer[previous..cursor_byte].to_owned();
+                            push_kill(&mut kill_ring, buffer[previous..cursor_byte].to_owned());
                             buffer.drain(previous..cursor_byte);
                             cursor_byte = previous;
                         }
@@ -1325,7 +2006,7 @@ impl InputEditor {
                             } else {
                                 start
                             };
-                            kill_buffer = buffer[start..cursor_byte].to_owned();
+                            push_kill(&mut kill_ring, buffer[start..cursor_byte].to_owned());
                             buffer.drain(start..cursor_byte);
                             cursor_byte = start;
                         }
@@ -1338,19 +2019,42 @@ impl InputEditor {
                             if end == cursor_byte && buffer.as_bytes().get(end) == Some(&b'\n') {
                                 end += 1;
                             }
-                            kill_buffer = buffer[cursor_byte..end].to_owned();
+                            push_kill(&mut kill_ring, buffer[cursor_byte..end].to_owned());
                             buffer.drain(cursor_byte..end);
                         }
                         KeyEvent {
                             code: KeyCode::Char('y'),
                             modifiers: KeyModifiers::CONTROL,
                             ..
-                        } if !kill_buffer.is_empty() => {
-                            if buffer.len().saturating_add(kill_buffer.len()) <= MAX_INPUT_BYTES {
-                                buffer.insert_str(cursor_byte, &kill_buffer);
-                                cursor_byte += kill_buffer.len();
+                        } if !kill_ring.is_empty() => {
+                            let killed = &kill_ring[0];
+                            if buffer.len().saturating_add(killed.len()) <= MAX_INPUT_BYTES {
+                                let start = cursor_byte;
+                                buffer.insert_str(cursor_byte, killed);
+                                cursor_byte += killed.len();
+                                last_yank = Some((start, killed.len(), 0));
                             } else {
                                 hint = "Input limit reached".to_owned();
+                            }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('y'),
+                            modifiers: KeyModifiers::ALT,
+                            ..
+                        } if kill_ring.len() > 1 && last_yank.is_some() => {
+                            let (start, length, index) = last_yank.expect("guarded above");
+                            let next_index = (index + 1) % kill_ring.len();
+                            let killed = &kill_ring[next_index];
+                            let next_len = buffer
+                                .len()
+                                .saturating_sub(length)
+                                .saturating_add(killed.len());
+                            if next_len <= MAX_INPUT_BYTES
+                                && start.saturating_add(length) <= buffer.len()
+                            {
+                                buffer.replace_range(start..start + length, killed);
+                                cursor_byte = start + killed.len();
+                                last_yank = Some((start, killed.len(), next_index));
                             }
                         }
                         KeyEvent {
@@ -1372,7 +2076,7 @@ impl InputEditor {
                             ..
                         } if cursor_byte < buffer.len() => {
                             let next = next_word_boundary(&buffer, cursor_byte);
-                            kill_buffer = buffer[cursor_byte..next].to_owned();
+                            push_kill(&mut kill_ring, buffer[cursor_byte..next].to_owned());
                             buffer.drain(cursor_byte..next);
                         }
                         KeyEvent {
@@ -1391,12 +2095,22 @@ impl InputEditor {
                             code: KeyCode::Up,
                             modifiers: KeyModifiers::NONE,
                             ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
                         } if line_start(&buffer, cursor_byte) > 0 => {
                             cursor_byte = move_vertical(&buffer, cursor_byte, -1);
                         }
                         KeyEvent {
                             code: KeyCode::Down,
                             modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('n'),
+                            modifiers: KeyModifiers::CONTROL,
                             ..
                         } if line_end(&buffer, cursor_byte) < buffer.len() => {
                             cursor_byte = move_vertical(&buffer, cursor_byte, 1);
@@ -1405,7 +2119,12 @@ impl InputEditor {
                             code: KeyCode::Up,
                             modifiers: KeyModifiers::NONE,
                             ..
-                        } if !self.history.is_empty() && !buffer.contains('\n') => {
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !self.history.is_empty() => {
                             if history_index == self.history.len() {
                                 draft.clone_from(&buffer);
                             }
@@ -1416,6 +2135,11 @@ impl InputEditor {
                         KeyEvent {
                             code: KeyCode::Down,
                             modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('n'),
+                            modifiers: KeyModifiers::CONTROL,
                             ..
                         } if history_index < self.history.len() => {
                             history_index += 1;
@@ -1439,7 +2163,10 @@ impl InputEditor {
                             modifiers,
                             ..
                         } if !modifiers.intersects(
-                            KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::HYPER,
+                            KeyModifiers::CONTROL
+                                | KeyModifiers::ALT
+                                | KeyModifiers::SUPER
+                                | KeyModifiers::HYPER,
                         ) =>
                         {
                             if buffer.len().saturating_add(character.len_utf8()) <= MAX_INPUT_BYTES
@@ -1466,14 +2193,44 @@ impl InputEditor {
                         hint = "Paste truncated at the input limit".to_owned();
                     }
                 }
-                // A terminal may reflow already-painted rows before reporting
-                // the resize, so the old relative row count is no longer a
-                // safe erase anchor. Reset the visible viewport atomically;
-                // the next loop iteration paints the composer at the new size.
+                // Clear only the owned composer rows. Clearing the whole screen
+                // makes a resize destroy the visible conversation and is
+                // especially hostile when the terminal has no native scrollback.
                 Event::Resize(_, _) => rendered.reset_viewport(&mut out)?,
                 _ => {}
             }
+            if open_external_editor {
+                rendered.erase(&mut out)?;
+                drop(raw_guard.take());
+                let edited = edit_prompt_externally(&buffer);
+                raw_guard = Some(RawModeGuard::enter()?);
+                rendered = RenderedInput::default();
+                match edited {
+                    Ok(text) => {
+                        buffer = text;
+                        cursor_byte = buffer.len();
+                        hint = "External editor changes loaded".to_owned();
+                    }
+                    Err(error) => {
+                        hint = format!("External editor failed: {error:#}");
+                    }
+                }
+            }
             if buffer != previous_buffer || cursor_byte != previous_cursor_byte {
+                if buffer != previous_buffer && !restored_undo {
+                    if undo_stack.last().is_none_or(|snapshot| {
+                        snapshot.text != previous_buffer
+                            || snapshot.cursor_byte != previous_cursor_byte
+                    }) {
+                        undo_stack.push(EditorSnapshot {
+                            text: previous_buffer.clone(),
+                            cursor_byte: previous_cursor_byte,
+                        });
+                    }
+                    if undo_stack.len() > 50 {
+                        undo_stack.remove(0);
+                    }
+                }
                 dismissed_suggestions_for = None;
                 dismissed_file_suggestions_for = None;
                 let updated_suggestions = command_matches(&buffer, commands);
@@ -1567,13 +2324,17 @@ impl RenderedInput {
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_START);
         }
-        queue!(frame, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        self.clear(&mut frame)?;
+        queue!(
+            frame,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_END);
         }
         out.write_all(&frame)?;
         out.flush()?;
-        *self = Self::default();
         Ok(())
     }
 
@@ -1621,6 +2382,7 @@ impl RenderedInput {
         let active_column = buffer[active_start..cursor_byte].graphemes(true).count();
         let mut rendered_cursor_column = active_column;
         let color = std::env::var_os("NO_COLOR").is_none();
+        let shell_mode = buffer.starts_with('!');
         let suggestion_limit = if file_suggestions.is_empty() {
             suggestions.len().min(6)
         } else {
@@ -1638,7 +2400,14 @@ impl RenderedInput {
         let visible_end = lines.len().min(visible_start.saturating_add(visible_limit));
 
         if color {
-            queue!(out, SetForegroundColor(Color::DarkGrey))?;
+            queue!(
+                out,
+                SetForegroundColor(if shell_mode {
+                    Color::Yellow
+                } else {
+                    Color::DarkGrey
+                })
+            )?;
         }
         queue!(out, Print(&rule), Print(RAW_LINE_END))?;
         if color {
@@ -1660,7 +2429,11 @@ impl RenderedInput {
             if color && index == 0 {
                 queue!(
                     out,
-                    SetForegroundColor(Color::Cyan),
+                    SetForegroundColor(if shell_mode {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    }),
                     SetAttribute(Attribute::Bold)
                 )?;
             }
@@ -1695,6 +2468,8 @@ impl RenderedInput {
             }
         } else if !hint.is_empty() {
             format!("  {hint}")
+        } else if shell_mode {
+            "  shell · permission checked · Enter run · Esc cancel · Tab history".to_owned()
         } else if let Some(argument_hint) = argument_hint {
             format!("  {argument_hint}")
         } else {
@@ -1853,13 +2628,17 @@ impl RenderedPicker {
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_START);
         }
-        queue!(frame, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        self.clear(&mut frame)?;
+        queue!(
+            frame,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
         if synchronized {
             frame.extend_from_slice(SYNC_OUTPUT_END);
         }
         out.write_all(&frame)?;
         out.flush()?;
-        *self = Self::default();
         Ok(())
     }
 
@@ -2009,6 +2788,21 @@ impl RenderedPicker {
 struct RawModeGuard {
     bracketed_paste: bool,
     keyboard_enhancement: bool,
+}
+
+struct AlternateScreenGuard;
+
+impl AlternateScreenGuard {
+    fn enter() -> Result<Self> {
+        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), cursor::Show, LeaveAlternateScreen);
+    }
 }
 
 impl RawModeGuard {
@@ -2612,6 +3406,7 @@ mod tests {
             file_token_at_cursor("see (@src/模", "see (@src/模".len()),
             Some(FileToken {
                 start: "see (".len(),
+                end: "see (@src/模".len(),
                 query: "src/模".to_owned(),
                 quoted: false,
             })
@@ -2620,6 +3415,7 @@ mod tests {
             file_token_at_cursor("open @\"目录/含 空", "open @\"目录/含 空".len()),
             Some(FileToken {
                 start: "open ".len(),
+                end: "open @\"目录/含 空".len(),
                 query: "目录/含 空".to_owned(),
                 quoted: true,
             })
@@ -2650,6 +3446,7 @@ mod tests {
             .collect::<Vec<_>>();
         let token = FileToken {
             start: 0,
+            end: "@src/".len(),
             query: "src/".to_owned(),
             quoted: false,
         };
@@ -2699,6 +3496,48 @@ mod tests {
         );
         assert_eq!(spaced_file, "open @\"my file.txt\"");
         assert_eq!(cursor, spaced_file.len());
+
+        let mut middle = "inspect @README.md later".to_owned();
+        let cursor = "inspect @READ".len();
+        let token = file_token_at_cursor(&middle, cursor).expect("middle-of-token reference");
+        assert_eq!(token.end, "inspect @README.md".len());
+        let cursor = replace_file_token(&mut middle, cursor, &token, "README.md", false, false);
+        assert_eq!(middle, "inspect @README.md later");
+        assert_eq!(cursor, "inspect @README.md".len());
+
+        let mut middle_quoted = "open @\"my file.txt\" later".to_owned();
+        let cursor = "open @\"my fi".len();
+        let token =
+            file_token_at_cursor(&middle_quoted, cursor).expect("middle-of-quoted reference");
+        assert_eq!(token.end, "open @\"my file.txt\"".len());
+        replace_file_token(
+            &mut middle_quoted,
+            cursor,
+            &token,
+            "my file.txt",
+            false,
+            false,
+        );
+        assert_eq!(middle_quoted, "open @\"my file.txt\" later");
+    }
+
+    #[test]
+    fn history_search_is_bounded_deduplicated_and_never_matches_oversized_entries() {
+        let oversized = "x".repeat(MAX_HISTORY_SEARCH_ENTRY_BYTES + 1);
+        let history = vec![
+            "first command".to_owned(),
+            "second command".to_owned(),
+            "first command".to_owned(),
+            oversized,
+        ];
+        let mut search = HistorySearch::new(&history, "draft".to_owned(), 5);
+        search.query = "command".to_owned();
+        search.refresh(&history);
+        assert_eq!(search.matches, ["first command", "second command"]);
+        search.query = "missing".to_owned();
+        search.refresh(&history);
+        assert!(search.matches.is_empty());
+        assert_eq!(search.current(), "draft");
     }
 
     #[test]

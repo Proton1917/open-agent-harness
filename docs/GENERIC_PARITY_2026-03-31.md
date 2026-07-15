@@ -77,6 +77,25 @@ is accurate; “complete parity with the proprietary product” is not.
   Enter confirmation, Esc cancellation, and double Ctrl-C/Ctrl-D exit. The
   candidate catalog comes only from bounded trusted `models` settings;
   `/model <id>` remains available for an explicit model outside that catalog.
+- The composer uses the snapshot's 800 ms double-press window, saves a draft
+  before double-Esc clearing, restores resumed prompts into bounded Up/Down and
+  Ctrl-R history, and supports Ctrl-P/N edge navigation, undo, stash, a bounded
+  kill ring with yank-pop, backslash/modified-Enter newlines, and Ctrl-G or
+  Ctrl-X Ctrl-E external-editor handoff through a private temporary file.
+  Unknown Alt chords are consumed instead of leaking letters into the prompt;
+  file completion replaces the complete token on both sides of the cursor.
+- `!` is a direct-shell input mode with shell-history completion. It preserves
+  this harness's permission-before-execution invariant and reuses the Bash
+  tool's schema, hooks, sandbox, limits, capture, and process cleanup rather
+  than introducing a privileged terminal escape hatch.
+- Ctrl-O opens a bounded alternate-screen transcript with keyboard scrolling,
+  search, match navigation, resize repaint, and explicit native-scrollback
+  dump. Ctrl-T and `/tasks` include persistent work items, background work, and
+  cron; selected background output and stop actions are exposed by ID. A ready
+  scheduled prompt can wake an idle composer without discarding its draft.
+- Every built-in slash command advertised by stream-JSON is dispatched locally
+  and returns a structured `command_result`; `/clear`, `/status`, or `/rewind`
+  can no longer be routed to the model by accident.
 
 ### Workspace, session, planning, and teams
 
@@ -204,6 +223,16 @@ is accurate; “complete parity with the proprietary product” is not.
 - The interactive composer does not accept a concurrent one-off side query
   while another model turn is active. Opt-in prompt suggestions run only after
   a completed print-mode turn and are never auto-executed.
+- The main conversation remains in native terminal scrollback rather than the
+  snapshot's always-on fullscreen cell renderer. The transcript viewer uses an
+  alternate screen, but the main REPL does not yet provide mouse selection,
+  virtualized scroll, sticky/new-message overlays, custom themes, a dynamic
+  status-line command, or a `/tui` renderer switch.
+- Prompt editing does not yet provide configurable hot-reloaded keybindings,
+  Vim Normal/Visual modes, or clipboard image ingestion. `/diff`, `/rewind`,
+  `/resume`, and `/tasks` expose their generic data and safe actions, but do
+  not reproduce the snapshot's proprietary React/Ink modal layouts or live
+  process hot-swap. These are explicit UI boundaries, not claims of parity.
 - The slash palette does not copy private usage ranking or vendor command
   inventory, and the model picker does not discover a vendor catalog or carry
   account, entitlement, billing, fast-mode, or proprietary effort behavior.

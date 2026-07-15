@@ -110,6 +110,69 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn stream_json_executes_advertised_local_slash_commands_without_model_requests() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args([
+            "--print",
+            "--bare",
+            "--no-session-persistence",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", "http://127.0.0.1:9")
+        .env("HARNESS_MESSAGES_PATH", "/v1/messages")
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let status_id = uuid::Uuid::new_v4();
+    let clear_id = uuid::Uuid::new_v4();
+    for (uuid, content) in [(status_id, "/status"), (clear_id, "/clear")] {
+        writeln!(
+            input,
+            "{}",
+            serde_json::json!({
+                "type":"user",
+                "uuid":uuid,
+                "message":{"role":"user","content":content}
+            })
+        )
+        .unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let local_results = lines
+        .iter()
+        .filter(|line| line["type"] == "result" && line.get("command_result").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(local_results.len(), 2, "{lines:#?}");
+    assert_eq!(local_results[0]["command_result"]["model"], "default");
+    assert_eq!(local_results[1]["command_result"]["cleared"], true);
+    assert!(lines.iter().all(|line| {
+        line["subtype"] != "error_during_execution" && line["type"] != "assistant"
+    }));
+}
+
 #[test]
 fn print_text_json_and_stream_json_contracts_are_stable() {
     let text = run_cli("text", json_response("plain response"));
