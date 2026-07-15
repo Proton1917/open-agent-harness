@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[test]
 fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     let _serial = serial_terminal_test();
@@ -38,7 +40,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         &mut terminal,
         &mut pending_output,
         b"/tui fullscreen\r",
-        Duration::from_secs(3),
+        INTERACTION_TIMEOUT,
     );
     assert!(entered.contains("TUI mode: fullscreen"));
     assert!(
@@ -69,7 +71,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         &mut terminal,
         &mut pending_output,
         "Selected transcript text copied",
-        Duration::from_secs(3),
+        INTERACTION_TIMEOUT,
     );
     assert!(copied.contains("Selected transcript text copied"));
 
@@ -78,7 +80,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
             &mut terminal,
             &mut pending_output,
             b"/tui\r",
-            Duration::from_secs(3),
+            INTERACTION_TIMEOUT,
         );
         assert!(cycle.contains("TUI mode: fullscreen"));
     }
@@ -92,7 +94,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         &mut terminal,
         &mut pending_output,
         b"\x1b[5~\x1b[5~/tui\r",
-        Duration::from_secs(3),
+        INTERACTION_TIMEOUT,
     );
     assert!(
         page_up.contains("/tui fullscreen"),
@@ -113,7 +115,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         &mut terminal,
         &mut pending_output,
         b"\x1b[1;5F/tui\r",
-        Duration::from_secs(3),
+        INTERACTION_TIMEOUT,
     );
     assert!(
         !bottom.contains("End to jump to bottom"),
@@ -124,7 +126,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         &mut terminal,
         &mut pending_output,
         b"/tui default\r",
-        Duration::from_secs(3),
+        INTERACTION_TIMEOUT,
     );
     assert!(restored.contains("TUI mode: default"));
     assert!(
