@@ -1789,7 +1789,11 @@ mod tests {
                 .rename(&"x".repeat(MAX_SESSION_TITLE_BYTES + 1))
                 .is_err()
         );
-        assert!(store.rename("Inspect /tmp/private-file").is_err());
+        let absolute_title = format!(
+            "Inspect {}",
+            workspace.path().join("private-file").display()
+        );
+        assert!(store.rename(&absolute_title).is_err());
         assert!(store.rename("api_key=not-a-real-key").is_err());
 
         let exact = "界".repeat(MAX_SESSION_TITLE_BYTES / "界".len());
