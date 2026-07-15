@@ -103,6 +103,7 @@ struct SafeReadOperand {
 }
 
 const MAX_SAFE_QUERY_OPERANDS: usize = 64;
+#[cfg(not(windows))]
 const SAFE_QUERY_FD_BASE: i32 = 64;
 
 impl BashTool {
@@ -171,11 +172,6 @@ impl Tool for BashTool {
 }
 
 fn safe_query_plan(context: &ToolContext, input: &Value) -> Option<SafeQueryPlan> {
-    #[cfg(windows)]
-    {
-        let _ = (context, input);
-        return None;
-    }
     if input
         .get("run_in_background")
         .and_then(Value::as_bool)
@@ -205,10 +201,26 @@ fn safe_query_plan(context: &ToolContext, input: &Value) -> Option<SafeQueryPlan
     {
         return None;
     }
-    Some(SafeQueryPlan {
+    let plan = SafeQueryPlan {
         script: rendered.join(" | "),
         operands,
-    })
+    };
+    #[cfg(windows)]
+    {
+        // Windows does not yet have the inherited fixed-fd execution path used
+        // below. Still parse and validate the candidate so this code remains
+        // warning-clean on every target, then refuse automatic classification.
+        let SafeQueryPlan { script, operands } = plan;
+        let _ = script;
+        for SafeReadOperand { path, directory } in operands {
+            let _ = (path, directory);
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(plan)
+    }
 }
 
 fn normalize_safe_query(
