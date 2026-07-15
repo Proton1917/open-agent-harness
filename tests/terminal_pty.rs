@@ -229,8 +229,10 @@ fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
 
     terminal.write_all(b"/status\r").unwrap();
-    let _ = read_until(&mut terminal, "Session status:", Duration::from_secs(3));
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let status = read_until(&mut terminal, "Session status:", Duration::from_secs(3));
+    if !status.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
     terminal.write_all(b"\x12").unwrap();
     let search = read_until(&mut terminal, "reverse-i-search", Duration::from_secs(3));
     assert!(search.contains("/status"));
