@@ -328,8 +328,11 @@ impl VimState {
                 self.mode = VimMode::Normal;
                 self.pending = Pending::Idle;
                 self.count_digits.clear();
-                if *cursor > 0 && (*cursor == text.len() || grapheme_at(text, *cursor) == "\n") {
-                    *cursor = prev_boundary(text, *cursor);
+                if *cursor > 0 {
+                    let previous = prev_boundary(text, *cursor);
+                    if grapheme_at(text, previous) != "\n" {
+                        *cursor = previous;
+                    }
                 }
                 VimOutcome::handled(false, true)
             }
@@ -413,6 +416,8 @@ impl VimState {
 
     fn handle_normal(&mut self, text: &mut String, cursor: &mut usize, key: VimKey) -> VimOutcome {
         let VimKey::Char(character) = key else {
+            let pending_expects_motion =
+                matches!(self.pending, Pending::Idle | Pending::Operator { .. });
             return match key {
                 VimKey::Escape => {
                     self.reset_command();
@@ -421,12 +426,24 @@ impl VimState {
                 VimKey::Enter => VimOutcome::action(VimAction::Submit),
                 // In the reference frontend, physical arrows remain base
                 // editor keys so history and wrapped-line fallback still work.
-                VimKey::Left | VimKey::Right | VimKey::Up | VimKey::Down => {
+                VimKey::Left | VimKey::Right | VimKey::Up | VimKey::Down
+                    if matches!(self.pending, Pending::Idle) =>
+                {
                     VimOutcome::passthrough()
                 }
+                VimKey::Left => self.handle_normal(text, cursor, VimKey::Char('h')),
+                VimKey::Right => self.handle_normal(text, cursor, VimKey::Char('l')),
+                VimKey::Up => self.handle_normal(text, cursor, VimKey::Char('k')),
+                VimKey::Down => self.handle_normal(text, cursor, VimKey::Char('j')),
                 VimKey::Home => self.normal_motion(text, cursor, '0'),
                 VimKey::End => self.normal_motion(text, cursor, '$'),
-                VimKey::Backspace | VimKey::Delete if !matches!(self.pending, Pending::Idle) => {
+                VimKey::Backspace if pending_expects_motion => {
+                    self.handle_normal(text, cursor, VimKey::Char('h'))
+                }
+                VimKey::Delete if pending_expects_motion && self.count_digits.is_empty() => {
+                    self.handle_normal(text, cursor, VimKey::Char('x'))
+                }
+                VimKey::Backspace | VimKey::Delete => {
                     self.reset_command();
                     VimOutcome::handled(false, false)
                 }
@@ -436,6 +453,14 @@ impl VimState {
         if character == '/' && matches!(self.pending, Pending::Idle) && self.count_digits.is_empty()
         {
             return VimOutcome::passthrough();
+        }
+        if character == '?' && matches!(self.pending, Pending::Idle) && self.count_digits.is_empty()
+        {
+            text.clear();
+            text.push('?');
+            *cursor = 0;
+            self.finish_nonchange();
+            return VimOutcome::handled(true, false);
         }
         self.record_key(VimKey::Char(character));
 
@@ -2439,7 +2464,30 @@ mod tests {
 
         let mut insertion = Harness::normal("ab");
         insertion.keys("iX\u{1b}l.");
-        assert_eq!(insertion.text, "XaXb");
+        assert_eq!(insertion.text, "XXab");
+    }
+
+    #[test]
+    fn normal_escape_motion_keys_and_question_match_reference_semantics() {
+        let mut middle = Harness::normal("abc");
+        middle.cursor = 2;
+        middle.vim.mode = VimMode::Insert;
+        middle.key(VimKey::Escape);
+        assert_eq!(middle.cursor, 1);
+
+        let mut operator_arrow = Harness::normal("abc");
+        operator_arrow.keys("d");
+        operator_arrow.key(VimKey::Right);
+        assert_eq!(operator_arrow.text, "bc");
+
+        let mut delete = Harness::normal("abc");
+        delete.key(VimKey::Delete);
+        assert_eq!(delete.text, "bc");
+
+        let mut question = Harness::normal("old input");
+        question.keys("?");
+        assert_eq!(question.text, "?");
+        assert_eq!(question.cursor, 0);
     }
 
     #[test]

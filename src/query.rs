@@ -61,6 +61,7 @@ pub enum QueryEvent {
         id: String,
         name: String,
         preview: String,
+        collapsed: bool,
         is_error: bool,
         elapsed_ms: u128,
     },
@@ -1017,10 +1018,12 @@ impl QueryEngine {
                     }),
                     Arc::new(move |index, output, elapsed| {
                         if let Some((id, name, _)) = finished_calls.get(index) {
+                            let (preview, collapsed) = output_preview(&output.content);
                             finished_sink(&QueryEvent::ToolFinished {
                                 id: id.clone(),
                                 name: name.clone(),
-                                preview: output_preview(&output.content),
+                                preview,
+                                collapsed,
                                 is_error: output.is_error,
                                 elapsed_ms: elapsed.as_millis(),
                             });
@@ -1543,18 +1546,16 @@ fn truncate_compaction_history(messages: &[Message]) -> Option<Vec<Message>> {
     None
 }
 
-fn output_preview(content: &str) -> String {
+fn output_preview(content: &str) -> (String, bool) {
     const MAX_CHARS: usize = 180;
-    let line = content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
+    let mut non_empty = content.lines().filter(|line| !line.trim().is_empty());
+    let line = non_empty.next().unwrap_or("").trim();
     let mut preview = line.chars().take(MAX_CHARS).collect::<String>();
-    if line.chars().count() > MAX_CHARS {
+    let shortened = line.chars().count() > MAX_CHARS;
+    if shortened {
         preview.push('…');
     }
-    preview
+    (preview, shortened || non_empty.next().is_some())
 }
 
 fn validate_tool_calls(tool_uses: &[Value]) -> Result<Vec<(String, String, Value)>> {
@@ -1602,6 +1603,17 @@ fn validate_tool_calls(tool_uses: &[Value]) -> Result<Vec<(String, String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_preview_marks_multiline_and_long_output_as_collapsed() {
+        assert_eq!(output_preview("one line"), ("one line".to_owned(), false));
+        assert_eq!(output_preview("first\nsecond"), ("first".to_owned(), true));
+        let long = "x".repeat(181);
+        let (preview, collapsed) = output_preview(&long);
+        assert!(collapsed);
+        assert_eq!(preview.chars().count(), 181);
+        assert!(preview.ends_with('…'));
+    }
 
     fn tool_use(id: &str) -> Value {
         json!({

@@ -379,7 +379,7 @@ impl PermissionManager {
                 }
                 if self.interactive {
                     let session_available = session_grant_is_bounded(tool, targets);
-                    match prompt(tool, summary, session_available)? {
+                    match prompt(tool, input, summary, session_available)? {
                         crate::terminal::PermissionChoice::Allow => Ok(PermissionDecision::Allow),
                         crate::terminal::PermissionChoice::AllowForSession => {
                             if !session_available {
@@ -2467,10 +2467,11 @@ fn session_grant_is_bounded(invocation_tool: &str, targets: &[PermissionTarget])
 
 fn prompt(
     tool: &str,
+    input: &Value,
     summary: &str,
     session_available: bool,
 ) -> Result<crate::terminal::PermissionChoice> {
-    crate::terminal::request_permission(tool, summary, session_available)
+    crate::terminal::request_permission(tool, input, summary, session_available)
 }
 
 #[cfg(test)]

@@ -318,15 +318,36 @@ impl KeybindingManager {
     }
 
     pub fn resolve(&mut self, event: KeyEvent, contexts: &[&str]) -> KeyResolution {
+        let Some(key) = Keystroke::from_event(event) else {
+            return KeyResolution::None;
+        };
+        self.resolve_keystroke(key, contexts)
+    }
+
+    pub fn resolve_wheel(&mut self, up: bool, contexts: &[&str]) -> KeyResolution {
+        self.resolve_keystroke(
+            Keystroke {
+                key: if up {
+                    KeyName::WheelUp
+                } else {
+                    KeyName::WheelDown
+                },
+                control: false,
+                alt: false,
+                shift: false,
+                super_key: false,
+            },
+            contexts,
+        )
+    }
+
+    fn resolve_keystroke(&mut self, key: Keystroke, contexts: &[&str]) -> KeyResolution {
         if self
             .pending_since
             .is_some_and(|started| started.elapsed() > CHORD_TIMEOUT)
         {
             self.clear_chord();
         }
-        let Some(key) = Keystroke::from_event(event) else {
-            return KeyResolution::None;
-        };
         if !self.pending.is_empty() && key.key == KeyName::Escape {
             self.clear_chord();
             return KeyResolution::ChordCancelled;
@@ -857,12 +878,6 @@ fn default_bindings() -> Vec<Binding> {
         ("Scroll", "ctrl+end", "scroll:bottom"),
         ("Scroll", "ctrl+shift+c", "selection:copy"),
         ("Scroll", "cmd+c", "selection:copy"),
-        ("Scroll", "shift+left", "selection:extendLeft"),
-        ("Scroll", "shift+right", "selection:extendRight"),
-        ("Scroll", "shift+up", "selection:extendUp"),
-        ("Scroll", "shift+down", "selection:extendDown"),
-        ("Scroll", "shift+home", "selection:extendLineStart"),
-        ("Scroll", "shift+end", "selection:extendLineEnd"),
     ];
     if cfg!(windows) {
         entries.push(("Chat", "alt+v", "chat:imagePaste"));

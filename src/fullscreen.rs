@@ -33,7 +33,7 @@ impl Default for FullscreenLimits {
         Self {
             max_transcript_bytes: 8 * 1024 * 1024,
             max_transcript_lines: 50_000,
-            max_line_bytes: 64 * 1024,
+            max_line_bytes: 8 * 1024 * 1024,
             max_selection_bytes: 1024 * 1024,
         }
     }
@@ -197,6 +197,17 @@ pub enum ClickKind {
     Triple,
 }
 
+/// Keyboard focus movement for extending an existing transcript selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionFocusMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
 /// A complete ANSI frame.  `content_rows` excludes header/status/composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnsiFrame {
@@ -237,7 +248,14 @@ struct TextPoint {
 struct SelectionSpan {
     anchor: TextPoint,
     focus: Option<TextPoint>,
+    focus_row: Option<VisualLocation>,
     dragging: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualLocation {
+    line_id: u64,
+    logical_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,32 +557,26 @@ impl FullscreenState {
                 self.selection = Some(SelectionSpan {
                     anchor: hit.start,
                     focus: None,
+                    focus_row: Some(hit.visual),
                     dragging: true,
                 });
             }
             ClickKind::Double => {
-                let Some((start, end)) = self.word_span(hit.start) else {
+                let Some((start, end)) = self.word_span(hit) else {
                     return false;
                 };
                 self.selection = Some(SelectionSpan {
                     anchor: start,
                     focus: Some(end),
+                    focus_row: Some(hit.visual),
                     dragging: true,
                 });
             }
             ClickKind::Triple => {
-                let Some(line) = self.line_by_id(hit.start.line_id) else {
-                    return false;
-                };
                 self.selection = Some(SelectionSpan {
-                    anchor: TextPoint {
-                        line_id: line.id,
-                        byte: 0,
-                    },
-                    focus: Some(TextPoint {
-                        line_id: line.id,
-                        byte: line.text.len(),
-                    }),
+                    anchor: hit.row_start,
+                    focus: Some(hit.row_end),
+                    focus_row: Some(hit.visual),
                     dragging: true,
                 });
             }
@@ -584,7 +596,11 @@ impl FullscreenState {
         if !selection.dragging {
             return false;
         }
+        if selection.focus.is_none() && hit.start == selection.anchor {
+            return false;
+        }
         selection.focus = Some(hit.end);
+        selection.focus_row = Some(hit.visual);
         true
     }
 
@@ -599,6 +615,93 @@ impl FullscreenState {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+    }
+
+    /// Extends an existing selection from its focus while keeping the anchor
+    /// fixed.  Movement is constrained to the visible transcript viewport,
+    /// matching the alternate-screen keyboard selection semantics.
+    pub fn move_selection_focus(&mut self, movement: SelectionFocusMove) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let Some(focus) = selection.focus else {
+            return false;
+        };
+        let Some((row_index, row)) = self.visual_row_for_focus(focus, selection.focus_row) else {
+            return false;
+        };
+        let visible_start = self.scroll_top.min(self.scroll_max());
+        let visible_end = visible_start
+            .saturating_add(self.layout().content_rows)
+            .min(self.visual_cache.len());
+        if row_index < visible_start || row_index >= visible_end {
+            return false;
+        }
+
+        let column = self.visual_column_for_point(row, focus);
+        let (next, next_row) = match movement {
+            SelectionFocusMove::Left => {
+                let Some(next) = self.previous_text_point(focus) else {
+                    return false;
+                };
+                let Some((index, row)) = self.visual_row_for_direction(next, false) else {
+                    return false;
+                };
+                if index < visible_start || index >= visible_end {
+                    return false;
+                }
+                (next, row_location(row))
+            }
+            SelectionFocusMove::Right => {
+                let Some(next) = self.next_text_point(focus) else {
+                    return false;
+                };
+                let Some((index, row)) = self.visual_row_for_direction(next, true) else {
+                    return false;
+                };
+                if index < visible_start || index >= visible_end {
+                    return false;
+                }
+                (next, row_location(row))
+            }
+            SelectionFocusMove::Up | SelectionFocusMove::Down => {
+                let target = if movement == SelectionFocusMove::Up {
+                    row_index.checked_sub(1)
+                } else {
+                    row_index.checked_add(1)
+                };
+                let Some(target) =
+                    target.filter(|target| *target >= visible_start && *target < visible_end)
+                else {
+                    return false;
+                };
+                let row = &self.visual_cache[target];
+                (self.point_at_visual_column(row, column), row_location(row))
+            }
+            SelectionFocusMove::LineStart => (
+                TextPoint {
+                    line_id: row.source.line_id,
+                    byte: row.logical_start,
+                },
+                row_location(row),
+            ),
+            SelectionFocusMove::LineEnd => (
+                TextPoint {
+                    line_id: row.source.line_id,
+                    byte: row.logical_end,
+                },
+                row_location(row),
+            ),
+        };
+        if next == focus {
+            return false;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            selection.focus = Some(next);
+            selection.focus_row = Some(next_row);
+            selection.dragging = false;
+        }
+        true
     }
 
     /// Copies the selected logical text.  Soft-wrapped visual rows are joined,
@@ -876,6 +979,15 @@ impl FullscreenState {
                         line_id: line.id,
                         byte: end,
                     },
+                    row_start: TextPoint {
+                        line_id: line.id,
+                        byte: row.logical_start,
+                    },
+                    row_end: TextPoint {
+                        line_id: line.id,
+                        byte: row.logical_end,
+                    },
+                    visual: row_location(row),
                 });
             }
             width = next_width;
@@ -889,16 +1001,27 @@ impl FullscreenState {
                 line_id: line.id,
                 byte: row.logical_end,
             },
+            row_start: TextPoint {
+                line_id: line.id,
+                byte: row.logical_start,
+            },
+            row_end: TextPoint {
+                line_id: line.id,
+                byte: row.logical_end,
+            },
+            visual: row_location(row),
         })
     }
 
-    fn word_span(&self, point: TextPoint) -> Option<(TextPoint, TextPoint)> {
-        let line = self.line_by_id(point.line_id)?;
-        let graphemes = line.text.grapheme_indices(true).collect::<Vec<_>>();
+    fn word_span(&self, hit: Hit) -> Option<(TextPoint, TextPoint)> {
+        let line = self.line_by_id(hit.start.line_id)?;
+        let row_text = line.text.get(hit.row_start.byte..hit.row_end.byte)?;
+        let graphemes = row_text.grapheme_indices(true).collect::<Vec<_>>();
         let index = graphemes
             .iter()
             .position(|(offset, grapheme)| {
-                point.byte >= *offset && point.byte < *offset + grapheme.len()
+                let start = hit.row_start.byte + *offset;
+                hit.start.byte >= start && hit.start.byte < start + grapheme.len()
             })
             .or_else(|| (!graphemes.is_empty()).then_some(graphemes.len() - 1))?;
         let class = word_class(graphemes[index].1);
@@ -910,10 +1033,10 @@ impl FullscreenState {
         while hi < graphemes.len() && word_class(graphemes[hi].1) == class {
             hi += 1;
         }
-        let start = graphemes[lo].0;
+        let start = hit.row_start.byte + graphemes[lo].0;
         let end = graphemes
             .get(hi)
-            .map_or(line.text.len(), |(offset, _)| *offset);
+            .map_or(hit.row_end.byte, |(offset, _)| hit.row_start.byte + *offset);
         Some((
             TextPoint {
                 line_id: line.id,
@@ -924,6 +1047,138 @@ impl FullscreenState {
                 byte: end,
             },
         ))
+    }
+
+    fn visual_row_for_focus(
+        &self,
+        focus: TextPoint,
+        hint: Option<VisualLocation>,
+    ) -> Option<(usize, &VisualRow)> {
+        if let Some(hint) = hint {
+            if let Some((index, row)) = self.visual_cache.iter().enumerate().find(|(_, row)| {
+                row.source.line_id == hint.line_id && row.logical_start == hint.logical_start
+            }) {
+                if focus.line_id == row.source.line_id
+                    && focus.byte >= row.logical_start
+                    && focus.byte <= row.logical_end
+                {
+                    return Some((index, row));
+                }
+            }
+        }
+        self.visual_cache.iter().enumerate().find(|(_, row)| {
+            row.source.line_id == focus.line_id
+                && focus.byte >= row.logical_start
+                && focus.byte <= row.logical_end
+        })
+    }
+
+    fn visual_row_for_direction(
+        &self,
+        point: TextPoint,
+        prefer_next_at_boundary: bool,
+    ) -> Option<(usize, &VisualRow)> {
+        let matches = self
+            .visual_cache
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.source.line_id == point.line_id
+                    && point.byte >= row.logical_start
+                    && point.byte <= row.logical_end
+            })
+            .collect::<Vec<_>>();
+        if prefer_next_at_boundary {
+            matches.last().copied()
+        } else {
+            matches.first().copied()
+        }
+    }
+
+    fn visual_column_for_point(&self, row: &VisualRow, point: TextPoint) -> usize {
+        let Some(line) = self.line_by_id(row.source.line_id) else {
+            return 0;
+        };
+        if row.text.as_str() != &line.text[row.logical_start..row.logical_end] {
+            return usize::from(point.byte >= row.logical_end).min(self.columns.saturating_sub(1));
+        }
+        let end = point.byte.clamp(row.logical_start, row.logical_end);
+        UnicodeWidthStr::width(&line.text[row.logical_start..end])
+            .min(self.columns.saturating_sub(1))
+    }
+
+    fn point_at_visual_column(&self, row: &VisualRow, column: usize) -> TextPoint {
+        let Some(line) = self.line_by_id(row.source.line_id) else {
+            return TextPoint {
+                line_id: row.source.line_id,
+                byte: row.logical_start,
+            };
+        };
+        if row.text.as_str() != &line.text[row.logical_start..row.logical_end] {
+            return TextPoint {
+                line_id: row.source.line_id,
+                byte: if column == 0 {
+                    row.logical_start
+                } else {
+                    row.logical_end
+                },
+            };
+        }
+        let mut width = 0usize;
+        for (offset, grapheme) in row.text.grapheme_indices(true) {
+            let next = width.saturating_add(display_width(grapheme));
+            if column < next {
+                return TextPoint {
+                    line_id: row.source.line_id,
+                    byte: row.logical_start + offset,
+                };
+            }
+            width = next;
+        }
+        TextPoint {
+            line_id: row.source.line_id,
+            byte: row.logical_end,
+        }
+    }
+
+    fn previous_text_point(&self, point: TextPoint) -> Option<TextPoint> {
+        let lines = self.all_logical_lines();
+        let index = lines.iter().position(|line| line.id == point.line_id)?;
+        let line = lines[index];
+        if point.byte > 0 {
+            let byte = line.text[..point.byte.min(line.text.len())]
+                .grapheme_indices(true)
+                .next_back()
+                .map(|(offset, _)| offset)?;
+            return Some(TextPoint {
+                line_id: line.id,
+                byte,
+            });
+        }
+        let previous = index.checked_sub(1).and_then(|index| lines.get(index))?;
+        Some(TextPoint {
+            line_id: previous.id,
+            byte: previous.text.len(),
+        })
+    }
+
+    fn next_text_point(&self, point: TextPoint) -> Option<TextPoint> {
+        let lines = self.all_logical_lines();
+        let index = lines.iter().position(|line| line.id == point.line_id)?;
+        let line = lines[index];
+        if point.byte < line.text.len() {
+            let suffix = &line.text[point.byte..];
+            let grapheme = suffix.graphemes(true).next()?;
+            return Some(TextPoint {
+                line_id: line.id,
+                byte: point.byte + grapheme.len(),
+            });
+        }
+        let next = lines.get(index + 1)?;
+        Some(TextPoint {
+            line_id: next.id,
+            byte: 0,
+        })
     }
 
     fn selection_bounds(&self) -> Option<(TextPoint, TextPoint)> {
@@ -1001,6 +1256,16 @@ struct Layout {
 struct Hit {
     start: TextPoint,
     end: TextPoint,
+    row_start: TextPoint,
+    row_end: TextPoint,
+    visual: VisualLocation,
+}
+
+fn row_location(row: &VisualRow) -> VisualLocation {
+    VisualLocation {
+        line_id: row.source.line_id,
+        logical_start: row.logical_start,
+    }
 }
 
 fn point_key(point: TextPoint) -> (u64, usize) {
@@ -1375,6 +1640,16 @@ mod tests {
     }
 
     #[test]
+    fn dragging_within_the_same_cell_does_not_create_a_selection() {
+        let mut state = state(7, 20);
+        state.push_message("hello world");
+        assert!(state.click(ViewportPoint { row: 0, column: 1 }, ClickKind::Single));
+        assert!(!state.drag_to(ViewportPoint { row: 0, column: 1 }));
+        state.finish_selection();
+        assert!(!state.has_selection());
+    }
+
+    #[test]
     fn drag_selection_copies_plain_text_across_soft_wraps() {
         let mut state = state(8, 5);
         state.push_message("abcdefghij");
@@ -1404,12 +1679,46 @@ mod tests {
     }
 
     #[test]
-    fn triple_click_selects_logical_not_visual_line() {
+    fn double_and_triple_click_are_bounded_to_the_visual_row() {
+        let mut state = state(8, 5);
+        state.push_message("abcdefghij");
+        assert!(state.click(ViewportPoint { row: 1, column: 1 }, ClickKind::Double));
+        state.finish_selection();
+        assert_eq!(state.selected_text().as_deref(), Some("fghij"));
+        assert!(state.click(ViewportPoint { row: 1, column: 1 }, ClickKind::Triple));
+        state.finish_selection();
+        assert_eq!(state.selected_text().as_deref(), Some("fghij"));
+    }
+
+    #[test]
+    fn keyboard_selection_keeps_anchor_and_moves_by_grapheme() {
+        let mut state = state(8, 40);
+        state.push_message("hello world");
+        assert!(state.click(ViewportPoint { row: 0, column: 1 }, ClickKind::Double));
+        state.finish_selection();
+        assert_eq!(state.selected_text().as_deref(), Some("hello"));
+        assert!(state.move_selection_focus(SelectionFocusMove::Right));
+        assert_eq!(state.selected_text().as_deref(), Some("hello "));
+        assert!(state.move_selection_focus(SelectionFocusMove::Left));
+        assert_eq!(state.selected_text().as_deref(), Some("hello"));
+        assert!(state.move_selection_focus(SelectionFocusMove::Left));
+        assert_eq!(state.selected_text().as_deref(), Some("hell"));
+    }
+
+    #[test]
+    fn keyboard_selection_wraps_rows_and_supports_visual_edges() {
         let mut state = state(8, 5);
         state.push_message("abcdefghij");
         assert!(state.click(ViewportPoint { row: 1, column: 1 }, ClickKind::Triple));
         state.finish_selection();
-        assert_eq!(state.selected_text().as_deref(), Some("abcdefghij"));
+        assert!(state.move_selection_focus(SelectionFocusMove::Left));
+        assert_eq!(state.selected_text().as_deref(), Some("fghi"));
+        assert!(state.move_selection_focus(SelectionFocusMove::LineStart));
+        assert_eq!(state.selected_text(), None);
+        assert!(state.move_selection_focus(SelectionFocusMove::Up));
+        assert_eq!(state.selected_text().as_deref(), Some("abcde"));
+        assert!(state.move_selection_focus(SelectionFocusMove::LineEnd));
+        assert_eq!(state.selected_text(), None);
     }
 
     #[test]

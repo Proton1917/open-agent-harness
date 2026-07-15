@@ -10,13 +10,15 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 #[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
@@ -30,6 +32,7 @@ pub const MAX_CLIPBOARD_IMAGE_PIXELS: u64 = 100_000_000;
 /// Wall-clock budget for one platform clipboard command.
 pub const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_OSC52_TEXT_BYTES: usize = 100 * 1024;
 
 const MAX_COMMAND_STDERR_BYTES: usize = 16 * 1024;
 const BASE64_OUTPUT_LIMIT: usize = (MAX_CLIPBOARD_IMAGE_BYTES / 3 + 1) * 4 + 4096;
@@ -227,11 +230,7 @@ pub fn write_clipboard_text(text: &str) -> Result<(), ClipboardError> {
             ("xsel", &["--clipboard", "--input"]),
         ],
         ClipboardPlatform::Windows | ClipboardPlatform::Wsl => &[("clip.exe", &[])],
-        ClipboardPlatform::Unsupported => {
-            return Err(ClipboardError::Command(
-                "clipboard text writing is unsupported on this platform".into(),
-            ));
-        }
+        ClipboardPlatform::Unsupported => &[],
     };
     let mut errors = Vec::new();
     for (program, arguments) in commands {
@@ -240,7 +239,49 @@ pub fn write_clipboard_text(text: &str) -> Result<(), ClipboardError> {
             Err(error) => errors.push(error.to_string()),
         }
     }
-    Err(ClipboardError::Command(errors.join("; ")))
+    if osc52_available() {
+        return write_osc52_clipboard(text);
+    }
+    if errors.is_empty() {
+        Err(ClipboardError::Command(
+            "clipboard text writing is unsupported on this platform".into(),
+        ))
+    } else {
+        Err(ClipboardError::Command(errors.join("; ")))
+    }
+}
+
+fn osc52_available() -> bool {
+    io::stdout().is_terminal()
+        && env::var("TERM").ok().as_deref() != Some("dumb")
+        && ["SSH_CONNECTION", "SSH_TTY", "TMUX"]
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+}
+
+fn osc52_sequence(text: &str, tmux: bool) -> Result<Vec<u8>, ClipboardError> {
+    if text.len() > MAX_OSC52_TEXT_BYTES {
+        return Err(ClipboardError::OutputTooLarge {
+            limit: MAX_OSC52_TEXT_BYTES,
+        });
+    }
+    let payload = BASE64_STANDARD.encode(text.as_bytes());
+    let sequence = format!("\x1b]52;c;{payload}\x07");
+    if tmux {
+        let escaped = sequence.replace('\x1b', "\x1b\x1b");
+        Ok(format!("\x1bPtmux;{escaped}\x1b\\").into_bytes())
+    } else {
+        Ok(sequence.into_bytes())
+    }
+}
+
+fn write_osc52_clipboard(text: &str) -> Result<(), ClipboardError> {
+    let sequence = osc52_sequence(text, env::var_os("TMUX").is_some())?;
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(&sequence)
+        .and_then(|()| stdout.flush())
+        .map_err(|error| ClipboardError::Command(format!("OSC 52 write failed: {error}")))
 }
 
 fn write_clipboard_text_command(
@@ -1012,6 +1053,18 @@ impl Drop for PrivateTempOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc52_text_copy_is_bounded_and_tmux_escaped() {
+        assert_eq!(
+            String::from_utf8(osc52_sequence("hello", false).unwrap()).unwrap(),
+            "\x1b]52;c;aGVsbG8=\x07"
+        );
+        let tmux = String::from_utf8(osc52_sequence("hello", true).unwrap()).unwrap();
+        assert!(tmux.starts_with("\x1bPtmux;\x1b\x1b]52;c;"));
+        assert!(tmux.ends_with("\x07\x1b\\"));
+        assert!(osc52_sequence(&"x".repeat(MAX_OSC52_TEXT_BYTES + 1), false).is_err());
+    }
     use std::{collections::VecDeque, sync::Mutex};
 
     #[derive(Clone)]

@@ -113,6 +113,14 @@ pub struct McpIntegration {
 pub trait McpControl: Send + Sync {
     fn status(&self) -> Vec<McpServerStatus>;
     async fn reconnect(&self, server: &str) -> Result<()>;
+    async fn list_prompts(&self, context: &ToolContext) -> Result<Value>;
+    async fn get_prompt(
+        &self,
+        context: &ToolContext,
+        server: &str,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4838,6 +4846,20 @@ impl McpControl for McpManager {
                 Err(error).with_context(|| format!("MCP server {name} reconnect 失败"))
             }
         }
+    }
+
+    async fn list_prompts(&self, context: &ToolContext) -> Result<Value> {
+        McpManager::list_prompts(self, context, None).await
+    }
+
+    async fn get_prompt(
+        &self,
+        context: &ToolContext,
+        server: &str,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value> {
+        McpManager::get_prompt(self, context, server, name, arguments).await
     }
 }
 

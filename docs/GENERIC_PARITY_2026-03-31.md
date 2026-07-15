@@ -225,25 +225,34 @@ is accurate; “complete parity with the proprietary product” is not.
   a completed print-mode turn and are never auto-executed.
 - The main conversation supports both native scrollback and an optional
   `/tui fullscreen` virtual viewport with sticky-bottom/unseen state, resize,
-  wheel/page scrolling, mouse word/line/drag selection and bounded native
-  clipboard copy. Keyboard-only shift-selection extension is not declared.
+  wheel/page scrolling, mouse word/line/drag selection, grapheme-aware keyboard
+  selection and bounded native/OSC 52 clipboard copy. Rich Markdown/table/
+  syntax rendering and clickable file/URL/tool-result regions are not yet
+  declared for the primary conversation stream.
 - Prompt editing now provides private hot-reloaded contextual keybindings,
   Vim Insert/Normal/Visual operation, scoped persistent history, visible and
   removable clipboard images, draft-preserving model/transcript/todo modals,
   safe UI settings, theme presets and a trusted bounded status-line command.
-  Theme preview/custom editing and status-line refresh while the composer is
-  completely idle remain outside the declared integration surface.
+  The theme picker previews a bounded diff sample and rolls back on Escape;
+  status-line commands refresh asynchronously on relevant state changes and at
+  the configured idle interval. Custom theme editing remains outside the
+  declared integration surface.
 - `/diff`, `/rewind`, `/resume`, `/tasks`, `/copy`, and `/export` expose their
   generic data and safe actions, but do not reproduce proprietary React/Ink
   layouts or live process hot-swap. These are explicit UI boundaries, not
   claims of parity.
 - The slash palette does not copy private usage ranking or vendor command
   inventory. Builtin/custom/Skill conflicts and ranking are deterministic;
-  direct MCP prompt entries and terminal-rendered dynamic argument candidates
-  are not yet declared. The model picker does not discover a vendor catalog or
-  carry account, entitlement, billing, fast-mode, or proprietary effort
-  behavior; its options are explicit trusted configuration plus the active
-  model.
+  namespaced MCP prompts and trusted dynamic argument candidates are included
+  without granting the server or project new authority. The model picker does
+  not discover a vendor catalog or carry account, entitlement, billing,
+  fast-mode, or proprietary effort behavior; its options are explicit trusted
+  configuration plus the active model.
+- Permission prompts show bounded tool-aware action/diff summaries plus the
+  complete exact JSON before authorization, but `/permissions` does not yet
+  implement the proprietary persistent add/remove rule-management dialog.
+  Task commands expose generic data and stop/output actions but do not yet
+  reproduce the live task-tree footer/dialog.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
 - `ConfigChange` covers the accepted project-Skill hot-refresh boundary only.

@@ -46,18 +46,28 @@ used to back-port behavior introduced after 2.1.207.
 - `/tui default|fullscreen` now preserves the conversation while switching to
   an alternate-screen virtual viewport with sticky bottom, unseen counts,
   resize/reflow, page/wheel navigation, mouse single/double/triple/drag
-  selection and bounded clipboard copy. The normal composer remains fixed at
-  the bottom and is covered by a real PTY lifecycle test.
+  selection, grapheme-aware keyboard selection and bounded native/OSC 52
+  clipboard copy. The normal composer remains fixed at the bottom, restores
+  raw/alternate-screen state across Ctrl-G and SIGTSTP/SIGCONT, and is covered
+  by real PTY lifecycle and job-control tests.
 - Private user-only `/config`, `/theme` and `/statusline` settings are strict,
   atomic and bounded. Theme presets affect composer tokens; trusted status-line
   commands receive public JSON, scrub credentials, time out, cap output and
-  reap their process tree. Todo and background-task surfaces remain separate.
-- Deliberate remaining boundaries: direct MCP prompt entries and terminal
-  rendering of injected dynamic argument candidates, keyboard-only shift
-  extension of fullscreen selections, theme preview/custom-theme editing,
-  periodic status-line refresh while the composer is fully idle, and exact
-  proprietary modal layout/wording. These are not claimed as complete product
-  parity.
+  reap their process tree. The theme picker previews a bounded diff sample and
+  rolls back on Escape. Status lines refresh asynchronously after model/mode/
+  Vim state changes and at the configured idle interval without blocking input.
+- MCP prompts are namespaced into the slash catalog and fetched only on an
+  explicit invocation. Trusted dynamic argument candidates are painted in the
+  composer, while `@` matching uses ignore-aware prefix/basename/substring/
+  fuzzy ranking and resets focus to the best match when its query changes.
+- Tool results identify collapsed output with the Ctrl-O expansion path;
+  permission prompts retain the exact JSON input and add bounded Bash, file,
+  edit-diff, write and network summaries. Common modals repaint on resize.
+- Deliberate remaining boundaries: rich Markdown/table/syntax rendering in the
+  primary stream, tool-specific clickable result expansion, a persistent
+  add/remove permission-rule manager, a live task-tree footer/dialog, clickable
+  file/URL links, custom themes, and exact proprietary modal layout/wording.
+  These are not claimed as complete product parity.
 
 ## Explicit exclusions
 

@@ -90,6 +90,59 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
 }
 
 #[test]
+fn composer_restores_terminal_around_job_control_suspend() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    let _ = read_available(&mut terminal, Duration::from_millis(100));
+
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
+    let suspended = read_until(&mut terminal, "\u{1b}[?2004l", Duration::from_secs(3));
+    assert!(
+        suspended.contains("\u{1b}[?2004l"),
+        "bracketed paste must be disabled before the process stops"
+    );
+
+    let mut status = 0;
+    let started = Instant::now();
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        assert!(result >= 0, "{}", io::Error::last_os_error());
+        if result == pid && libc::WIFSTOPPED(status) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "child did not enter a stopped state"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    let resumed = read_until(&mut terminal, "\u{1b}[?2004h", Duration::from_secs(3));
+    assert!(resumed.contains("\u{1b}[?2004h"));
+    let ready = if resumed.contains("Shift+Tab mode") {
+        resumed
+    } else {
+        read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3))
+    };
+    assert!(ready.contains("Shift+Tab mode"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
 fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
@@ -153,7 +206,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
     let filtered = read_until(&mut terminal, "/model", Duration::from_secs(3));
     assert!(filtered.contains("Set the model for this session"));
     terminal.write_all(b"\t").unwrap();
-    let completed = read_until(&mut terminal, "[model]", Duration::from_secs(3));
+    let completed = read_until(&mut terminal, "model-a", Duration::from_secs(3));
     assert!(completed.contains("/model"));
     terminal.write_all(b"\x7f\r").unwrap();
     let picker = read_until(&mut terminal, "Select model", Duration::from_secs(3));
@@ -189,6 +242,79 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
 
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
+fn theme_picker_previews_without_persisting_on_escape() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"/theme\r").unwrap();
+    let initial = read_until(&mut terminal, "Preview · demo.rs", Duration::from_secs(3));
+    assert!(initial.contains("- let message = \"before\";"));
+    assert!(initial.contains("+ let message = \"after\";"));
+
+    terminal.write_all(b"\x1b[B").unwrap();
+    let focused = read_until(&mut terminal, "› 2. Dark", Duration::from_secs(3));
+    assert!(focused.contains("› 2. Dark"));
+    terminal.write_all(b"\x1b").unwrap();
+    let cancelled = read_until(
+        &mut terminal,
+        "Theme unchanged: auto",
+        Duration::from_secs(3),
+    );
+    assert!(cancelled.contains("Theme unchanged: auto"));
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
+fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"/statusline cat\r").unwrap();
+    let configured = read_until(
+        &mut terminal,
+        "Status line configured from trusted user settings.",
+        Duration::from_secs(3),
+    );
+    assert!(configured.contains("Status line configured"));
+    let initial = read_until(
+        &mut terminal,
+        "\"permissionMode\":\"default\"",
+        Duration::from_secs(5),
+    );
+    assert!(initial.contains("\"permissionMode\":\"default\""));
+
+    terminal.write_all(b"\x1b[Z").unwrap();
+    let refreshed = read_until(
+        &mut terminal,
+        "\"permissionMode\":\"acceptEdits\"",
+        Duration::from_secs(5),
+    );
+    assert!(refreshed.contains("\"permissionMode\":\"acceptEdits\""));
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
     terminal.write_all(b"\x03").unwrap();
     drop(terminal);
     assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());

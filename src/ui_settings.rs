@@ -90,7 +90,7 @@ impl StatusLineConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UiSettings {
     #[serde(default)]
@@ -99,8 +99,22 @@ pub struct UiSettings {
     pub tui_mode: TuiMode,
     #[serde(default)]
     pub theme: ThemePreset,
+    #[serde(default = "default_true")]
+    pub copy_on_select: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_line: Option<StatusLineConfig>,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            editor_mode: EditorMode::default(),
+            tui_mode: TuiMode::default(),
+            theme: ThemePreset::default(),
+            copy_on_select: true,
+            status_line: None,
+        }
+    }
 }
 
 impl UiSettings {
@@ -124,6 +138,11 @@ impl UiSettings {
             "editorMode" => next.editor_mode = parse_editor_mode(value)?,
             "tuiMode" => next.tui_mode = parse_tui_mode(value)?,
             "theme" => next.theme = parse_theme(value)?,
+            "copyOnSelect" => {
+                next.copy_on_select = value
+                    .parse::<bool>()
+                    .context("copyOnSelect must be true or false")?;
+            }
             "statusLine" => {
                 next.status_line = if value.trim() == "null" {
                     None
@@ -218,6 +237,10 @@ fn parse_theme(value: &str) -> Result<ThemePreset> {
     }
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSettingSource {
     User,
@@ -257,6 +280,10 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     UiSettingSpec {
         key: "theme",
         value_kind: UiSettingValueKind::ThemePreset,
+    },
+    UiSettingSpec {
+        key: "copyOnSelect",
+        value_kind: UiSettingValueKind::Boolean,
     },
     UiSettingSpec {
         key: "statusLine",
@@ -643,6 +670,7 @@ mod tests {
             editor_mode: EditorMode::Vim,
             tui_mode: TuiMode::Fullscreen,
             theme: ThemePreset::Daltonized,
+            copy_on_select: false,
             status_line: Some(StatusLineConfig {
                 command: "status-helper --json".to_owned(),
                 padding: 2,
@@ -728,6 +756,10 @@ mod tests {
             .apply_setting(UiSettingSource::User, "theme", "dark")
             .unwrap();
         assert_eq!(settings.theme, ThemePreset::Dark);
+        settings
+            .apply_setting(UiSettingSource::User, "copyOnSelect", "false")
+            .unwrap();
+        assert!(!settings.copy_on_select);
         let before = settings.clone();
         assert!(
             settings

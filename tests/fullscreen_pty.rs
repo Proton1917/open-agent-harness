@@ -91,12 +91,12 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     let page_up = submit_prompt(
         &mut terminal,
         &mut pending_output,
-        b"\x1b[5~/tui\r",
+        b"\x1b[5~\x1b[5~/tui\r",
         Duration::from_secs(3),
     );
     assert!(
         page_up.contains("/tui fullscreen"),
-        "PageUp did not expose older transcript content: {page_up:?}"
+        "two reference-style half-page PageUps did not expose older transcript content: {page_up:?}"
     );
 
     assert!(
@@ -112,12 +112,12 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     let bottom = submit_prompt(
         &mut terminal,
         &mut pending_output,
-        b"\x1b[F/tui\r",
+        b"\x1b[1;5F/tui\r",
         Duration::from_secs(3),
     );
     assert!(
         !bottom.contains("End to jump to bottom"),
-        "End did not restore the sticky bottom"
+        "Ctrl-End did not restore the sticky bottom"
     );
 
     let restored = submit_prompt(

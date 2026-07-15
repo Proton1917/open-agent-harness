@@ -20,11 +20,15 @@ use crossterm::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{
     clipboard::{ClipboardImage, read_clipboard_image, write_clipboard_text},
     config::ModelOption,
     fullscreen::{
-        ClickKind, FrameSpec, FullscreenLimits, FullscreenState, ViewportPoint, WheelDirection,
+        ClickKind, FrameSpec, FullscreenLimits, FullscreenState, SelectionFocusMove, ViewportPoint,
+        WheelDirection,
     },
     input_history::HistoryScope,
     keybindings::{KeyResolution, KeybindingManager},
@@ -49,6 +53,7 @@ const CLEAR_INPUT_WINDOW: Duration = Duration::from_secs(2);
 const MAX_CLIPBOARD_ATTACHMENTS: usize = 8;
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FULLSCREEN_STREAM_BYTES: usize = 64 * 1024;
+const MAX_PERMISSION_PREVIEW_BYTES: usize = 64 * 1024;
 const FULLSCREEN_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,14 +267,16 @@ impl ConversationUi {
             return Ok(());
         }
         match direction {
-            FullscreenScroll::PageUp => state.fullscreen.scroll_page(WheelDirection::Up),
-            FullscreenScroll::PageDown => state.fullscreen.scroll_page(WheelDirection::Down),
+            FullscreenScroll::PageUp => state.fullscreen.scroll_half_page(WheelDirection::Up),
+            FullscreenScroll::PageDown => state.fullscreen.scroll_half_page(WheelDirection::Down),
             FullscreenScroll::Top => state.fullscreen.scroll_to_top(),
             FullscreenScroll::Bottom => state.fullscreen.scroll_to_bottom(),
             FullscreenScroll::WheelUp(at) => {
+                state.fullscreen.clear_selection();
                 state.fullscreen.wheel(WheelDirection::Up, at);
             }
             FullscreenScroll::WheelDown(at) => {
+                state.fullscreen.clear_selection();
                 state.fullscreen.wheel(WheelDirection::Down, at);
             }
         }
@@ -316,12 +323,40 @@ impl ConversationUi {
         state.fullscreen.selected_text()
     }
 
-    fn fullscreen_selected_text(&self) -> Option<String> {
+    fn fullscreen_has_selection(&self) -> bool {
         let state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.fullscreen.selected_text()
+        state.fullscreen.has_selection()
+    }
+
+    fn fullscreen_selection_move(&self, movement: SelectionFocusMove) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.fullscreen.move_selection_focus(movement)
+    }
+
+    fn fullscreen_selection_clear(&self) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let had_selection = state.fullscreen.has_selection();
+        state.fullscreen.clear_selection();
+        had_selection
+    }
+
+    fn fullscreen_selection_take(&self) -> Option<String> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected = state.fullscreen.selected_text();
+        state.fullscreen.clear_selection();
+        selected
     }
 
     fn resize_fullscreen(&self, columns: u16, rows: u16) -> Result<()> {
@@ -432,6 +467,7 @@ impl ConversationUi {
             QueryEvent::ToolFinished {
                 name,
                 preview,
+                collapsed,
                 is_error,
                 elapsed_ms,
                 ..
@@ -453,6 +489,9 @@ impl ConversationUi {
                 let preview = single_line(preview, 100);
                 if !preview.is_empty() {
                     let _ = queue!(out, Print(" · "), Print(preview));
+                }
+                if *collapsed {
+                    let _ = queue!(out, Print(" (Ctrl-O to expand)"));
                 }
                 if self.color {
                     let _ = queue!(out, ResetColor);
@@ -624,7 +663,19 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
             };
             state.fullscreen.set_status(Some(&status));
         }
-        QueryEvent::AssistantMessage { .. } | QueryEvent::CheckpointCreated { .. } => {}
+        QueryEvent::AssistantMessage { content } => {
+            if !state.fullscreen_stream.is_empty() {
+                let complete = assistant_content_text(content);
+                state.fullscreen.set_streaming_line(None);
+                state.fullscreen_stream.clear();
+                if !complete.is_empty() {
+                    state
+                        .fullscreen
+                        .push_message(&format!("Assistant · {complete}"));
+                }
+            }
+        }
+        QueryEvent::CheckpointCreated { .. } => {}
         QueryEvent::ToolStarted { name, summary, .. } => {
             finish_fullscreen_stream(state);
             state.fullscreen.set_status(None);
@@ -639,17 +690,21 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
         QueryEvent::ToolFinished {
             name,
             preview,
+            collapsed,
             is_error,
             elapsed_ms,
             ..
         } => {
             let symbol = if *is_error { "✗" } else { "✓" };
             let preview = single_line(preview, 100);
-            let suffix = if preview.is_empty() {
+            let mut suffix = if preview.is_empty() {
                 String::new()
             } else {
                 format!(" · {preview}")
             };
+            if *collapsed {
+                suffix.push_str(" (Ctrl-O to expand)");
+            }
             state.fullscreen.push_message(&format!(
                 "  ╰─ {symbol} {name} {}{suffix}",
                 format_duration(*elapsed_ms)
@@ -687,6 +742,15 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
     }
 }
 
+fn assistant_content_text(content: &[serde_json::Value]) -> String {
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 pub struct InputEditor {
     history: Vec<String>,
     project_history: Vec<String>,
@@ -703,6 +767,8 @@ pub struct InputEditor {
 enum BindingDispatch {
     Key(KeyEvent),
     Command(String),
+    FullscreenScroll(FullscreenScroll),
+    CopySelection,
     RedrawOrClear,
     ClearScreen,
     PasteImage,
@@ -747,6 +813,13 @@ fn dispatch_binding(action: String) -> BindingDispatch {
         "chat:clearInput" | "app:redraw" => return BindingDispatch::RedrawOrClear,
         "chat:clearScreen" => return BindingDispatch::ClearScreen,
         "chat:imagePaste" => return BindingDispatch::PasteImage,
+        "scroll:pageUp" => return BindingDispatch::FullscreenScroll(FullscreenScroll::PageUp),
+        "scroll:pageDown" => {
+            return BindingDispatch::FullscreenScroll(FullscreenScroll::PageDown);
+        }
+        "scroll:top" => return BindingDispatch::FullscreenScroll(FullscreenScroll::Top),
+        "scroll:bottom" => return BindingDispatch::FullscreenScroll(FullscreenScroll::Bottom),
+        "selection:copy" => return BindingDispatch::CopySelection,
         _ => return BindingDispatch::Unsupported(action),
     };
     BindingDispatch::Key(key)
@@ -815,13 +888,13 @@ struct HistorySearch {
 }
 
 impl HistorySearch {
-    fn new(history: &[String], text: String, cursor_byte: usize) -> Self {
+    fn new(history: &[String], scope: HistoryScope, text: String, cursor_byte: usize) -> Self {
         let mut search = Self {
             original: EditorSnapshot { text, cursor_byte },
             query: String::new(),
             matches: Vec::new(),
             selected: 0,
-            scope: HistoryScope::Session,
+            scope,
         };
         search.refresh(history);
         search
@@ -984,6 +1057,7 @@ pub struct InputReadContext<'a> {
     pub todos: &'a [String],
     pub status_line: Option<&'a str>,
     pub theme: ThemePreset,
+    pub copy_on_select: bool,
 }
 
 pub struct InputReadActions<'a> {
@@ -991,6 +1065,78 @@ pub struct InputReadActions<'a> {
     pub model_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
     pub rewind_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
     pub transcript_viewer: &'a mut dyn FnMut() -> Result<()>,
+    /// Returns `Some(new_value)` only when an asynchronous refresh completed.
+    /// The inner `None` clears an existing status line.
+    pub status_line_refresh:
+        &'a mut dyn FnMut(PermissionMode, Option<VimMode>) -> Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptMatch {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+fn transcript_matches(lines: &[&String], query: &str) -> Vec<TranscriptMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let Ok(pattern) = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .unicode(true)
+        .build()
+    else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(line, text)| {
+            pattern.find_iter(text).map(move |found| TranscriptMatch {
+                line,
+                start: found.start(),
+                end: found.end(),
+            })
+        })
+        .take(1_000)
+        .collect()
+}
+
+fn queue_transcript_search_line(
+    out: &mut impl Write,
+    line: &str,
+    width: usize,
+    matches: &[TranscriptMatch],
+    line_index: usize,
+    selected: Option<TranscriptMatch>,
+) -> io::Result<()> {
+    let visible = visible_line(line, width);
+    let mut cursor = 0usize;
+    for found in matches.iter().filter(|found| found.line == line_index) {
+        let start = found.start.min(visible.len());
+        let end = found.end.min(visible.len());
+        if start >= end
+            || start < cursor
+            || !visible.is_char_boundary(start)
+            || !visible.is_char_boundary(end)
+        {
+            continue;
+        }
+        queue!(out, Print(&visible[cursor..start]))?;
+        if selected == Some(*found) {
+            queue!(out, SetAttribute(Attribute::Reverse))?;
+        } else {
+            queue!(out, SetAttribute(Attribute::Underlined))?;
+        }
+        queue!(
+            out,
+            Print(&visible[start..end]),
+            SetAttribute(Attribute::Reset)
+        )?;
+        cursor = end;
+    }
+    queue!(out, Print(&visible[cursor..]))
 }
 
 pub fn view_transcript(lines: &[String]) -> Result<()> {
@@ -1019,8 +1165,9 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
     let mut show_all = false;
     let mut top = compact.len().saturating_sub(1);
     let mut search = None::<String>;
-    let mut matches = Vec::<usize>::new();
+    let mut matches = Vec::<TranscriptMatch>::new();
     let mut selected_match = 0usize;
+    let mut search_origin_top = 0usize;
     let mut dump_to_scrollback = false;
 
     loop {
@@ -1035,12 +1182,17 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
             frame.extend_from_slice(SYNC_OUTPUT_START);
         }
         queue!(frame, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        for line in active.iter().skip(top).take(viewport) {
-            queue!(
-                frame,
-                Print(visible_line(line, width.saturating_sub(1))),
-                Print(RAW_LINE_END)
+        let selected = matches.get(selected_match).copied();
+        for (line_index, line) in active.iter().enumerate().skip(top).take(viewport) {
+            queue_transcript_search_line(
+                &mut frame,
+                line,
+                width.saturating_sub(1),
+                &matches,
+                line_index,
+                selected,
             )?;
+            queue!(frame, Print(RAW_LINE_END))?;
         }
         let footer = if let Some(query) = &search {
             format!(
@@ -1086,9 +1238,17 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
         if let Some(query) = search.as_mut() {
             match key {
                 KeyEvent {
-                    code: KeyCode::Esc | KeyCode::Enter,
+                    code: KeyCode::Enter,
                     ..
                 } => search = None,
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } => {
+                    search = None;
+                    top = search_origin_top;
+                    matches.clear();
+                    selected_match = 0;
+                }
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
@@ -1099,7 +1259,12 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
                     code: KeyCode::Char('c'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-                } => search = None,
+                } => {
+                    search = None;
+                    top = search_origin_top;
+                    matches.clear();
+                    selected_match = 0;
+                }
                 KeyEvent {
                     code: KeyCode::Char(character),
                     modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
@@ -1110,19 +1275,10 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
                 _ => {}
             }
             if let Some(query) = &search {
-                matches = if query.is_empty() {
-                    Vec::new()
-                } else {
-                    active
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, line)| line.contains(query).then_some(index))
-                        .take(1_000)
-                        .collect()
-                };
+                matches = transcript_matches(active, query);
                 selected_match = 0;
-                if let Some(index) = matches.first() {
-                    top = (*index).min(active.len().saturating_sub(viewport));
+                if let Some(found) = matches.first() {
+                    top = found.line.min(active.len().saturating_sub(viewport));
                 }
             }
             continue;
@@ -1219,7 +1375,10 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
                 code: KeyCode::Char('/'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => search = Some(String::new()),
+            } => {
+                search_origin_top = top;
+                search = Some(String::new());
+            }
             KeyEvent {
                 code: KeyCode::Char('n' | 'N'),
                 modifiers,
@@ -1230,7 +1389,9 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
                 } else {
                     (selected_match + 1) % matches.len()
                 };
-                top = matches[selected_match].min(active.len().saturating_sub(viewport));
+                top = matches[selected_match]
+                    .line
+                    .min(active.len().saturating_sub(viewport));
             }
             KeyEvent {
                 code: KeyCode::Char('['),
@@ -1277,6 +1438,72 @@ pub struct SlashCommandSuggestion {
     pub description: String,
     pub argument_hint: Option<String>,
     pub execute_on_enter: bool,
+    pub argument_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArgumentToken {
+    start: usize,
+    end: usize,
+    query: String,
+}
+
+fn argument_matches<'a>(
+    buffer: &str,
+    cursor_byte: usize,
+    commands: &'a [SlashCommandSuggestion],
+) -> Option<(ArgumentToken, Vec<&'a String>)> {
+    let before = buffer.get(..cursor_byte)?;
+    let rest = before.strip_prefix('/')?;
+    if rest.contains('\n') {
+        return None;
+    }
+    let split = rest.find(char::is_whitespace)?;
+    let command_name = &rest[..split];
+    let command = commands.iter().find(|command| {
+        command.name == command_name || command.aliases.iter().any(|alias| alias == command_name)
+    })?;
+    if command.argument_candidates.is_empty() {
+        return None;
+    }
+    let argument_start = 1
+        + split
+        + rest[split..]
+            .len()
+            .saturating_sub(rest[split..].trim_start().len());
+    let current_start = before[argument_start..]
+        .rfind(char::is_whitespace)
+        .map_or(argument_start, |offset| argument_start + offset + 1);
+    let query = &before[current_start..];
+    if before[argument_start..current_start]
+        .split_whitespace()
+        .count()
+        > 0
+    {
+        return None;
+    }
+    let query_lower = query.to_ascii_lowercase();
+    let mut matches = command
+        .argument_candidates
+        .iter()
+        .filter(|candidate| candidate.to_ascii_lowercase().contains(&query_lower))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|candidate| {
+        let normalized = candidate.to_ascii_lowercase();
+        (
+            usize::from(normalized != query_lower),
+            usize::from(!normalized.starts_with(&query_lower)),
+            normalized,
+        )
+    });
+    (!matches.is_empty()).then_some((
+        ArgumentToken {
+            start: current_start,
+            end: cursor_byte,
+            query: query.to_owned(),
+        },
+        matches,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1380,19 +1607,62 @@ fn unescape_open_quoted_path(value: &str) -> Option<String> {
 }
 
 fn file_matches<'a>(token: &FileToken, files: &'a [FileSuggestion]) -> Vec<&'a FileSuggestion> {
-    files
+    let query = token.query.to_ascii_lowercase();
+    let mut matches = files
         .iter()
         .take(MAX_FILE_CANDIDATES_SCANNED)
-        .filter(|file| {
-            file.display_path.starts_with(&token.query)
-                && if file.is_dir {
-                    format!("{}/", file.display_path.trim_end_matches('/')) != token.query
-                } else {
-                    file.display_path != token.query
-                }
+        .filter_map(|file| {
+            if if file.is_dir {
+                format!("{}/", file.display_path.trim_end_matches('/')) == token.query
+            } else {
+                file.display_path == token.query
+            } {
+                return None;
+            }
+            let path = file.display_path.to_ascii_lowercase();
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            let score = if query.is_empty() || path.starts_with(&query) {
+                (0, path.len())
+            } else if basename.starts_with(&query) {
+                (1, path.len())
+            } else if path.contains(&query) {
+                (2, path.len())
+            } else if fuzzy_subsequence(&path, &query) {
+                (3, path.len())
+            } else if edit_distance(basename, &query)
+                <= usize::max(1, query.chars().count().saturating_mul(3).div_ceil(10))
+            {
+                (4, path.len())
+            } else {
+                return None;
+            };
+            Some((score, file))
         })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left.display_path.cmp(&right.display_path))
+    });
+    matches
+        .into_iter()
+        .map(|(_, file)| file)
         .take(MAX_FILE_SUGGESTIONS)
         .collect()
+}
+
+fn fuzzy_subsequence(value: &str, query: &str) -> bool {
+    let mut query = query.chars();
+    let mut expected = query.next();
+    for character in value.chars() {
+        if Some(character) == expected {
+            expected = query.next();
+            if expected.is_none() {
+                return true;
+            }
+        }
+    }
+    expected.is_none()
 }
 
 fn common_file_prefix(files: &[&FileSuggestion]) -> String {
@@ -1580,6 +1850,7 @@ pub enum ModelPickerOutcome {
 struct PickerText<'a> {
     title: &'a str,
     help: &'a str,
+    preview_theme: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1674,6 +1945,7 @@ pub fn select_model(options: &[ModelOption], current: &str) -> Result<ModelPicke
         current,
         "Select model",
         "Switch between models configured for this backend. Use /model <id> for another model.",
+        false,
     )
 }
 
@@ -1684,6 +1956,7 @@ pub fn select_rewind_checkpoint(options: &[ModelOption]) -> Result<ModelPickerOu
         current,
         "Restore conversation",
         "Choose a prior user-message boundary. Enter restores it; Escape keeps the current conversation.",
+        false,
     )
 }
 
@@ -1693,6 +1966,7 @@ pub fn select_theme(options: &[ModelOption], current: &str) -> Result<ModelPicke
         current,
         "Select theme",
         "Choose a provider-neutral terminal color preset. Escape keeps the current preset.",
+        true,
     )
 }
 
@@ -1701,6 +1975,7 @@ fn select_option(
     current: &str,
     title: &str,
     help: &str,
+    preview_theme: bool,
 ) -> Result<ModelPickerOutcome> {
     if options.is_empty() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Ok(ModelPickerOutcome::Cancelled);
@@ -1710,7 +1985,11 @@ fn select_option(
     let mut state = ModelPickerState::new(options, current);
     let mut rendered = RenderedPicker::default();
     let mut exit_pending: Option<(KeyCode, Instant)> = None;
-    let text = PickerText { title, help };
+    let text = PickerText {
+        title,
+        help,
+        preview_theme,
+    };
 
     loop {
         state.fit_terminal();
@@ -1815,6 +2094,7 @@ fn select_option(
 
 pub fn request_permission(
     tool: &str,
+    input: &serde_json::Value,
     summary: &str,
     session_available: bool,
 ) -> Result<PermissionChoice> {
@@ -1824,26 +2104,34 @@ pub fn request_permission(
     let _raw = RawModeGuard::enter()?;
     let mut out = io::stdout();
     let tool = sanitize_inline(tool);
-    let summary = visible_line(&single_line(summary, 160), 160);
-    queue!(
-        out,
-        Print(RAW_LINE_END),
-        Print("  Permission required"),
-        Print(RAW_LINE_END),
-        Print(format!("  {tool}")),
-        Print(if summary.is_empty() { "" } else { " · " }),
-        Print(summary),
-        Print(RAW_LINE_END),
-        Print(if session_available {
-            "  [y] allow once   [s] allow exact action for session   [n] deny"
-        } else {
-            "  [y] allow once   [n] deny"
-        }),
-        Print(RAW_LINE_END),
-        Print("  [Esc] deny   [Ctrl-C] interrupt"),
-        Print(RAW_LINE_END)
+    let summary = single_line(summary, 4 * 1024);
+    let details = sanitize_multiline(&serde_json::to_string_pretty(input)?);
+    if details.len() > MAX_PERMISSION_PREVIEW_BYTES {
+        queue!(
+            out,
+            Print(RAW_LINE_END),
+            Print("  Permission denied"),
+            Print(RAW_LINE_END),
+            Print(format!(
+                "  {tool} input exceeds the {MAX_PERMISSION_PREVIEW_BYTES}-byte exact preview limit"
+            )),
+            Print(RAW_LINE_END),
+            Print("  Refusing to authorize an action whose full input cannot be displayed."),
+            Print(RAW_LINE_END),
+            Print(RAW_LINE_END)
+        )?;
+        out.flush()?;
+        return Ok(PermissionChoice::Deny);
+    }
+    render_permission_prompt(
+        &mut out,
+        &tool,
+        input,
+        &summary,
+        &details,
+        session_available,
+        false,
     )?;
-    out.flush()?;
     loop {
         match event::read()? {
             Event::Key(KeyEvent {
@@ -1905,9 +2193,118 @@ pub fn request_permission(
                 out.flush()?;
                 return Ok(PermissionChoice::Interrupt);
             }
+            Event::Resize(_, _) => render_permission_prompt(
+                &mut out,
+                &tool,
+                input,
+                &summary,
+                &details,
+                session_available,
+                true,
+            )?,
             _ => {}
         }
     }
+}
+
+fn render_permission_prompt(
+    out: &mut impl Write,
+    tool: &str,
+    input: &serde_json::Value,
+    summary: &str,
+    details: &str,
+    session_available: bool,
+    clear: bool,
+) -> Result<()> {
+    if clear {
+        queue!(
+            out,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown),
+            Print(RAW_LINE_END)
+        )?;
+    } else {
+        queue!(out, Print(RAW_LINE_END))?;
+    }
+    queue!(
+        out,
+        SetAttribute(Attribute::Bold),
+        Print("  Permission required"),
+        SetAttribute(Attribute::Reset),
+        Print(RAW_LINE_END),
+        Print(format!("  {tool}")),
+        Print(if summary.is_empty() { "" } else { " · " }),
+        Print(summary),
+        Print(RAW_LINE_END)
+    )?;
+    for line in permission_action_preview(tool, input) {
+        queue!(out, Print(line), Print(RAW_LINE_END))?;
+    }
+    queue!(
+        out,
+        Print("  Exact input:"),
+        Print(RAW_LINE_END),
+        Print(details),
+        Print(RAW_LINE_END),
+        Print(if session_available {
+            "  [y] allow once   [s] allow exact action for session   [n] deny"
+        } else {
+            "  [y] allow once   [n] deny"
+        }),
+        Print(RAW_LINE_END),
+        Print("  [Esc] deny   [Ctrl-C] interrupt"),
+        Print(RAW_LINE_END)
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+fn permission_action_preview(tool: &str, input: &serde_json::Value) -> Vec<String> {
+    const MAX_PREVIEW_CHARS: usize = 240;
+    let field = |name: &str| input.get(name).and_then(serde_json::Value::as_str);
+    let mut lines = Vec::new();
+    match tool {
+        "Bash" => {
+            if let Some(command) = field("command") {
+                lines.push(format!("  $ {}", single_line(command, MAX_PREVIEW_CHARS)));
+            }
+        }
+        "Edit" => {
+            if let Some(path) = field("file_path").or_else(|| field("path")) {
+                lines.push(format!("  Edit {}", single_line(path, MAX_PREVIEW_CHARS)));
+            }
+            if let Some(old) = field("old_string") {
+                lines.push(format!("    - {}", single_line(old, MAX_PREVIEW_CHARS)));
+            }
+            if let Some(new) = field("new_string") {
+                lines.push(format!("    + {}", single_line(new, MAX_PREVIEW_CHARS)));
+            }
+        }
+        "Write" | "NotebookEdit" => {
+            if let Some(path) = field("file_path").or_else(|| field("notebook_path")) {
+                lines.push(format!("  {tool} {}", single_line(path, MAX_PREVIEW_CHARS)));
+            }
+            if let Some(content) = field("content").or_else(|| field("new_source")) {
+                let line_count = content.lines().count().max(1);
+                lines.push(format!("    {line_count} line(s) of proposed content"));
+            }
+        }
+        "Read" | "Glob" | "Grep" => {
+            if let Some(path) = field("file_path").or_else(|| field("path")) {
+                lines.push(format!("  Access {}", single_line(path, MAX_PREVIEW_CHARS)));
+            }
+        }
+        "WebFetch" | "WebSearch" => {
+            if let Some(target) = field("url").or_else(|| field("query")) {
+                lines.push(format!(
+                    "  Network target {}",
+                    single_line(target, MAX_PREVIEW_CHARS)
+                ));
+            }
+        }
+        _ => {}
+    }
+    lines
 }
 
 impl Default for InputEditor {
@@ -1990,21 +2387,32 @@ impl InputEditor {
             todos,
             status_line,
             theme,
+            copy_on_select,
         } = context;
         let InputReadActions {
             scheduled_prompt,
             model_picker,
             rewind_picker,
             transcript_viewer,
+            status_line_refresh,
         } = actions;
         let mut raw_guard = Some(RawModeGuard::enter()?);
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignalGuard::register()?;
         let mut out = io::stdout();
         let mut buffer = String::new();
         let mut cursor_byte = 0usize;
         let mut rendered = RenderedInput::default();
-        let mut history_index = self.history.len();
+        let mut navigation_history = self.project_history.clone();
+        navigation_history.retain(|entry| !self.history.contains(entry));
+        navigation_history.extend(self.history.iter().cloned());
+        if navigation_history.len() > self.history_limit {
+            navigation_history.drain(..navigation_history.len() - self.history_limit);
+        }
+        let mut history_index = navigation_history.len();
         let mut draft = String::new();
         let mut mode = initial_mode;
+        let mut live_status_line = status_line.map(ToOwned::to_owned);
         let mut exit_pending: Option<ExitPending> = None;
         let mut last_escape: Option<Instant> = None;
         let mut hint = String::new();
@@ -2017,14 +2425,51 @@ impl InputEditor {
         let mut selected_attachment: Option<usize> = None;
         let mut fullscreen_last_click: Option<(Instant, u16, u16, u8)> = None;
         let mut fullscreen_selecting = false;
+        let mut fullscreen_composer_hit_map = FullscreenComposerHitMap::default();
         let mut clipboard_images = std::mem::take(&mut self.stashed_clipboard_images);
         let mut selected_suggestion = 0usize;
         let mut dismissed_suggestions_for: Option<String> = None;
         let mut selected_file_suggestion = 0usize;
         let mut dismissed_file_suggestions_for: Option<(String, usize)> = None;
+        let mut selected_argument_suggestion = 0usize;
+        let mut dismissed_argument_suggestions_for: Option<(String, usize)> = None;
         let mut needs_redraw = true;
 
         loop {
+            #[cfg(unix)]
+            if suspend_signal.take() {
+                let was_fullscreen = self
+                    .ui
+                    .as_ref()
+                    .is_some_and(ConversationUi::fullscreen_active);
+                if was_fullscreen {
+                    self.ui
+                        .as_ref()
+                        .expect("fullscreen UI was checked")
+                        .set_tui_mode(TuiMode::Default)?;
+                } else {
+                    rendered.erase(&mut out)?;
+                }
+                drop(raw_guard.take());
+                signal_hook::low_level::raise(signal_hook::consts::signal::SIGSTOP)?;
+                raw_guard = Some(RawModeGuard::enter()?);
+                if was_fullscreen {
+                    self.ui
+                        .as_ref()
+                        .expect("fullscreen UI was checked")
+                        .set_tui_mode(TuiMode::Fullscreen)?;
+                }
+                rendered = RenderedInput::default();
+                fullscreen_composer_hit_map = FullscreenComposerHitMap::default();
+                needs_redraw = true;
+                continue;
+            }
+            if let Some(refreshed) = status_line_refresh(mode, self.vim_mode()) {
+                if live_status_line != refreshed {
+                    live_status_line = refreshed;
+                    needs_redraw = true;
+                }
+            }
             if self.keybindings.reload_if_due(false) {
                 needs_redraw = true;
             }
@@ -2066,6 +2511,25 @@ impl InputEditor {
                 selected_file_suggestion = 0;
             } else {
                 selected_file_suggestion = selected_file_suggestion.min(file_suggestions.len() - 1);
+            }
+            let (argument_token, argument_suggestions) = if history_search.is_some()
+                || dismissed_argument_suggestions_for
+                    .as_ref()
+                    .is_some_and(|(dismissed, cursor)| {
+                        dismissed == &buffer && *cursor == cursor_byte
+                    }) {
+                (None, Vec::new())
+            } else {
+                argument_matches(&buffer, cursor_byte, commands).map_or_else(
+                    || (None, Vec::new()),
+                    |(token, matches)| (Some(token), matches),
+                )
+            };
+            if argument_suggestions.is_empty() {
+                selected_argument_suggestion = 0;
+            } else {
+                selected_argument_suggestion =
+                    selected_argument_suggestion.min(argument_suggestions.len() - 1);
             }
             let argument_hint = command_argument_hint(&buffer, commands);
             if needs_redraw {
@@ -2120,9 +2584,11 @@ impl InputEditor {
                     selected_suggestion,
                     file_suggestions: &file_suggestions,
                     selected_file_suggestion,
+                    argument_suggestions: &argument_suggestions,
+                    selected_argument_suggestion,
                     argument_hint,
                     todos: show_todos.then_some(todos),
-                    status_line,
+                    status_line: live_status_line.as_deref(),
                     theme,
                     vim_mode,
                     vim_selection,
@@ -2131,9 +2597,16 @@ impl InputEditor {
                     let mut probe = RenderedInput::default();
                     let mut composer = Vec::new();
                     probe.draw(&mut composer, render_state)?;
-                    ui.render_fullscreen_prompt(&composer, probe.rows.saturating_add(1))?;
+                    let reserve = probe.rows.saturating_add(1);
+                    let terminal_rows = terminal::size().map_or(24, |(_, rows)| rows);
+                    fullscreen_composer_hit_map = FullscreenComposerHitMap {
+                        top_row: terminal_rows.saturating_sub(reserve),
+                        rows: probe.input_rows.clone(),
+                    };
+                    ui.render_fullscreen_prompt(&composer, reserve)?;
                     rendered = RenderedInput::default();
                 } else {
+                    fullscreen_composer_hit_map = FullscreenComposerHitMap::default();
                     rendered.redraw(&mut out, render_state)?;
                 }
                 needs_redraw = false;
@@ -2174,6 +2647,15 @@ impl InputEditor {
                     Event::Mouse(mouse)
                         if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                     {
+                        if let Some(next_cursor) =
+                            fullscreen_composer_hit_map.cursor_at(mouse.row, mouse.column, &buffer)
+                        {
+                            cursor_byte = next_cursor.min(buffer.len());
+                            ui.fullscreen_selection_clear();
+                            fullscreen_selecting = false;
+                            fullscreen_last_click = None;
+                            continue;
+                        }
                         let now = Instant::now();
                         let count = fullscreen_last_click
                             .filter(|(at, row, column, _)| {
@@ -2190,7 +2672,9 @@ impl InputEditor {
                         };
                         fullscreen_selecting =
                             ui.fullscreen_selection_start(mouse.row, mouse.column, kind);
-                        continue;
+                        if fullscreen_selecting {
+                            continue;
+                        }
                     }
                     Event::Mouse(mouse)
                         if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
@@ -2205,11 +2689,22 @@ impl InputEditor {
                     {
                         fullscreen_selecting = false;
                         if let Some(selected) = ui.fullscreen_selection_finish() {
-                            hint = match write_clipboard_text(&selected) {
-                                Ok(()) => "Selected transcript text copied".to_owned(),
-                                Err(error) => format!("Selection copy failed: {error}"),
-                            };
+                            if copy_on_select {
+                                hint = match write_clipboard_text(&selected) {
+                                    Ok(()) => "Selected transcript text copied".to_owned(),
+                                    Err(error) => format!("Selection copy failed: {error}"),
+                                };
+                            }
                         }
+                        continue;
+                    }
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Esc,
+                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                        ..
+                    }) if ui.fullscreen_has_selection() => {
+                        ui.fullscreen_selection_clear();
+                        hint.clear();
                         continue;
                     }
                     Event::Key(KeyEvent {
@@ -2217,11 +2712,13 @@ impl InputEditor {
                         modifiers,
                         kind: KeyEventKind::Press | KeyEventKind::Repeat,
                         ..
-                    }) if (modifiers.contains(KeyModifiers::CONTROL)
-                        && modifiers.contains(KeyModifiers::SHIFT))
-                        || modifiers.contains(KeyModifiers::SUPER) =>
+                    }) if ui.fullscreen_has_selection()
+                        && modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.intersects(
+                            KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
                     {
-                        hint = match ui.fullscreen_selected_text() {
+                        hint = match ui.fullscreen_selection_take() {
                             Some(selected) => match write_clipboard_text(&selected) {
                                 Ok(()) => "Selected transcript text copied".to_owned(),
                                 Err(error) => format!("Selection copy failed: {error}"),
@@ -2230,43 +2727,72 @@ impl InputEditor {
                         };
                         continue;
                     }
+                    Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                        ..
+                    }) if ui.fullscreen_has_selection()
+                        && modifiers.contains(KeyModifiers::SHIFT)
+                        && !modifiers.contains(KeyModifiers::ALT)
+                        && matches!(
+                            code,
+                            KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Home
+                                | KeyCode::End
+                        ) =>
+                    {
+                        let movement = match code {
+                            KeyCode::Left => SelectionFocusMove::Left,
+                            KeyCode::Right => SelectionFocusMove::Right,
+                            KeyCode::Up => SelectionFocusMove::Up,
+                            KeyCode::Down => SelectionFocusMove::Down,
+                            KeyCode::Home => SelectionFocusMove::LineStart,
+                            KeyCode::End => SelectionFocusMove::LineEnd,
+                            _ => unreachable!("selection movement was matched above"),
+                        };
+                        ui.fullscreen_selection_move(movement);
+                        continue;
+                    }
                     _ => {}
                 }
-                let scroll = match &event {
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => Some(
-                        FullscreenScroll::WheelUp(self.fullscreen_wheel_epoch.elapsed()),
-                    ),
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => Some(
-                        FullscreenScroll::WheelDown(self.fullscreen_wheel_epoch.elapsed()),
-                    ),
-                    Event::Key(KeyEvent {
-                        code: KeyCode::PageUp,
-                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                        ..
-                    }) => Some(FullscreenScroll::PageUp),
-                    Event::Key(KeyEvent {
-                        code: KeyCode::PageDown,
-                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                        ..
-                    }) => Some(FullscreenScroll::PageDown),
-                    Event::Key(KeyEvent {
-                        code: KeyCode::Home,
-                        modifiers,
-                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                        ..
-                    }) if modifiers.contains(KeyModifiers::CONTROL) => Some(FullscreenScroll::Top),
-                    Event::Key(KeyEvent {
-                        code: KeyCode::End,
-                        modifiers,
-                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                        ..
-                    }) if modifiers.contains(KeyModifiers::CONTROL) || buffer.is_empty() => {
-                        Some(FullscreenScroll::Bottom)
-                    }
+                let wheel_up = match &event {
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => Some(true),
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => Some(false),
                     _ => None,
                 };
-                if let Some(scroll) = scroll {
-                    ui.fullscreen_scroll(scroll)?;
+                if let Some(up) = wheel_up {
+                    match self.keybindings.resolve_wheel(up, &["Scroll"]) {
+                        KeyResolution::Match(action)
+                            if action
+                                == if up {
+                                    "scroll:lineUp"
+                                } else {
+                                    "scroll:lineDown"
+                                } =>
+                        {
+                            let at = self.fullscreen_wheel_epoch.elapsed();
+                            ui.fullscreen_scroll(if up {
+                                FullscreenScroll::WheelUp(at)
+                            } else {
+                                FullscreenScroll::WheelDown(at)
+                            })?;
+                        }
+                        KeyResolution::Unbound => {}
+                        KeyResolution::Match(action) => {
+                            hint = format!("Action {action} is unavailable for mouse wheel");
+                        }
+                        KeyResolution::ChordStarted => {
+                            hint = "Mouse wheel chord started".to_owned();
+                        }
+                        KeyResolution::ChordCancelled => {
+                            hint = "Mouse wheel chord cancelled".to_owned();
+                        }
+                        KeyResolution::None => {}
+                    }
                     continue;
                 }
                 if let Event::Resize(columns, rows) = &event {
@@ -2284,14 +2810,13 @@ impl InputEditor {
             let previous_selected_file = file_suggestions
                 .get(selected_file_suggestion)
                 .map(|suggestion| suggestion.display_path.clone());
+            let previous_selected_argument = argument_suggestions
+                .get(selected_argument_suggestion)
+                .map(|suggestion| (*suggestion).clone());
             match event {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    let vim_host_escape = matches!(key.code, KeyCode::Esc)
-                        && self.vim.as_ref().is_some_and(|vim| {
-                            vim.mode() == VimMode::Normal && !vim.pending_command()
-                        });
                     let vim_history_search = matches!(
                         key,
                         KeyEvent {
@@ -2304,6 +2829,7 @@ impl InputEditor {
                         .as_ref()
                         .is_some_and(|vim| vim.mode() == VimMode::Normal && !vim.pending_command());
                     let overlay_navigation = (!file_suggestions.is_empty()
+                        || !argument_suggestions.is_empty()
                         || !suggestions.is_empty())
                         && matches!(
                             key.code,
@@ -2315,7 +2841,6 @@ impl InputEditor {
                         );
                     let key = if history_search.is_none()
                         && !overlay_navigation
-                        && !vim_host_escape
                         && !vim_history_search
                     {
                         if let (Some(vim), Some(vim_event)) = (self.vim.as_mut(), vim_event(key)) {
@@ -2324,6 +2849,7 @@ impl InputEditor {
                             if outcome.changed {
                                 dismissed_suggestions_for = None;
                                 dismissed_file_suggestions_for = None;
+                                dismissed_argument_suggestions_for = None;
                             }
                             match outcome.action {
                                 Some(VimAction::Submit) => key,
@@ -2338,6 +2864,10 @@ impl InputEditor {
                                         }
                                         if !file_suggestions.is_empty() {
                                             dismissed_file_suggestions_for =
+                                                Some((buffer.clone(), cursor_byte));
+                                        }
+                                        if !argument_suggestions.is_empty() {
+                                            dismissed_argument_suggestions_for =
                                                 Some((buffer.clone(), cursor_byte));
                                         }
                                     }
@@ -2363,11 +2893,21 @@ impl InputEditor {
                     let mut contexts = Vec::with_capacity(3);
                     if history_search.is_some() {
                         contexts.push("HistorySearch");
-                    } else if !file_suggestions.is_empty() || !suggestions.is_empty() {
+                    } else if !file_suggestions.is_empty()
+                        || !argument_suggestions.is_empty()
+                        || !suggestions.is_empty()
+                    {
                         contexts.push("Autocomplete");
                         contexts.push("Chat");
                     } else {
                         contexts.push("Chat");
+                    }
+                    if self
+                        .ui
+                        .as_ref()
+                        .is_some_and(ConversationUi::fullscreen_active)
+                    {
+                        contexts.push("Scroll");
                     }
                     contexts.push("Global");
                     let key = match self.keybindings.resolve(key, &contexts) {
@@ -2397,6 +2937,31 @@ impl InputEditor {
                                     permission_mode: mode,
                                     clipboard_images: std::mem::take(&mut clipboard_images),
                                 }));
+                            }
+                            BindingDispatch::FullscreenScroll(scroll) => {
+                                if let Some(ui) =
+                                    self.ui.as_ref().filter(|ui| ui.fullscreen_active())
+                                {
+                                    ui.fullscreen_scroll(scroll)?;
+                                }
+                                continue;
+                            }
+                            BindingDispatch::CopySelection => {
+                                let selected = self
+                                    .ui
+                                    .as_ref()
+                                    .filter(|ui| ui.fullscreen_active())
+                                    .and_then(ConversationUi::fullscreen_selection_take);
+                                hint = match selected {
+                                    Some(selected) => match write_clipboard_text(&selected) {
+                                        Ok(()) => "Selected transcript text copied".to_owned(),
+                                        Err(error) => {
+                                            format!("Selection copy failed: {error}")
+                                        }
+                                    },
+                                    None => "No transcript selection to copy".to_owned(),
+                                };
+                                continue;
                             }
                             BindingDispatch::RedrawOrClear => {
                                 let now = Instant::now();
@@ -2460,6 +3025,30 @@ impl InputEditor {
                             }
                         },
                     };
+                    if let Some(ui) = self
+                        .ui
+                        .as_ref()
+                        .filter(|ui| ui.fullscreen_active() && ui.fullscreen_has_selection())
+                    {
+                        let navigation = matches!(
+                            key.code,
+                            KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Home
+                                | KeyCode::End
+                                | KeyCode::PageUp
+                                | KeyCode::PageDown
+                        );
+                        let preserves_selection = navigation
+                            && key.modifiers.intersects(
+                                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            );
+                        if !preserves_selection {
+                            ui.fullscreen_selection_clear();
+                        }
+                    }
                     if let Some(search) = history_search.as_mut() {
                         match key {
                             KeyEvent {
@@ -2478,7 +3067,11 @@ impl InputEditor {
                             } => {
                                 search.scope = search.scope.next();
                                 search.selected = 0;
-                                search.refresh(self.history_for_scope(search.scope));
+                                let entries = match search.scope {
+                                    HistoryScope::Project => navigation_history.as_slice(),
+                                    scope => self.history_for_scope(scope),
+                                };
+                                search.refresh(entries);
                             }
                             KeyEvent {
                                 code: KeyCode::Backspace,
@@ -2724,6 +3317,73 @@ impl InputEditor {
                         } if !file_suggestions.is_empty() => {
                             dismissed_file_suggestions_for = Some((buffer.clone(), cursor_byte));
                             hint = "File suggestions dismissed".to_owned();
+                            last_escape = None;
+                        }
+                        KeyEvent {
+                            code: KeyCode::Up,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !argument_suggestions.is_empty() => {
+                            selected_argument_suggestion = if selected_argument_suggestion == 0 {
+                                argument_suggestions.len() - 1
+                            } else {
+                                selected_argument_suggestion - 1
+                            };
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('n'),
+                            modifiers: KeyModifiers::CONTROL,
+                            ..
+                        } if !argument_suggestions.is_empty() => {
+                            selected_argument_suggestion =
+                                (selected_argument_suggestion + 1) % argument_suggestions.len();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if !argument_suggestions.is_empty() => {
+                            let token = argument_token
+                                .as_ref()
+                                .expect("argument suggestions have a token");
+                            let selected = argument_suggestions[selected_argument_suggestion];
+                            buffer.replace_range(token.start..token.end, selected);
+                            cursor_byte = token.start.saturating_add(selected.len());
+                            hint = "Command argument inserted".to_owned();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if !argument_suggestions.is_empty()
+                            && argument_token.as_ref().is_some_and(|token| {
+                                token.query != *argument_suggestions[selected_argument_suggestion]
+                            }) =>
+                        {
+                            let token = argument_token
+                                .as_ref()
+                                .expect("argument suggestions have a token");
+                            let selected = argument_suggestions[selected_argument_suggestion];
+                            buffer.replace_range(token.start..token.end, selected);
+                            cursor_byte = token.start.saturating_add(selected.len());
+                            hint = "Command argument inserted".to_owned();
+                        }
+                        KeyEvent {
+                            code: KeyCode::Esc, ..
+                        } if !argument_suggestions.is_empty() => {
+                            dismissed_argument_suggestions_for =
+                                Some((buffer.clone(), cursor_byte));
+                            hint = "Argument suggestions dismissed".to_owned();
                             last_escape = None;
                         }
                         KeyEvent {
@@ -3008,6 +3668,7 @@ impl InputEditor {
                         } => {
                             let search = HistorySearch::new(
                                 self.history_for_scope(HistoryScope::Session),
+                                HistoryScope::Session,
                                 buffer.clone(),
                                 cursor_byte,
                             );
@@ -3061,14 +3722,22 @@ impl InputEditor {
                             modifiers: KeyModifiers::CONTROL,
                             ..
                         } => {
-                            if let Some(ui) = self.ui.as_ref().filter(|ui| ui.fullscreen_active()) {
-                                ui.render_fullscreen_prompt(&[], 1)?;
+                            let fullscreen_ui = self
+                                .ui
+                                .as_ref()
+                                .filter(|ui| ui.fullscreen_active())
+                                .cloned();
+                            if let Some(ui) = &fullscreen_ui {
+                                ui.set_tui_mode(TuiMode::Default)?;
                             } else {
                                 rendered.erase(&mut out)?;
                             }
                             drop(raw_guard.take());
                             let outcome = transcript_viewer();
                             raw_guard = Some(RawModeGuard::enter()?);
+                            if let Some(ui) = &fullscreen_ui {
+                                ui.set_tui_mode(TuiMode::Fullscreen)?;
+                            }
                             rendered = RenderedInput::default();
                             match outcome {
                                 Ok(()) => hint = "Returned from transcript".to_owned(),
@@ -3285,13 +3954,13 @@ impl InputEditor {
                             code: KeyCode::Char('p'),
                             modifiers: KeyModifiers::CONTROL,
                             ..
-                        } if !self.history.is_empty() => {
-                            if history_index == self.history.len() {
+                        } if !navigation_history.is_empty() => {
+                            if history_index == navigation_history.len() {
                                 draft.clone_from(&buffer);
                             }
                             history_index = history_index.saturating_sub(1);
-                            buffer.clone_from(&self.history[history_index]);
-                            cursor_byte = buffer.len();
+                            buffer.clone_from(&navigation_history[history_index]);
+                            cursor_byte = 0;
                         }
                         KeyEvent {
                             code: KeyCode::Down,
@@ -3302,12 +3971,12 @@ impl InputEditor {
                             code: KeyCode::Char('n'),
                             modifiers: KeyModifiers::CONTROL,
                             ..
-                        } if history_index < self.history.len() => {
+                        } if history_index < navigation_history.len() => {
                             history_index += 1;
-                            if history_index == self.history.len() {
+                            if history_index == navigation_history.len() {
                                 buffer.clone_from(&draft);
                             } else {
-                                buffer.clone_from(&self.history[history_index]);
+                                buffer.clone_from(&navigation_history[history_index]);
                             }
                             cursor_byte = buffer.len();
                         }
@@ -3375,10 +4044,22 @@ impl InputEditor {
                 _ => {}
             }
             if open_external_editor {
-                rendered.erase(&mut out)?;
+                let fullscreen_ui = self
+                    .ui
+                    .as_ref()
+                    .filter(|ui| ui.fullscreen_active())
+                    .cloned();
+                if let Some(ui) = &fullscreen_ui {
+                    ui.set_tui_mode(TuiMode::Default)?;
+                } else {
+                    rendered.erase(&mut out)?;
+                }
                 drop(raw_guard.take());
                 let edited = edit_prompt_externally(&buffer);
                 raw_guard = Some(RawModeGuard::enter()?);
+                if let Some(ui) = &fullscreen_ui {
+                    ui.set_tui_mode(TuiMode::Fullscreen)?;
+                }
                 rendered = RenderedInput::default();
                 match edited {
                     Ok(text) => {
@@ -3413,25 +4094,46 @@ impl InputEditor {
                 }
                 dismissed_suggestions_for = None;
                 dismissed_file_suggestions_for = None;
-                let updated_suggestions = command_matches(&buffer, commands);
-                selected_suggestion = previous_selected_name
-                    .as_deref()
-                    .and_then(|name| {
-                        updated_suggestions
-                            .iter()
-                            .position(|suggestion| suggestion.name == name)
-                    })
-                    .unwrap_or(0);
-                let updated_file_suggestions = file_token_at_cursor(&buffer, cursor_byte)
-                    .map_or_else(Vec::new, |token| file_matches(&token, files));
-                selected_file_suggestion = previous_selected_file
-                    .as_deref()
-                    .and_then(|path| {
-                        updated_file_suggestions
-                            .iter()
-                            .position(|suggestion| suggestion.display_path == path)
-                    })
-                    .unwrap_or(0);
+                dismissed_argument_suggestions_for = None;
+                if buffer != previous_buffer {
+                    // Filtering establishes a new ranked list. Focus its best
+                    // match; preserve an explicit keyboard selection only
+                    // while the query itself is unchanged.
+                    selected_suggestion = 0;
+                    selected_file_suggestion = 0;
+                    selected_argument_suggestion = 0;
+                } else {
+                    let updated_suggestions = command_matches(&buffer, commands);
+                    selected_suggestion = previous_selected_name
+                        .as_deref()
+                        .and_then(|name| {
+                            updated_suggestions
+                                .iter()
+                                .position(|suggestion| suggestion.name == name)
+                        })
+                        .unwrap_or(0);
+                    let updated_file_suggestions = file_token_at_cursor(&buffer, cursor_byte)
+                        .map_or_else(Vec::new, |token| file_matches(&token, files));
+                    selected_file_suggestion = previous_selected_file
+                        .as_deref()
+                        .and_then(|path| {
+                            updated_file_suggestions
+                                .iter()
+                                .position(|suggestion| suggestion.display_path == path)
+                        })
+                        .unwrap_or(0);
+                    let updated_argument_suggestions =
+                        argument_matches(&buffer, cursor_byte, commands)
+                            .map_or_else(Vec::new, |(_, matches)| matches);
+                    selected_argument_suggestion = previous_selected_argument
+                        .as_deref()
+                        .and_then(|value| {
+                            updated_argument_suggestions
+                                .iter()
+                                .position(|suggestion| suggestion.as_str() == value)
+                        })
+                        .unwrap_or(0);
+                }
             }
         }
     }
@@ -3459,10 +4161,50 @@ fn bounded_history(entries: impl IntoIterator<Item = String>, limit: usize) -> V
     history
 }
 
+#[derive(Debug, Clone)]
+struct ComposerInputRow {
+    local_row: u16,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FullscreenComposerHitMap {
+    top_row: u16,
+    rows: Vec<ComposerInputRow>,
+}
+
+impl FullscreenComposerHitMap {
+    fn cursor_at(&self, screen_row: u16, screen_column: u16, buffer: &str) -> Option<usize> {
+        let local_row = screen_row.checked_sub(self.top_row)?;
+        let row = self.rows.iter().find(|row| row.local_row == local_row)?;
+        let visible = buffer.get(row.byte_start..row.byte_end)?;
+        let target = usize::from(screen_column.saturating_sub(2));
+        let mut width = 0usize;
+        let mut bytes = 0usize;
+        for grapheme in visible.graphemes(true) {
+            let next_width = width.saturating_add(UnicodeWidthStr::width(grapheme));
+            if target < next_width {
+                let choose_after = target.saturating_sub(width).saturating_mul(2)
+                    >= next_width.saturating_sub(width);
+                return Some(
+                    row.byte_start
+                        .saturating_add(bytes)
+                        .saturating_add(if choose_after { grapheme.len() } else { 0 }),
+                );
+            }
+            width = next_width;
+            bytes = bytes.saturating_add(grapheme.len());
+        }
+        Some(row.byte_end)
+    }
+}
+
 #[derive(Default)]
 struct RenderedInput {
     rows: u16,
     cursor_row: u16,
+    input_rows: Vec<ComposerInputRow>,
 }
 
 struct InputRenderState<'a> {
@@ -3474,6 +4216,8 @@ struct InputRenderState<'a> {
     selected_suggestion: usize,
     file_suggestions: &'a [&'a FileSuggestion],
     selected_file_suggestion: usize,
+    argument_suggestions: &'a [&'a String],
+    selected_argument_suggestion: usize,
     argument_hint: Option<&'a str>,
     todos: Option<&'a [String]>,
     status_line: Option<&'a str>,
@@ -3554,6 +4298,7 @@ impl RenderedInput {
     }
 
     fn draw(&mut self, out: &mut impl Write, state: InputRenderState<'_>) -> Result<()> {
+        self.input_rows.clear();
         let InputRenderState {
             buffer,
             cursor_byte,
@@ -3563,6 +4308,8 @@ impl RenderedInput {
             selected_suggestion,
             file_suggestions,
             selected_file_suggestion,
+            argument_suggestions,
+            selected_argument_suggestion,
             argument_hint,
             todos,
             status_line,
@@ -3601,6 +4348,8 @@ impl RenderedInput {
         let shell_mode = buffer.starts_with('!');
         let suggestion_limit = if !file_suggestions.is_empty() {
             file_suggestions.len().min(6)
+        } else if !argument_suggestions.is_empty() {
+            argument_suggestions.len().min(6)
         } else if !suggestions.is_empty() {
             suggestions.len().min(6)
         } else if let Some(todos) = todos {
@@ -3662,6 +4411,19 @@ impl RenderedInput {
             } else {
                 (visible_line(line, available), 0)
             };
+            let visible_bytes = if index == active_line {
+                visible.len()
+            } else {
+                visible_prefix_bytes(line, available)
+            };
+            self.input_rows.push(ComposerInputRow {
+                local_row: u16::try_from(index.saturating_sub(visible_start).saturating_add(1))
+                    .unwrap_or(u16::MAX),
+                byte_start: line_offsets[index].saturating_add(local_start),
+                byte_end: line_offsets[index]
+                    .saturating_add(local_start)
+                    .saturating_add(visible_bytes),
+            });
             queue_text_with_selection(
                 out,
                 &visible,
@@ -3686,7 +4448,11 @@ impl RenderedInput {
                 format!("  {hint} · line {}/{}", active_line + 1, lines.len())
             }
         } else if !hint.is_empty() {
-            format!("  {hint} · Shift+Tab mode · Shift+Enter/Ctrl+J newline")
+            if let Some(status_line) = status_line {
+                format!("  {hint} · {}", plain_status_line(status_line))
+            } else {
+                format!("  {hint} · Shift+Tab mode · Shift+Enter/Ctrl+J newline")
+            }
         } else if let Some(status_line) = status_line {
             format!("  {}", plain_status_line(status_line))
         } else if shell_mode {
@@ -3726,28 +4492,56 @@ impl RenderedInput {
                 }
             }
             end.saturating_sub(start)
-        } else if suggestions.is_empty() && todos.is_some() {
-            let todos = todos.expect("todo panel was checked");
-            if todos.is_empty() {
-                queue!(out, Print("  No todo items"), Print(RAW_LINE_END))?;
-                1usize
-            } else {
-                for todo in todos.iter().take(suggestion_limit) {
-                    queue!(
-                        out,
-                        Print(visible_line(todo, width.saturating_sub(1))),
-                        Print(RAW_LINE_END)
-                    )?;
+        } else if !argument_suggestions.is_empty() {
+            let count = suggestion_limit.min(height.saturating_sub(3).max(1));
+            let start = selected_argument_suggestion
+                .saturating_sub(count / 2)
+                .min(argument_suggestions.len().saturating_sub(count));
+            let end = (start + count).min(argument_suggestions.len());
+            for (index, argument) in argument_suggestions
+                .iter()
+                .enumerate()
+                .take(end)
+                .skip(start)
+            {
+                let selected = index == selected_argument_suggestion;
+                if color && selected {
+                    queue!(out, SetForegroundColor(accent))?;
                 }
-                todos.len().min(suggestion_limit)
+                queue!(
+                    out,
+                    Print(if selected { "› " } else { "  " }),
+                    Print(visible_line(argument, width.saturating_sub(3))),
+                    Print(RAW_LINE_END)
+                )?;
+                if color && selected {
+                    queue!(out, ResetColor)?;
+                }
             }
+            end.saturating_sub(start)
         } else if suggestions.is_empty() {
-            queue!(
-                out,
-                Print(visible_line(&footer, width.saturating_sub(1))),
-                Print(RAW_LINE_END)
-            )?;
-            0usize
+            if let Some(todos) = todos {
+                if todos.is_empty() {
+                    queue!(out, Print("  No todo items"), Print(RAW_LINE_END))?;
+                    1usize
+                } else {
+                    for todo in todos.iter().take(suggestion_limit) {
+                        queue!(
+                            out,
+                            Print(visible_line(todo, width.saturating_sub(1))),
+                            Print(RAW_LINE_END)
+                        )?;
+                    }
+                    todos.len().min(suggestion_limit)
+                }
+            } else {
+                queue!(
+                    out,
+                    Print(visible_line(&footer, width.saturating_sub(1))),
+                    Print(RAW_LINE_END)
+                )?;
+                0usize
+            }
         } else {
             let count = suggestion_limit.min(height.saturating_sub(3).max(1));
             let start = selected_suggestion
@@ -3919,12 +4713,16 @@ impl RenderedPicker {
             .map(|(width, _)| usize::from(width).max(20))
             .unwrap_or(80);
         let color = std::env::var_os("NO_COLOR").is_none();
+        let accent = if text.preview_theme {
+            picker_theme_accent(&options[state.focused].value)
+        } else {
+            Some(Color::Cyan)
+        };
         if color {
-            queue!(
-                out,
-                SetForegroundColor(Color::Cyan),
-                SetAttribute(Attribute::Bold)
-            )?;
+            if let Some(accent) = accent {
+                queue!(out, SetForegroundColor(accent))?;
+            }
+            queue!(out, SetAttribute(Attribute::Bold))?;
         }
         queue!(out, Print("  "), Print(text.title))?;
         if color {
@@ -3960,7 +4758,9 @@ impl RenderedPicker {
                 " "
             };
             if color && focused {
-                queue!(out, SetForegroundColor(Color::Cyan))?;
+                if let Some(accent) = accent {
+                    queue!(out, SetForegroundColor(accent))?;
+                }
             }
             let selected = if option.value == current { " ✓" } else { "" };
             let prefix = format!(
@@ -4002,6 +4802,36 @@ impl RenderedPicker {
                 queue!(out, ResetColor)?;
             }
         }
+        let preview_rows = if text.preview_theme {
+            queue!(
+                out,
+                Print(RAW_LINE_END),
+                Print("  Preview · demo.rs"),
+                Print(RAW_LINE_END)
+            )?;
+            if color && options[state.focused].value != "no-color" {
+                queue!(out, SetForegroundColor(Color::Red))?;
+            }
+            queue!(
+                out,
+                Print("  - let message = \"before\";"),
+                Print(RAW_LINE_END)
+            )?;
+            if color && options[state.focused].value != "no-color" {
+                queue!(out, SetForegroundColor(Color::Green))?;
+            }
+            queue!(
+                out,
+                Print("  + let message = \"after\";"),
+                Print(RAW_LINE_END)
+            )?;
+            if color {
+                queue!(out, ResetColor)?;
+            }
+            4usize
+        } else {
+            0usize
+        };
         queue!(out, Print(RAW_LINE_END))?;
         if color {
             queue!(out, SetForegroundColor(Color::DarkGrey))?;
@@ -4019,7 +4849,8 @@ impl RenderedPicker {
         }
 
         let hidden_row = usize::from(hidden > 0);
-        self.rows = u16::try_from(5 + state.visible_count + hidden_row).unwrap_or(u16::MAX);
+        self.rows =
+            u16::try_from(5 + state.visible_count + hidden_row + preview_rows).unwrap_or(u16::MAX);
         self.cursor_row =
             u16::try_from(3 + state.focused.saturating_sub(state.visible_from)).unwrap_or(u16::MAX);
         queue!(
@@ -4031,9 +4862,50 @@ impl RenderedPicker {
     }
 }
 
+fn picker_theme_accent(theme: &str) -> Option<Color> {
+    match theme {
+        "light" => Some(Color::Blue),
+        "daltonized" => Some(Color::Magenta),
+        "no-color" => None,
+        _ => Some(Color::Cyan),
+    }
+}
+
 struct RawModeGuard {
     bracketed_paste: bool,
     keyboard_enhancement: bool,
+}
+
+#[cfg(unix)]
+struct SuspendSignalGuard {
+    requested: Arc<AtomicBool>,
+    registration: signal_hook::SigId,
+}
+
+#[cfg(unix)]
+impl SuspendSignalGuard {
+    fn register() -> Result<Self> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let registration = signal_hook::flag::register(
+            signal_hook::consts::signal::SIGTSTP,
+            Arc::clone(&requested),
+        )?;
+        Ok(Self {
+            requested,
+            registration,
+        })
+    }
+
+    fn take(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignalGuard {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.registration);
+    }
 }
 
 struct AlternateScreenGuard;
@@ -4231,6 +5103,26 @@ fn visible_line(value: &str, limit: usize) -> String {
     }
     output.push('…');
     output
+}
+
+fn visible_prefix_bytes(value: &str, limit: usize) -> usize {
+    if UnicodeWidthStr::width(value) <= limit {
+        return value.len();
+    }
+    if limit == 0 {
+        return 0;
+    }
+    let mut bytes = 0usize;
+    let mut width = 0usize;
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width.saturating_add(grapheme_width).saturating_add(1) > limit {
+            break;
+        }
+        bytes = bytes.saturating_add(grapheme.len());
+        width = width.saturating_add(grapheme_width);
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -4492,6 +5384,27 @@ fn mode_label(mode: PermissionMode) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn permission_preview_explains_common_mutating_actions() {
+        let edit = permission_action_preview(
+            "Edit",
+            &serde_json::json!({
+                "file_path":"src/main.rs",
+                "old_string":"old\nvalue",
+                "new_string":"new\nvalue"
+            }),
+        );
+        assert_eq!(
+            edit,
+            vec!["  Edit src/main.rs", "    - old value", "    + new value"]
+        );
+        let bash = permission_action_preview(
+            "Bash",
+            &serde_json::json!({"command":"cargo test\ncargo clippy"}),
+        );
+        assert_eq!(bash, vec!["  $ cargo test cargo clippy"]);
+    }
+
     struct TestScreen {
         cells: Vec<Vec<char>>,
         row: usize,
@@ -4681,6 +5594,27 @@ mod tests {
         assert_eq!(visible_around_cursor("a界b", 2, 4), ("a界b".into(), 3));
     }
 
+    #[test]
+    fn transcript_search_is_case_insensitive_and_tracks_each_occurrence() {
+        let lines = ["Alpha beta ALPHA".to_owned(), "unrelated".to_owned()];
+        let refs = lines.iter().collect::<Vec<_>>();
+        assert_eq!(
+            transcript_matches(&refs, "alpha"),
+            [
+                TranscriptMatch {
+                    line: 0,
+                    start: 0,
+                    end: 5,
+                },
+                TranscriptMatch {
+                    line: 0,
+                    start: 11,
+                    end: 16,
+                },
+            ]
+        );
+    }
+
     fn test_commands() -> Vec<SlashCommandSuggestion> {
         vec![
             SlashCommandSuggestion {
@@ -4689,6 +5623,7 @@ mod tests {
                 description: "Clear conversation".into(),
                 argument_hint: None,
                 execute_on_enter: true,
+                argument_candidates: Vec::new(),
             },
             SlashCommandSuggestion {
                 name: "exit".into(),
@@ -4696,6 +5631,7 @@ mod tests {
                 description: "Exit session".into(),
                 argument_hint: None,
                 execute_on_enter: true,
+                argument_candidates: Vec::new(),
             },
             SlashCommandSuggestion {
                 name: "model".into(),
@@ -4703,6 +5639,7 @@ mod tests {
                 description: "Set model".into(),
                 argument_hint: Some("[model]".into()),
                 execute_on_enter: true,
+                argument_candidates: vec!["opus".into(), "sonnet".into()],
             },
         ]
     }
@@ -4723,6 +5660,16 @@ mod tests {
         assert!(command_matches("/model ", &commands).is_empty());
         assert!(command_matches("/model custom", &commands).is_empty());
         assert_eq!(command_argument_hint("/model ", &commands), Some("[model]"));
+        let (token, candidates) = argument_matches("/model so", "/model so".len(), &commands)
+            .expect("model arguments complete");
+        assert_eq!(token.query, "so");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.as_str())
+                .collect::<Vec<_>>(),
+            ["sonnet"]
+        );
     }
 
     #[test]
@@ -4779,6 +5726,27 @@ mod tests {
         let matches = file_matches(&token, &files);
         assert_eq!(matches.len(), MAX_FILE_SUGGESTIONS);
         assert_eq!(matches.last().unwrap().display_path, "src/file-0099.rs");
+
+        let fuzzy_files = [
+            FileSuggestion {
+                display_path: "src/terminal_renderer.rs".to_owned(),
+                is_dir: false,
+            },
+            FileSuggestion {
+                display_path: "docs/other.md".to_owned(),
+                is_dir: false,
+            },
+        ];
+        let fuzzy_token = FileToken {
+            start: 0,
+            end: "@tmrnd".len(),
+            query: "tmrnd".to_owned(),
+            quoted: false,
+        };
+        assert_eq!(
+            file_matches(&fuzzy_token, &fuzzy_files)[0].display_path,
+            "src/terminal_renderer.rs"
+        );
 
         let unicode = [
             FileSuggestion {
@@ -4856,7 +5824,7 @@ mod tests {
             "first command".to_owned(),
             oversized,
         ];
-        let mut search = HistorySearch::new(&history, "draft".to_owned(), 5);
+        let mut search = HistorySearch::new(&history, HistoryScope::Project, "draft".to_owned(), 5);
         search.query = "command".to_owned();
         search.refresh(&history);
         assert_eq!(search.matches, ["first command", "second command"]);
@@ -4864,6 +5832,33 @@ mod tests {
         search.refresh(&history);
         assert!(search.matches.is_empty());
         assert_eq!(search.current(), "draft");
+    }
+
+    #[test]
+    fn fullscreen_composer_click_maps_rows_and_wide_graphemes_to_utf8_boundaries() {
+        let buffer = "a你b\nsecond";
+        let map = FullscreenComposerHitMap {
+            top_row: 20,
+            rows: vec![
+                ComposerInputRow {
+                    local_row: 1,
+                    byte_start: 0,
+                    byte_end: "a你b".len(),
+                },
+                ComposerInputRow {
+                    local_row: 2,
+                    byte_start: "a你b\n".len(),
+                    byte_end: buffer.len(),
+                },
+            ],
+        };
+        assert_eq!(map.cursor_at(21, 0, buffer), Some(0));
+        assert_eq!(map.cursor_at(21, 2, buffer), Some(0));
+        assert_eq!(map.cursor_at(21, 3, buffer), Some(1));
+        assert_eq!(map.cursor_at(21, 4, buffer), Some("a你".len()));
+        assert_eq!(map.cursor_at(21, 40, buffer), Some("a你b".len()));
+        assert_eq!(map.cursor_at(22, 2, buffer), Some("a你b\n".len()));
+        assert_eq!(map.cursor_at(20, 2, buffer), None);
     }
 
     #[test]
@@ -4893,6 +5888,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &suggestions,
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
@@ -4935,6 +5932,25 @@ mod tests {
     }
 
     #[test]
+    fn complete_assistant_event_reconciles_a_truncated_fullscreen_stream() {
+        let mut state = OutputState::default();
+        let complete = format!("{}TAIL", "x".repeat(MAX_FULLSCREEN_STREAM_BYTES + 4096));
+        append_bounded_fullscreen_stream(&mut state, &complete);
+        assert_eq!(state.fullscreen_stream.len(), MAX_FULLSCREEN_STREAM_BYTES);
+        apply_fullscreen_event(
+            &mut state,
+            &QueryEvent::AssistantMessage {
+                content: vec![serde_json::json!({"type":"text", "text":complete})],
+            },
+        );
+        assert!(state.fullscreen_stream.is_empty());
+        assert!(state.fullscreen.streaming_line().is_none());
+        assert!(state.fullscreen.transcript_bytes() > MAX_FULLSCREEN_STREAM_BYTES);
+        let frame = state.fullscreen.render_ansi(FrameSpec::new("session", &[]));
+        assert!(frame.bytes.contains("TAIL"));
+    }
+
+    #[test]
     fn raw_mode_frames_use_carriage_return_line_feeds() {
         fn assert_no_bare_line_feeds(output: &[u8]) {
             for (index, byte) in output.iter().enumerate() {
@@ -4962,6 +5978,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &[],
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
@@ -4989,6 +6007,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &[],
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
@@ -5025,6 +6045,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &[],
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
@@ -5054,6 +6076,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &[],
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
@@ -5076,6 +6100,8 @@ mod tests {
                     selected_suggestion: 0,
                     file_suggestions: &[],
                     selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
                     argument_hint: None,
                     todos: None,
                     status_line: None,
