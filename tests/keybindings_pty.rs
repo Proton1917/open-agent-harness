@@ -200,14 +200,18 @@ fn keybindings_path(home: &Path) -> PathBuf {
 }
 
 fn write_keybindings_atomic(home: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
     let directory = home.join(".open-agent-harness");
     fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let destination = keybindings_path(home);
     let temporary = directory.join(format!(
         ".keybindings-{}.tmp",
         uuid::Uuid::new_v4().simple()
     ));
     fs::write(&temporary, contents).unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
     fs::rename(&temporary, &destination).unwrap();
 }
 
