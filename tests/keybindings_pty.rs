@@ -365,7 +365,7 @@ fn take_through_needle(
         .windows(needle.len())
         .position(|window| window == needle)?;
     let end = position + needle.len();
-    *pending_output = output.split_off(end);
+    pending_output.extend_from_slice(&output[end..]);
     Some(String::from_utf8_lossy(output).into_owned())
 }
 
