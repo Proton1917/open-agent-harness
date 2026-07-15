@@ -69,14 +69,76 @@ pub struct RequestParts<'a> {
     pub include_stream_usage: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Option<Self>> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "default" | "none" => Ok(None),
+            "low" => Ok(Some(Self::Low)),
+            "medium" => Ok(Some(Self::Medium)),
+            "high" => Ok(Some(Self::High)),
+            "max" => Ok(Some(Self::Max)),
+            _ => bail!("reasoning effort must be auto, low, medium, high, or max"),
+        }
+    }
+}
+
 pub fn encode_request(format: ApiFormat, request: RequestParts<'_>) -> Result<Value> {
+    encode_request_with_effort(format, request, None)
+}
+
+pub fn encode_request_with_effort(
+    format: ApiFormat,
+    request: RequestParts<'_>,
+    effort: Option<ReasoningEffort>,
+) -> Result<Value> {
     validate_request_user_messages(request.messages)?;
-    match format {
+    let mut body = match format {
         ApiFormat::Messages => encode_messages_request(request),
         ApiFormat::ChatCompletions => encode_chat_request(request),
         ApiFormat::Responses => encode_responses_request(request),
         ApiFormat::Auto => bail!("API format 必须在编码请求前完成解析"),
+    }?;
+    if let Some(effort) = effort {
+        let object = body
+            .as_object_mut()
+            .context("encoded request must be an object")?;
+        match format {
+            ApiFormat::Messages => {
+                object.insert(
+                    "output_config".to_owned(),
+                    json!({"effort":effort.as_str()}),
+                );
+            }
+            ApiFormat::ChatCompletions => {
+                object.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(effort.as_str().to_owned()),
+                );
+            }
+            ApiFormat::Responses => {
+                object.insert("reasoning".to_owned(), json!({"effort":effort.as_str()}));
+            }
+            ApiFormat::Auto => unreachable!("auto format was rejected above"),
+        }
     }
+    Ok(body)
 }
 
 /// Validates rich content supplied directly by a user or SDK client. Internal
@@ -3334,6 +3396,43 @@ mod tests {
         assert_eq!(body["max_tokens"], 10);
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn explicit_reasoning_effort_maps_to_each_wire_protocol() {
+        let encode = |format, effort| {
+            encode_request_with_effort(
+                format,
+                RequestParts {
+                    model: "model",
+                    max_tokens: 10,
+                    system: "system",
+                    messages: &[],
+                    tools: &[],
+                    stream: false,
+                    chat_tokens_field: ChatTokensField::MaxCompletionTokens,
+                    include_stream_usage: true,
+                },
+                effort,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            encode(ApiFormat::Messages, Some(ReasoningEffort::High))["output_config"]["effort"],
+            "high"
+        );
+        assert_eq!(
+            encode(ApiFormat::ChatCompletions, Some(ReasoningEffort::Medium))["reasoning_effort"],
+            "medium"
+        );
+        assert_eq!(
+            encode(ApiFormat::Responses, Some(ReasoningEffort::Max))["reasoning"]["effort"],
+            "max"
+        );
+        let automatic = encode(ApiFormat::Responses, None);
+        assert!(automatic.get("reasoning").is_none());
+        assert_eq!(ReasoningEffort::parse("auto").unwrap(), None);
+        assert!(ReasoningEffort::parse("extreme").is_err());
     }
 
     #[test]

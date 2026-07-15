@@ -1,7 +1,10 @@
 use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -35,21 +38,25 @@ use open_agent_harness::{
     interactions::UserInteractionHandler,
     keybindings::KeybindingManager,
     lsp::configure_lsp,
-    mcp::{McpControl, McpHookInvoker, connect_mcp},
+    mcp::{McpControl, McpHookInvoker, McpServerStatusKind, connect_mcp},
     permissions::{PermissionManager, PermissionMode},
-    plan::plan_tools,
+    plan::{clear_latest_plan, load_latest_plan, plan_tools},
     plugin_manager::run_plugin_command,
     plugins::PluginCatalog,
     prompt::{default_system_prompt, init_prompt},
-    query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
-    session::{SessionStateRoot, SessionStore},
+    protocol::ReasoningEffort,
+    query::{
+        QueryEngine, QueryEvent, QueryEventSink, QueryOptions, SideQuestionAnswer, TextDeltaSink,
+    },
+    session::{SessionStateRoot, SessionStore, SessionSummary},
     statusline::{StatusLineOutcome, StatusLineRunner},
     structured_output::StructuredOutputTool,
     terminal::{
-        ConversationUi, FileSuggestion, InputEditor, InputReadActions, InputReadContext,
-        ModelPickerOutcome, SlashCommandSuggestion, TaskUiUpdate, TuiMode, configure_ui_dialog,
-        manage_permissions_dialog, open_file_in_external_editor, select_model,
-        select_rewind_checkpoint, select_theme, show_tasks_dialog, view_transcript,
+        AsyncInputNotice, ConversationUi, FileSuggestion, InputEditor, InputReadActions,
+        InputReadContext, ModelPickerOutcome, SlashCommandSuggestion, TaskUiUpdate, TuiMode,
+        configure_ui_dialog, manage_permissions_dialog, open_file_in_external_editor, select_model,
+        select_option_dialog, select_rewind_checkpoint, select_searchable_option, select_theme,
+        show_tasks_dialog, view_transcript,
     },
     terminal_dialogs::{
         PermissionDialogData, PermissionDialogItem, PermissionManagerAction,
@@ -61,13 +68,13 @@ use open_agent_harness::{
         MemoryTool, TaskUiItem, TaskUiItemKind, TaskUiStatus, TeamTool, ToolContext, ToolRegistry,
         ToolService,
     },
-    types::{Message, Role},
+    types::{Message, Role, SessionUsage},
     ui_settings::{
         EditorMode, ThemePreset, TuiMode as PersistedTuiMode, UiSettingSource, UiSettings,
         UiSettingsStore,
     },
     web_tools::configure_web,
-    worktree::configure_worktree,
+    worktree::{RepositoryWorktree, configure_worktree, same_repository_worktrees},
 };
 
 fn main() {
@@ -284,20 +291,23 @@ async fn run(
     // `Settings::load` has already removed automatic user/project settings in bare mode;
     // an explicit `--settings` plugin declaration remains explicit user input.
     let plugins = PluginCatalog::discover(&settings, &cwd, false)?;
-    let plugin_count = plugins.plugins().len();
+    let mut plugin_count = plugins.plugins().len();
+    let plugin_mcp_definitions = plugins.mcp_servers().clone();
+    let plugin_lsp_definitions = plugins.lsp_servers().clone();
     let settings_output_style = settings.output_style()?.map(ToOwned::to_owned);
     let requested_output_style = (!cli.safe_mode)
         .then_some(
             cli.output_style
                 .as_deref()
-                .or(settings_output_style.as_deref()),
+                .or(settings_output_style.as_deref())
+                .or(ui_settings.output_style.as_deref()),
         )
         .flatten();
     let selected_output_style = plugins
         .select_output_style(requested_output_style)?
         .cloned();
     let output_style = requested_output_style.unwrap_or("default").to_owned();
-    let available_output_styles = plugins.available_output_style_names();
+    let mut available_output_styles = plugins.available_output_style_names();
     plugins.apply_runtime_contributions(&mut settings)?;
     tool_context.configure_secret_env_scrubber(&settings)?;
     let (plugin_skills, plugin_commands, plugin_hooks, plugin_monitors) = plugins.into_parts();
@@ -332,7 +342,7 @@ async fn run(
         tool_context.set_user_interaction_handler(Some(interaction_handler));
     }
     let agents = configure_agents(&settings)?;
-    let custom_agent_names = agents
+    let mut custom_agent_names = agents
         .custom_agents
         .iter()
         .map(|(name, definition)| json!({"name":name, "description":definition.description}))
@@ -448,10 +458,10 @@ async fn run(
         store.id,
         active_cwd.clone(),
     );
-    let hooks = match HookRunner::from_settings_and_plugins(&settings, &plugin_hooks) {
+    let mut hooks = match HookRunner::from_settings_and_plugins(&settings, &plugin_hooks) {
         Ok(hooks) => Arc::new(
             hooks
-                .with_mcp_invoker(mcp_hook_invoker)
+                .with_mcp_invoker(mcp_hook_invoker.clone())
                 .with_observer(hook_events.as_ref().map(HookEventEmitter::observer)),
         ),
         Err(error) => {
@@ -519,21 +529,24 @@ async fn run(
         ))
     }
     .await;
-    let (command_context, ui, enhanced_terminal, text_delta_sink, client) = match startup_outcome {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            cleanup_before_engine(
-                &hooks,
-                &registry,
-                store.id,
-                &tool_context.cwd(),
-                "startup_failed",
-                cli.debug,
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    let (mut command_context, ui, enhanced_terminal, text_delta_sink, client) =
+        match startup_outcome {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_before_engine(
+                    &hooks,
+                    &registry,
+                    store.id,
+                    &tool_context.cwd(),
+                    "startup_failed",
+                    cli.debug,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+    let initial_prompt_color = store.color()?;
+    ui.set_prompt_color(initial_prompt_color.as_deref())?;
     let memory_extractor = AutoMemoryExtractor::new(memory.clone(), client.clone(), cli.debug);
     let mut engine = QueryEngine::new(
         client,
@@ -566,6 +579,13 @@ async fn run(
     };
     let engine_setup = (|| -> Result<()> {
         engine.install_custom_agents(agents.custom_agents)?;
+        let effort = ui_settings
+            .reasoning_effort
+            .as_deref()
+            .map(ReasoningEffort::parse)
+            .transpose()?
+            .flatten();
+        engine.set_reasoning_effort(effort);
         if let Some(max_turns) = cli.max_turns {
             engine.set_max_tool_rounds(max_turns)?;
         }
@@ -726,6 +746,7 @@ async fn run(
         }
         let mut initial = cli.prompt.clone();
         let mut editor = InputEditor::default();
+        editor.set_prompt_color(initial_prompt_color.as_deref())?;
         if enhanced_terminal {
             editor.attach_ui(ui.clone());
         }
@@ -778,9 +799,14 @@ async fn run(
         };
         editor.seed_history(conversation_prompt_history(&engine.messages));
         let task_monitor = TaskUiMonitor::start(command_context.clone());
+        let (side_question_tx, side_question_rx) =
+            std::sync::mpsc::channel::<std::result::Result<SideQuestionAnswer, String>>();
+        let side_question_active = Arc::new(AtomicBool::new(false));
+        let side_question_usage = Arc::new(Mutex::new(SessionUsage::default()));
         let mut mcp_prompt_commands = Vec::new();
         let mut mcp_prompts_refreshed_at: Option<Instant> = None;
         loop {
+            merge_background_usage(&mut engine.usage, &side_question_usage);
             let mut clipboard_images = Vec::new();
             let input = match initial.take() {
                 Some(prompt) => prompt,
@@ -792,12 +818,10 @@ async fn run(
                         prompt
                     }
                     None if enhanced_terminal => {
-                        ui.set_fullscreen_header(format!(
-                            "open-agent-harness · {} · {:?} · {}",
-                            engine.model,
-                            engine.permission_mode(),
-                            active_store.id
-                        ))?;
+                        ui.set_fullscreen_header(fullscreen_session_header(
+                            &engine,
+                            &active_store,
+                        )?)?;
                         if mcp_control.is_some()
                             && mcp_prompts_refreshed_at.is_none_or(|refreshed| {
                                 refreshed.elapsed() >= Duration::from_secs(30)
@@ -828,11 +852,53 @@ async fn run(
                         );
                         let file_suggestions = workspace_file_suggestions(&command_context);
                         let task_snapshot = task_monitor.snapshot();
+                        let (context_used, auto_compact_at, context_window) =
+                            engine.context_status();
+                        let context_used_percentage = (context_window > 0).then(|| {
+                            context_used.saturating_mul(100).div_ceil(context_window).min(100)
+                        });
+                        let session_name = active_store.title()?;
+                        let output_style = ui_settings.output_style.clone();
+                        let public_added_dirs = command_context
+                            .trusted_roots()
+                            .into_iter()
+                            .skip(1)
+                            .map(|root| format!("workspace:{}", opaque_workspace_key(&root)))
+                            .collect::<Vec<_>>();
                         let public_status = json!({
-                            "model": engine.model,
+                            "model": {
+                                "id": engine.model,
+                                "display_name": engine.model,
+                            },
+                            "modelId": engine.model,
+                            "reasoningEffort": engine.reasoning_effort().map(ReasoningEffort::as_str),
                             "permissionMode": permission_mode_name(engine.permission_mode()),
                             "sessionId": active_store.id,
                             "workspaceKey": opaque_workspace_key(&command_context.cwd()),
+                            "session_id": active_store.id,
+                            "session_name": session_name,
+                            "cwd": ".",
+                            "workspace": {
+                                "current_dir": ".",
+                                "project_dir": ".",
+                                "added_dirs": public_added_dirs,
+                            },
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "output_style": {"name": output_style},
+                            "context_window": {
+                                "total_input_tokens": engine.usage.input_tokens,
+                                "total_output_tokens": engine.usage.output_tokens,
+                                "context_window_size": context_window,
+                                "auto_compact_at": auto_compact_at,
+                                "current_usage": {
+                                    "input_tokens": engine.usage.input_tokens,
+                                    "output_tokens": engine.usage.output_tokens,
+                                    "cache_creation_input_tokens": engine.usage.cache_creation_input_tokens,
+                                    "cache_read_input_tokens": engine.usage.cache_read_input_tokens,
+                                },
+                                "used_percentage": context_used_percentage,
+                                "remaining_percentage": context_used_percentage.map(|used| 100usize.saturating_sub(used)),
+                            },
                         });
                         let status_line = if let Some(config) = &ui_settings.status_line {
                             match status_line_runner
@@ -849,10 +915,13 @@ async fn run(
                         } else {
                             None
                         };
+                        let public_status_shared = Arc::new(Mutex::new(public_status));
                         let mut scheduled_prompt = || command_context.take_scheduled_prompt();
                         let initial_mode = engine.permission_mode();
                         let mode_locked = engine.permission_mode_locked();
                         let transcript_snapshot = transcript_lines(&engine.messages);
+                        let rewind_message_snapshot = engine.messages.clone();
+                        let model_status = Arc::clone(&public_status_shared);
                         let mut model_picker = || {
                             let mut options = model_options.clone();
                             if !options.iter().any(|option| option.value == engine.model) {
@@ -865,33 +934,31 @@ async fn run(
                             let outcome = select_model(&options, &engine.model)?;
                             if let ModelPickerOutcome::Selected(model) = &outcome {
                                 engine.set_model(model.clone());
-                                ui.set_fullscreen_header(format!(
-                                    "open-agent-harness · {} · {:?} · {}",
-                                    engine.model,
-                                    engine.permission_mode(),
-                                    active_store.id
-                                ))?;
+                                let mut status = model_status
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                status["model"] = json!({
+                                    "id":model,
+                                    "display_name":model,
+                                });
+                                status["modelId"] = json!(model);
+                                ui.set_fullscreen_header(fullscreen_session_header(
+                                    &engine,
+                                    &active_store,
+                                )?)?;
                             }
                             Ok(outcome)
                         };
-                        let rewind_options = checkpoint_catalog(&active_file_histories)?
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, checkpoint)| ModelOption {
-                                value: checkpoint.id.to_string(),
-                                display_name: format!("Message boundary {}", index + 1),
-                                description: format!(
-                                    "{} messages · {} tracked files",
-                                    checkpoint.message_count, checkpoint.tracked_files
-                                ),
-                            })
-                            .collect::<Vec<_>>();
+                        let rewind_options = checkpoint_picker_options(
+                            checkpoint_catalog(&active_file_histories)?,
+                            &rewind_message_snapshot,
+                        );
                         let mut rewind_picker = || select_rewind_checkpoint(&rewind_options);
                         let mut transcript_viewer = || view_transcript(&transcript_snapshot);
                         let status_refresh_config = ui_settings.status_line.clone();
                         let status_refresh_runner = status_line_runner.clone();
                         let status_refresh_cwd = command_context.cwd();
-                        let status_refresh_input = public_status;
+                        let status_refresh_input = Arc::clone(&public_status_shared);
                         let (status_refresh_tx, status_refresh_rx) =
                             std::sync::mpsc::channel::<Result<Option<String>, String>>();
                         let mut status_refresh_pending = false;
@@ -922,7 +989,10 @@ async fn run(
                                     status_refresh_pending = true;
                                     let runner = status_refresh_runner.clone();
                                     let cwd = status_refresh_cwd.clone();
-                                    let mut input = status_refresh_input.clone();
+                                    let mut input = status_refresh_input
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clone();
                                     input["permissionMode"] =
                                         json!(permission_mode_name(mode));
                                     if !config.hide_vim_mode_indicator {
@@ -965,6 +1035,37 @@ async fn run(
                                 Some(current)
                             }
                         };
+                        let notice_usage = Arc::clone(&side_question_usage);
+                        let notice_active = Arc::clone(&side_question_active);
+                        let mut notice_refresh = || match side_question_rx.try_recv() {
+                            Ok(Ok(answer)) => {
+                                if let Some(usage) = &answer.usage {
+                                    notice_usage
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .add(usage);
+                                }
+                                notice_active.store(false, Ordering::Release);
+                                Some(AsyncInputNotice {
+                                    title: "BTW".to_owned(),
+                                    body: answer.text,
+                                    is_error: false,
+                                })
+                            }
+                            Ok(Err(error)) => {
+                                notice_active.store(false, Ordering::Release);
+                                Some(AsyncInputNotice {
+                                    title: "BTW".to_owned(),
+                                    body: error,
+                                    is_error: true,
+                                })
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                notice_active.store(false, Ordering::Release);
+                                None
+                            }
+                        };
                         let read = editor.read(
                                 initial_mode,
                                 mode_locked,
@@ -984,8 +1085,10 @@ async fn run(
                                     transcript_viewer: &mut transcript_viewer,
                                     status_line_refresh: &mut status_line_refresh,
                                     task_refresh: &mut task_refresh,
+                                    notice_refresh: &mut notice_refresh,
                                 },
                             )?;
+                        merge_background_usage(&mut engine.usage, &side_question_usage);
                         status_line_runner.cancel();
                         let Some(read) = read else {
                             break;
@@ -1004,16 +1107,26 @@ async fn run(
             if input.len() > MAX_USER_INPUT_BYTES {
                 bail!("prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
             }
-            if input.trim().is_empty() {
+            if input.trim().is_empty() && clipboard_images.is_empty() {
                 continue;
             }
             if let Some((history, context)) = &persistent_history {
-                if let Err(error) = history.append(context, input.clone()) {
-                    eprintln!("Input history was not persisted: {error:#}");
+                if !input.trim().is_empty() {
+                    if let Err(error) = history.append(context, input.clone()) {
+                        eprintln!("Input history was not persisted: {error:#}");
+                    }
                 }
             }
             if enhanced_terminal {
-                ui.record_user_input(input.trim())?;
+                if input.trim().is_empty() {
+                    ui.record_user_input(&format!(
+                        "[{} image attachment{}]",
+                        clipboard_images.len(),
+                        if clipboard_images.len() == 1 { "" } else { "s" }
+                    ))?;
+                } else {
+                    ui.record_user_input(input.trim())?;
+                }
             }
             let input = match resolve_mcp_prompt_input(
                 input,
@@ -1162,26 +1275,51 @@ async fn run(
             let input = match commands::handle(input.trim(), &mut engine) {
                 CommandOutcome::Exit => break,
                 CommandOutcome::Clear(name) => {
-                    match active_store.archive_and_clear_history() {
-                        Ok(archive_id) => {
+                    let old_session_id = active_store.id;
+                    let cleared = (|| -> Result<(SessionStore, Vec<FileHistory>)> {
+                        let next_store = active_store.start_new_after_clear()?;
+                        let next_histories = command_context
+                            .trusted_roots()
+                            .into_iter()
+                            .map(|root| {
+                                create_file_history(
+                                    &cli,
+                                    &root,
+                                    next_store.id,
+                                    session_state_root.as_ref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        clear_latest_plan(&command_context)?;
+                        Ok((next_store, next_histories))
+                    })();
+                    match cleared {
+                        Ok((next_store, next_histories)) => {
                             engine.clear();
+                            command_context.set_file_histories(next_histories.clone())?;
+                            install_session_state_recorders(&command_context, &next_store);
+                            active_store = next_store;
+                            active_file_histories = next_histories;
+                            editor.set_prompt_color(None)?;
+                            ui.set_prompt_color(None)?;
                             if enhanced_terminal {
                                 ui.replace_fullscreen_transcript(&transcript_lines(
                                     &engine.messages,
                                 ))?;
+                                ui.set_fullscreen_header(fullscreen_session_header(
+                                    &engine,
+                                    &active_store,
+                                )?)?;
                             }
-                            if let Some(archive_id) = archive_id {
-                                let label = if name.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" ({})", bounded_single_line(&name, 80))
-                                };
-                                println!(
-                                    "Conversation cleared{label}. Previous conversation preserved as resumable session {archive_id}."
-                                );
+                            let label = if name.is_empty() {
+                                String::new()
                             } else {
-                                println!("Conversation cleared.");
-                            }
+                                format!(" ({})", bounded_single_line(&name, 80))
+                            };
+                            println!(
+                                "Conversation cleared{label}. Previous conversation remains resumable as {old_session_id}; new session is {}.",
+                                active_store.id
+                            );
                         }
                         Err(error) => {
                             eprintln!("Clear failed; conversation unchanged: {error:#}");
@@ -1222,7 +1360,22 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::ShowStatus => {
-                    print_session_status(&engine, &session_metadata);
+                    print_session_status(
+                        &engine,
+                        &command_context,
+                        &active_store,
+                        plugin_count,
+                        &hooks,
+                        &memory,
+                    );
+                    continue;
+                }
+                CommandOutcome::ShowStats => {
+                    print_local_stats(
+                        &engine,
+                        &active_store,
+                        session_state_root.as_ref(),
+                    )?;
                     continue;
                 }
                 CommandOutcome::ToggleVim => {
@@ -1390,7 +1543,7 @@ async fn run(
                         .trusted_roots()
                         .into_iter()
                         .map(|root| {
-                            open_file_history(
+                            create_file_history(
                                 &cli,
                                 &root,
                                 active_store.id,
@@ -1450,15 +1603,135 @@ async fn run(
                     }
                     continue;
                 }
-                CommandOutcome::RenameSession(title) => {
-                    let title = title.trim();
-                    if title.is_empty() {
-                        eprintln!("Usage: /rename <title>");
+                CommandOutcome::Plan(argument) => {
+                    let argument = argument.trim();
+                    if engine.permission_mode() != PermissionMode::Plan {
+                        match engine.set_permission_mode(PermissionMode::Plan) {
+                            Ok(_) => println!("Enabled plan mode."),
+                            Err(error) => {
+                                eprintln!("Plan mode unchanged: {error:#}");
+                                continue;
+                            }
+                        }
+                        if !argument.is_empty() && argument != "open" {
+                            argument.to_owned()
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        let Some(plan) = (match load_latest_plan(&command_context) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                eprintln!("Unable to read the current plan: {error:#}");
+                                continue;
+                            }
+                        }) else {
+                            println!("Already in plan mode. No plan written yet.");
+                            continue;
+                        };
+                        if argument.split_whitespace().next() == Some("open") {
+                            match open_file_in_external_editor(&plan.path) {
+                                Ok(()) => println!("Opened plan in editor: {}", plan.path.display()),
+                                Err(error) => {
+                                    eprintln!("Failed to open plan in editor: {error:#}")
+                                }
+                            }
+                        } else {
+                            let display = format!(
+                                "## Current Plan\n\n`{}`\n\n{}",
+                                plan.path.display(),
+                                plan.content
+                            );
+                            if enhanced_terminal {
+                                ui.response(&display)?;
+                            } else {
+                                println!("Current Plan\n{}\n\n{}", plan.path.display(), plan.content);
+                            }
+                        }
                         continue;
                     }
-                    match active_store.rename(title) {
-                        Ok(()) => println!("Session renamed to {title:?}."),
+                }
+                CommandOutcome::SideQuestion(question) => {
+                    if question.trim().is_empty() {
+                        eprintln!("Usage: /btw <question>");
+                        continue;
+                    }
+                    if !enhanced_terminal {
+                        match engine.answer_side_question(&question).await {
+                            Ok(answer) => println!("/btw {}\n\n{answer}", question.trim()),
+                            Err(error) => eprintln!("Side question failed: {error:#}"),
+                        }
+                        continue;
+                    }
+                    if side_question_active
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        eprintln!("A /btw question is already running; wait for its answer.");
+                        continue;
+                    }
+                    let request = match engine.prepare_side_question(&question) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            side_question_active.store(false, Ordering::Release);
+                            eprintln!("Side question unchanged: {error:#}");
+                            continue;
+                        }
+                    };
+                    let sender = side_question_tx.clone();
+                    tokio::spawn(async move {
+                        let answer = request.answer().await.map_err(|error| format!("{error:#}"));
+                        let _ = sender.send(answer);
+                    });
+                    if enhanced_terminal {
+                        ui.response("**BTW** question started in the background; keep typing.")?;
+                    }
+                    continue;
+                }
+                CommandOutcome::RenameSession(title) => {
+                    let sessions = match session_state_root.as_ref() {
+                        Some(root) => SessionStore::list_in(active_store.cwd(), root, 100)?,
+                        None => SessionStore::list(active_store.cwd(), 100)?,
+                    };
+                    let title = if title.trim().is_empty() {
+                        unique_session_title(
+                            &suggested_session_title(&engine.messages),
+                            &sessions,
+                            Some(active_store.id),
+                        )
+                    } else {
+                        title.trim().to_owned()
+                    };
+                    match active_store.rename(&title) {
+                        Ok(()) => {
+                            if enhanced_terminal {
+                                ui.set_fullscreen_header(fullscreen_session_header(
+                                    &engine,
+                                    &active_store,
+                                )?)?;
+                            }
+                            println!("Session renamed to {title:?}.");
+                        }
                         Err(error) => eprintln!("Session title unchanged: {error:#}"),
+                    }
+                    continue;
+                }
+                CommandOutcome::TagSession(tag) => {
+                    let tag = tag.trim();
+                    if tag.is_empty() {
+                        println!(
+                            "Session tag: {}. Usage: /tag <tag-name>; run the same tag again to remove it.",
+                            active_store
+                                .tag()?
+                                .as_deref()
+                                .map_or("(none)".to_owned(), |tag| format!("#{tag}"))
+                        );
+                        continue;
+                    }
+                    match active_store.toggle_tag(tag) {
+                        Ok(Some(tag)) => println!("Tagged session with #{tag}."),
+                        Ok(None) => println!("Removed session tag."),
+                        Err(error) => eprintln!("Session tag unchanged: {error:#}"),
                     }
                     continue;
                 }
@@ -1473,7 +1746,16 @@ async fn run(
                         );
                         continue;
                     }
-                    let title = (!title.trim().is_empty()).then_some(title.trim());
+                    let sessions = match session_state_root.as_ref() {
+                        Some(root) => SessionStore::list_in(active_store.cwd(), root, 100)?,
+                        None => SessionStore::list(active_store.cwd(), 100)?,
+                    };
+                    let generated_title = title
+                        .trim()
+                        .is_empty()
+                        .then(|| unique_branch_title(&engine.messages, &sessions));
+                    let title = generated_title.as_deref().or_else(|| Some(title.trim()));
+                    let original_session_id = active_store.id;
                     let (next_store, history) = active_store.fork_from_with_title(
                         Some(engine.messages.len()),
                         title,
@@ -1489,21 +1771,115 @@ async fn run(
                     engine.messages = history;
                     active_store = next_store;
                     active_file_histories = next_histories;
+                    let branch_color = active_store.color()?;
+                    editor.set_prompt_color(branch_color.as_deref())?;
+                    ui.set_prompt_color(branch_color.as_deref())?;
                     editor.seed_history(conversation_prompt_history(&engine.messages));
                     if enhanced_terminal {
                         ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
-                        ui.set_fullscreen_header(format!(
-                            "open-agent-harness · {} · {:?} · {}",
-                            engine.model,
-                            engine.permission_mode(),
-                            active_store.id
-                        ))?;
+                        ui.set_fullscreen_header(fullscreen_session_header(
+                            &engine,
+                            &active_store,
+                        )?)?;
                     }
-                    println!("Branched into session {}.", active_store.id);
+                    println!(
+                        "Branched into session {}. Return with /resume {}.",
+                        active_store.id, original_session_id
+                    );
                     continue;
                 }
                 CommandOutcome::TerminalSetup => {
                     print_terminal_setup();
+                    continue;
+                }
+                CommandOutcome::ConfigureColor(argument) => {
+                    if argument.trim().is_empty() {
+                        println!(
+                            "Session color: {}. Available: red, blue, green, yellow, purple, orange, pink, cyan, default",
+                            active_store.color()?.as_deref().unwrap_or("default")
+                        );
+                        continue;
+                    }
+                    match normalize_prompt_color(&argument) {
+                        Ok(color) => {
+                            active_store.set_color(color.as_deref())?;
+                            editor.set_prompt_color(color.as_deref())?;
+                            ui.set_prompt_color(color.as_deref())?;
+                            println!(
+                                "Session color set to {}.",
+                                color.as_deref().unwrap_or("default")
+                            );
+                        }
+                        Err(error) => eprintln!("Session color unchanged: {error:#}"),
+                    }
+                    continue;
+                }
+                CommandOutcome::ConfigureEffort(argument) => {
+                    let selected = if argument.trim().is_empty() && enhanced_terminal {
+                        let options = [
+                            ("auto", "Automatic", "Do not send an explicit effort hint"),
+                            ("low", "Low", "Prefer a shorter reasoning budget"),
+                            ("medium", "Medium", "Use a balanced reasoning budget"),
+                            ("high", "High", "Prefer a larger reasoning budget"),
+                            ("max", "Maximum", "Request the largest supported reasoning budget"),
+                        ]
+                        .into_iter()
+                        .map(|(value, display_name, description)| ModelOption {
+                            value: value.to_owned(),
+                            display_name: display_name.to_owned(),
+                            description: description.to_owned(),
+                        })
+                        .collect::<Vec<_>>();
+                        let current = engine
+                            .reasoning_effort()
+                            .map_or("auto", ReasoningEffort::as_str);
+                        match select_option_dialog(
+                            &options,
+                            current,
+                            "Reasoning effort",
+                            "Choose a provider-neutral effort hint. Unsupported backends may reject explicit values.",
+                        )? {
+                            ModelPickerOutcome::Selected(value) => value,
+                            ModelPickerOutcome::Cancelled => continue,
+                            ModelPickerOutcome::Exit => break,
+                        }
+                    } else if argument.trim().is_empty() {
+                        println!(
+                            "Reasoning effort: {}. Available: auto, low, medium, high, max",
+                            engine
+                                .reasoning_effort()
+                                .map_or("auto", ReasoningEffort::as_str)
+                        );
+                        continue;
+                    } else {
+                        argument
+                    };
+                    match ReasoningEffort::parse(&selected) {
+                        Ok(effort) => {
+                            engine.set_reasoning_effort(effort);
+                            if let Err(error) = save_ui_setting(
+                                ui_settings_store.as_ref(),
+                                &mut ui_settings,
+                                "reasoningEffort",
+                                effort.map_or("auto", ReasoningEffort::as_str),
+                            ) {
+                                eprintln!(
+                                    "Effort changed for this session but was not saved: {error:#}"
+                                );
+                            }
+                            if enhanced_terminal {
+                                ui.set_fullscreen_header(fullscreen_session_header(
+                                    &engine,
+                                    &active_store,
+                                )?)?;
+                            }
+                            println!(
+                                "Reasoning effort set to {}.",
+                                effort.map_or("auto", ReasoningEffort::as_str)
+                            );
+                        }
+                        Err(error) => eprintln!("Reasoning effort unchanged: {error:#}"),
+                    }
                     continue;
                 }
                 CommandOutcome::ConfigureUi(argument) => {
@@ -1511,6 +1887,7 @@ async fn run(
                         if enhanced_terminal {
                             match configure_ui_dialog(SettingsDialog::new(ui_settings_snapshot(
                                 &ui_settings,
+                                &available_output_styles,
                             )))? {
                                 SettingsDialogAction::Save { changes, .. } => {
                                     let mut next = ui_settings.clone();
@@ -1526,7 +1903,16 @@ async fn run(
                                     }
                                     ui_settings = next;
                                     apply_ui_runtime(&ui_settings, &mut editor, &ui)?;
-                                    println!("UI settings saved.");
+                                    let effort = ui_settings
+                                        .reasoning_effort
+                                        .as_deref()
+                                        .map(ReasoningEffort::parse)
+                                        .transpose()?
+                                        .flatten();
+                                    engine.set_reasoning_effort(effort);
+                                    println!(
+                                        "Settings saved. Reasoning effort applies now; output-style changes apply on the next session."
+                                    );
                                 }
                                 SettingsDialogAction::Cancel { .. } => {
                                     println!("UI settings unchanged.");
@@ -1537,7 +1923,7 @@ async fn run(
                         }
                         println!("{}", serde_json::to_string_pretty(&ui_settings)?);
                         println!(
-                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
+                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
                         );
                         continue;
                     }
@@ -1764,29 +2150,35 @@ async fn run(
                 }
                 CommandOutcome::Rewind(argument) => {
                     let argument = if argument.trim().is_empty() && enhanced_terminal {
-                        let options = checkpoint_catalog(&active_file_histories)?
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, checkpoint)| ModelOption {
-                                value: checkpoint.id.to_string(),
-                                display_name: format!("Message boundary {}", index + 1),
-                                description: format!(
-                                    "{} messages · {} tracked files",
-                                    checkpoint.message_count, checkpoint.tracked_files
-                                ),
-                            })
-                            .collect::<Vec<_>>();
+                        let options = checkpoint_picker_options(
+                            checkpoint_catalog(&active_file_histories)?,
+                            &engine.messages,
+                        );
                         let checkpoint = match select_rewind_checkpoint(&options)? {
                             ModelPickerOutcome::Selected(checkpoint) => checkpoint,
                             ModelPickerOutcome::Cancelled => continue,
                             ModelPickerOutcome::Exit => break,
                         };
-                        let actions = [
-                            ("both", "Restore code and conversation", "Rewind both state surfaces"),
-                            ("conversation", "Restore conversation only", "Keep workspace files unchanged"),
-                            ("files", "Restore code only", "Keep conversation history unchanged"),
-                            ("preview", "Preview only", "Show the exact bounded diff without changing state"),
-                        ]
+                        let can_restore_code = checkpoint.parse::<Uuid>().is_ok();
+                        let mut actions = Vec::new();
+                        if can_restore_code {
+                            actions.extend([
+                                ("both", "Restore code and conversation", "Rewind both state surfaces"),
+                                ("conversation", "Restore conversation only", "Keep workspace files unchanged"),
+                                ("files", "Restore code only", "Keep conversation history unchanged"),
+                            ]);
+                        } else {
+                            actions.push((
+                                "conversation",
+                                "Restore conversation",
+                                "Code restore is unavailable for this message",
+                            ));
+                        }
+                        actions.extend([
+                            ("summarize", "Summarize from here", "Keep earlier messages and compact the selected point onward"),
+                            ("preview", "Preview only", "Show what would change without modifying state"),
+                        ]);
+                        let actions = actions
                         .into_iter()
                         .map(|(value, display_name, description)| ModelOption {
                             value: value.to_owned(),
@@ -1794,13 +2186,23 @@ async fn run(
                             description: description.to_owned(),
                         })
                         .collect::<Vec<_>>();
-                        match select_model(&actions, "both")? {
+                        match select_option_dialog(
+                            &actions,
+                            if can_restore_code { "both" } else { "conversation" },
+                            "Restore scope",
+                            "Choose whether to restore conversation, code, or both.",
+                        )? {
                             ModelPickerOutcome::Selected(action) => match action.as_str() {
                                 "both" => format!("{checkpoint} --confirm"),
                                 "conversation" => {
-                                    format!("{checkpoint} --conversation-only --confirm")
+                                    if can_restore_code {
+                                        format!("{checkpoint} --conversation-only --confirm")
+                                    } else {
+                                        format!("{checkpoint} --confirm")
+                                    }
                                 }
                                 "files" => format!("{checkpoint} --files-only --confirm"),
+                                "summarize" => format!("__summarize__ {checkpoint}"),
                                 "preview" => checkpoint,
                                 _ => unreachable!("fixed rewind action"),
                             },
@@ -1810,13 +2212,64 @@ async fn run(
                     } else {
                         argument
                     };
+                    if let Some(checkpoint) = argument.strip_prefix("__summarize__ ") {
+                        let message_count = if let Some(index) =
+                            checkpoint.strip_prefix("conversation:")
+                        {
+                            index
+                                .parse::<usize>()
+                                .context("selected conversation boundary is invalid")?
+                        } else {
+                            let checkpoint = checkpoint.parse::<Uuid>()?;
+                            checkpoint_catalog(&active_file_histories)?
+                                .into_iter()
+                                .find(|candidate| candidate.id == checkpoint)
+                                .map(|boundary| boundary.message_count)
+                                .context("selected message boundary is no longer available")?
+                        };
+                        match engine.compact_from(message_count, None).await {
+                            Ok(stats) => {
+                                active_store.replace_history(&engine.messages)?;
+                                editor.seed_history(conversation_prompt_history(&engine.messages));
+                                if enhanced_terminal {
+                                    ui.replace_fullscreen_transcript(&transcript_lines(
+                                        &engine.messages,
+                                    ))?;
+                                }
+                                println!(
+                                    "Conversation summarized from the selected message ({} → {} messages; estimated tokens {} → {}).",
+                                    stats.messages_before,
+                                    stats.messages_after,
+                                    stats.before_tokens,
+                                    stats.after_tokens
+                                );
+                            }
+                            Err(error) => eprintln!("Summarize failed: {error:#}"),
+                        }
+                        continue;
+                    }
                     if let Err(error) = handle_rewind_command(
                         &mut engine,
-                        &active_store,
-                        &active_file_histories,
+                        &mut active_store,
+                        &mut active_file_histories,
+                        &command_context,
                         &argument,
                     ) {
                         eprintln!("Rewind failed: {error:#}");
+                    } else {
+                        let color = active_store.color()?;
+                        editor.set_prompt_color(color.as_deref())?;
+                        ui.set_prompt_color(color.as_deref())?;
+                        editor.seed_history(conversation_prompt_history(&engine.messages));
+                        if enhanced_terminal {
+                            ui.replace_fullscreen_transcript(&transcript_lines(
+                                &engine.messages,
+                            ))?;
+                            ui.set_fullscreen_header(fullscreen_session_header(
+                                &engine,
+                                &active_store,
+                            )?)?;
+                        }
                     }
                     continue;
                 }
@@ -1829,70 +2282,122 @@ async fn run(
                         eprintln!("Resume unavailable while background tasks are running; stop them first.");
                         continue;
                     }
-                    let sessions = match session_state_root.as_ref() {
-                        Some(root) => SessionStore::list_in(active_store.cwd(), root, 100),
-                        None => SessionStore::list(active_store.cwd(), 100),
-                    }?;
+                    let candidates = resume_session_candidates(
+                        &command_context,
+                        &active_store,
+                        session_state_root.as_ref(),
+                    )
+                    .await?;
+                    let selectable_sessions = candidates
+                        .iter()
+                        .filter(|candidate| candidate.summary.id != active_store.id)
+                        .collect::<Vec<_>>();
                     let selected = if argument.trim().is_empty() {
-                        if sessions.is_empty() {
+                        if selectable_sessions.is_empty() {
                             println!("No persisted sessions are available for this workspace.");
                             continue;
                         }
                         if !enhanced_terminal {
-                            print_resume_sessions(&session_metadata, "")?;
+                            print_resume_sessions(
+                                &active_store,
+                                session_state_root.as_ref(),
+                                "",
+                            )?;
                             continue;
                         }
-                        let options = sessions
+                        let options = selectable_sessions
                             .iter()
-                            .map(|session| {
+                            .map(|candidate| {
+                                let session = &candidate.summary;
                                 let label = session
                                     .title
                                     .clone()
+                                    .or_else(|| session.preview.clone())
                                     .unwrap_or_else(|| session.id.to_string());
+                                let workspace = candidate
+                                    .workspace
+                                    .root
+                                    .file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("worktree");
                                 ModelOption {
                                     value: session.id.to_string(),
-                                    display_name: format!(
-                                        "{label}{}",
-                                        if session.id == active_store.id {
-                                            " (current)"
-                                        } else {
-                                            ""
-                                        }
-                                    ),
+                                    display_name: label,
                                     description: format!(
-                                        "{} · {} bytes · modified {}{}",
+                                        "{} · {workspace} · {} bytes · modified {}{}{}{}{}",
                                         session.id,
                                         session.bytes,
                                         session.modified_ms,
                                         session.parent_session_id.map_or_else(
                                             String::new,
                                             |parent| format!(" · branch of {parent}")
-                                        )
+                                        ),
+                                        session.color.as_deref().map_or_else(
+                                            String::new,
+                                            |color| format!(" · {color}")
+                                        ),
+                                        session.tag.as_deref().map_or_else(
+                                            String::new,
+                                            |tag| format!(" · #{tag}")
+                                        ),
+                                        session
+                                            .title
+                                            .as_ref()
+                                            .and(session.preview.as_ref())
+                                            .map_or_else(String::new, |preview| {
+                                                format!(" · {}", bounded_single_line(preview, 90))
+                                            })
                                     ),
                                 }
                             })
                             .collect::<Vec<_>>();
-                        match select_model(&options, &active_store.id.to_string())? {
+                        match select_searchable_option(
+                            &options,
+                            "",
+                            "Resume conversation",
+                            "Type to search titles, tags, previews, or ids. Enter resumes; Escape keeps this conversation.",
+                        )? {
                             ModelPickerOutcome::Selected(id) => id.parse::<Uuid>()?,
                             ModelPickerOutcome::Cancelled => continue,
                             ModelPickerOutcome::Exit => break,
                         }
                     } else {
-                        argument.trim().parse::<Uuid>().context("session id must be a UUID")?
+                        let sessions = candidates
+                            .iter()
+                            .map(|candidate| candidate.summary.clone())
+                            .collect::<Vec<_>>();
+                        resolve_session_selector(&sessions, argument.trim())?
                     };
                     if selected == active_store.id {
                         println!("Session {} is already active.", selected);
                         continue;
                     }
+                    let candidate = candidates
+                        .iter()
+                        .find(|candidate| candidate.summary.id == selected)
+                        .context("selected session is no longer available")?;
                     let (next_store, history) = match session_state_root.as_ref() {
-                        Some(root) => {
-                            SessionStore::resume_in(active_store.cwd(), selected, root, true)
-                        }
-                        None => SessionStore::resume(active_store.cwd(), selected, true),
+                        Some(root) => SessionStore::resume_in(
+                            &candidate.workspace.cwd,
+                            selected,
+                            root,
+                            true,
+                        ),
+                        None => SessionStore::resume(&candidate.workspace.cwd, selected, true),
                     }?;
-                    if let Some(restored) = worktree.restore_session(&next_store.workspace_state()).await? {
+                    if let Some(restored) = worktree
+                        .restore_session(&next_store.workspace_state())
+                        .await?
+                    {
                         command_context
                             .switch_workspace(restored.cwd, restored.root)
+                            .await?;
+                    } else if candidate.workspace.cwd != active_store.cwd() {
+                        command_context
+                            .switch_workspace(
+                                candidate.workspace.cwd.clone(),
+                                candidate.workspace.root.clone(),
+                            )
                             .await?;
                     }
                     if let Some(current) = next_store.current_cwd_state() {
@@ -1905,7 +2410,7 @@ async fn run(
                         .trusted_roots()
                         .into_iter()
                         .map(|root| {
-                            open_file_history(
+                            create_file_history(
                                 &cli,
                                 &root,
                                 next_store.id,
@@ -1919,15 +2424,16 @@ async fn run(
                     engine.messages = history;
                     active_store = next_store;
                     active_file_histories = next_histories;
+                    let resumed_color = active_store.color()?;
+                    editor.set_prompt_color(resumed_color.as_deref())?;
+                    ui.set_prompt_color(resumed_color.as_deref())?;
                     editor.seed_history(conversation_prompt_history(&engine.messages));
                     if enhanced_terminal {
                         ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
-                        ui.set_fullscreen_header(format!(
-                            "open-agent-harness · {} · {:?} · {}",
-                            engine.model,
-                            engine.permission_mode(),
-                            active_store.id
-                        ))?;
+                        ui.set_fullscreen_header(fullscreen_session_header(
+                            &engine,
+                            &active_store,
+                        )?)?;
                     }
                     println!("Resumed session {} in this terminal.", active_store.id);
                     continue;
@@ -1948,8 +2454,26 @@ async fn run(
                     continue;
                 }
                 CommandOutcome::ManageMcp(argument) => {
+                    let argument = if argument.is_empty() && enhanced_terminal {
+                        let control = mcp_control
+                            .as_deref()
+                            .context("当前没有配置 MCP server")?;
+                        match interactive_mcp_action(control).await? {
+                            ModelPickerOutcome::Selected(action) => action,
+                            ModelPickerOutcome::Cancelled => continue,
+                            ModelPickerOutcome::Exit => break,
+                        }
+                    } else {
+                        argument
+                    };
                     if argument.is_empty() || argument == "status" || argument == "list" {
                         print_mcp_status(mcp_control.as_deref());
+                    } else if let Some(server) = argument.strip_prefix("tools ") {
+                        let server = server.trim();
+                        let control = mcp_control
+                            .as_deref()
+                            .context("当前没有配置 MCP server")?;
+                        print_mcp_tools(control, server, enhanced_terminal).await?;
                     } else if let Some(server) = argument.strip_prefix("reconnect ") {
                         let server = server.trim();
                         let control = mcp_control
@@ -1994,7 +2518,7 @@ async fn run(
                         print_mcp_status(Some(control));
                     } else {
                         eprintln!(
-                            "Usage: /mcp [status|list|reconnect|enable|disable <server>]"
+                            "Usage: /mcp [status|list|tools|reconnect|enable|disable <server>]"
                         );
                     }
                     continue;
@@ -2008,6 +2532,126 @@ async fn run(
                         "Plugins: {} loaded; lifecycle commands: open-agent-harness plugin --help",
                         plugin_count
                     );
+                    continue;
+                }
+                CommandOutcome::ReloadPlugins => {
+                    if cli.bare || cli.safe_mode {
+                        println!("Reloaded: 0 plugins · extensions remain disabled in this mode.");
+                        continue;
+                    }
+                    if !command_context.background_task_ids().await.is_empty() {
+                        eprintln!(
+                            "Plugin reload unavailable while background tasks are running; stop them first."
+                        );
+                        continue;
+                    }
+                    let reload = (|| -> Result<_> {
+                        let mut refreshed_settings =
+                            Settings::load(&cwd, cli.settings.as_deref(), cli.bare)?;
+                        if cli.safe_mode {
+                            refreshed_settings.retain_safe_mode_core();
+                        }
+                        let catalog =
+                            PluginCatalog::discover(&refreshed_settings, &cwd, false)?;
+                        let count = catalog.plugins().len();
+                        let mcp_definitions = catalog.mcp_servers().clone();
+                        let lsp_definitions = catalog.lsp_servers().clone();
+                        let styles = catalog.available_output_style_names();
+                        let skills = catalog.skills().clone();
+                        let plugin_hooks = catalog.hooks().clone();
+                        let monitors = catalog.monitors().to_vec();
+                        let monitor_count = monitors.len();
+                        let mut commands =
+                            CustomCommandCatalog::from_settings(&refreshed_settings)?;
+                        commands.merge(catalog.commands().clone())?;
+                        catalog.apply_runtime_contributions(&mut refreshed_settings)?;
+                        let agents = configure_agents(&refreshed_settings)?;
+                        let agent_names = agents
+                            .custom_agents
+                            .iter()
+                            .map(|(name, definition)| {
+                                json!({"name":name,"description":definition.description})
+                            })
+                            .collect::<Vec<_>>();
+                        let next_hooks = Arc::new(
+                            HookRunner::from_settings_and_plugins(
+                                &refreshed_settings,
+                                &plugin_hooks,
+                            )?
+                            .with_mcp_invoker(mcp_hook_invoker.clone())
+                            .with_observer(
+                                hook_events.as_ref().map(HookEventEmitter::observer),
+                            ),
+                        );
+                        Ok((
+                            count,
+                            skills,
+                            commands,
+                            agents.custom_agents,
+                            agent_names,
+                            next_hooks,
+                            monitors,
+                            monitor_count,
+                            styles,
+                            mcp_definitions,
+                            lsp_definitions,
+                        ))
+                    })();
+                    match reload {
+                        Ok((
+                            next_plugin_count,
+                            next_skills,
+                            next_commands,
+                            next_agents,
+                            next_agent_names,
+                            next_hooks,
+                            next_monitors,
+                            next_monitor_count,
+                            next_styles,
+                            next_mcp_definitions,
+                            next_lsp_definitions,
+                        )) => {
+                            hooks.finalize_async().await;
+                            command_context.shutdown_monitors().await;
+                            command_context.set_extension_skills(next_skills);
+                            command_context.configure_plugin_monitors(next_monitors);
+                            command_context.set_hooks(Arc::clone(&next_hooks));
+                            engine.replace_hooks(Arc::clone(&next_hooks));
+                            engine.install_custom_agents(next_agents)?;
+                            custom_commands = next_commands;
+                            custom_agent_names = next_agent_names;
+                            hooks = next_hooks;
+                            plugin_count = next_plugin_count;
+                            available_output_styles = next_styles;
+                            let monitor_errors =
+                                command_context.start_always_plugin_monitors().await;
+                            let topology_changed = next_mcp_definitions != plugin_mcp_definitions
+                                || next_lsp_definitions != plugin_lsp_definitions;
+                            println!(
+                                "Reloaded: {} plugin{} · {} skill{} · {} agent{} · {} hook configuration · {} plugin monitor{}",
+                                plugin_count,
+                                if plugin_count == 1 { "" } else { "s" },
+                                command_context.skill_catalog().len(),
+                                if command_context.skill_catalog().len() == 1 { "" } else { "s" },
+                                custom_agent_names.len(),
+                                if custom_agent_names.len() == 1 { "" } else { "s" },
+                                if hooks.is_empty() { "no" } else { "active" },
+                                next_monitor_count,
+                                if next_monitor_count == 1 { "" } else { "s" },
+                            );
+                            if topology_changed {
+                                eprintln!(
+                                    "Plugin MCP/LSP definitions changed. Skills, commands, agents, hooks, and monitors were activated; server topology changes require a new session."
+                                );
+                            }
+                            for error in monitor_errors {
+                                eprintln!("Plugin monitor was not started: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Plugin reload failed; current runtime kept unchanged: {error:#}");
+                        }
+                    }
                     continue;
                 }
                 CommandOutcome::Submit(prompt) => prompt,
@@ -2419,6 +3063,22 @@ fn open_file_history(
     source.fork(session_id)
 }
 
+fn create_file_history(
+    cli: &Cli,
+    cwd: &std::path::Path,
+    session_id: Uuid,
+    state_root: Option<&SessionStateRoot>,
+) -> Result<FileHistory> {
+    let enabled = !cli.no_session_persistence;
+    if !enabled {
+        return FileHistory::create(cwd, session_id, false);
+    }
+    match state_root {
+        Some(root) => FileHistory::create_in(cwd, session_id, &root.file_history_root()?, true),
+        None => FileHistory::create(cwd, session_id, true),
+    }
+}
+
 async fn build_base_system_prompt(cli: &Cli) -> Result<String> {
     let mut system = if let Some(prompt) = &cli.system_prompt {
         prompt.clone()
@@ -2680,6 +3340,21 @@ fn emit_query_event(
         QueryEvent::RequestStarted { round } if include_partial => Some(json!({
             "type":"system", "subtype":"request_started", "round":round, "session_id":session_id
         })),
+        QueryEvent::RequestRetry {
+            attempt,
+            max_attempts,
+            delay_ms,
+            reason,
+        } if include_partial => Some(json!({
+            "type":"system",
+            "subtype":"status",
+            "status":"retrying",
+            "attempt":attempt,
+            "max_attempts":max_attempts,
+            "delay_ms":delay_ms,
+            "reason":open_agent_harness::session::sanitize_transport_text(reason, cwd),
+            "session_id":session_id
+        })),
         QueryEvent::AssistantMessage { content, .. } => Some(json!({
             "type":"assistant",
             "message":{"role":"assistant", "content":content},
@@ -2727,9 +3402,10 @@ fn emit_query_event(
         QueryEvent::TurnFinished if include_partial => Some(json!({
             "type":"system", "subtype":"status", "status":Value::Null, "session_id":session_id
         })),
-        QueryEvent::TurnStarted | QueryEvent::RequestStarted { .. } | QueryEvent::TurnFinished => {
-            None
-        }
+        QueryEvent::TurnStarted
+        | QueryEvent::RequestStarted { .. }
+        | QueryEvent::RequestRetry { .. }
+        | QueryEvent::TurnFinished => None,
     };
     if let Some(message) = message {
         let message = open_agent_harness::session::sanitize_transport_value(&message, cwd);
@@ -3012,6 +3688,7 @@ async fn handle_control_slash_command(
             handled(json!({
                 "sessionId":metadata.store.id,
                 "model":engine.model,
+                "reasoningEffort":engine.reasoning_effort().map(ReasoningEffort::as_str),
                 "permissionMode":permission_mode_name(engine.permission_mode()),
                 "context":{"estimatedTokens":used,"autoCompactAt":threshold,"window":window},
                 "toolCount":engine.registered_tool_names().len(),
@@ -3020,6 +3697,38 @@ async fn handle_control_slash_command(
                 "pluginCount":metadata.plugin_count,
             }))
         }
+        "/stats" => handled(json!({
+            "sessionId":metadata.store.id,
+            "messages":engine.messages.len(),
+            "usage":engine.usage,
+        })),
+        "/color" => {
+            let color = normalize_prompt_color(argument)?;
+            metadata.store.set_color(color.as_deref())?;
+            handled(json!({"color":color.unwrap_or_else(|| "default".to_owned())}))
+        }
+        "/tag" if argument.is_empty() => handled(json!({"tag":metadata.store.tag()?})),
+        "/tag" => handled(json!({"tag":metadata.store.toggle_tag(argument)?})),
+        "/effort" => {
+            if argument.is_empty() {
+                return handled(json!({
+                    "effort":engine.reasoning_effort().map_or("auto", ReasoningEffort::as_str),
+                    "available":["auto","low","medium","high","max"],
+                }));
+            }
+            let effort = ReasoningEffort::parse(argument)?;
+            engine.set_reasoning_effort(effort);
+            handled(json!({
+                "effort":effort.map_or("auto", ReasoningEffort::as_str),
+                "persisted":false,
+            }))
+        }
+        "/output-style" => handled(json!({
+            "deprecated":true,
+            "message":"Use /config outputStyle=<name>; changes apply on the next session.",
+            "current":metadata.output_style,
+            "available":metadata.available_output_styles,
+        })),
         "/tasks" | "/bashes" => {
             let mut words = argument.split_whitespace();
             if let Some(action) = words.next() {
@@ -3185,6 +3894,15 @@ async fn handle_control_slash_command(
         "/mcp" if argument.is_empty() || matches!(argument, "status" | "list") => handled(json!({
             "servers":metadata.mcp_control.map_or_else(Vec::new, |control| control.status())
         })),
+        "/mcp" if argument.starts_with("tools ") => {
+            let server = argument["tools ".len()..].trim();
+            if server.is_empty() {
+                bail!("Usage: /mcp tools <server>")
+            }
+            let control = metadata.mcp_control.context("当前没有配置 MCP server")?;
+            let tools = control.list_tools(server).await?;
+            handled(json!({"server":server,"tools":tools}))
+        }
         "/mcp" if argument.starts_with("reconnect ") => {
             let server = argument["reconnect ".len()..].trim();
             if server.is_empty() {
@@ -3222,7 +3940,7 @@ async fn handle_control_slash_command(
             }
             handled(json!({"action":action,"server":server,"servers":control.status()}))
         }
-        "/mcp" => bail!("Usage: /mcp [status|list|reconnect|enable|disable <server>]"),
+        "/mcp" => bail!("Usage: /mcp [status|list|tools|reconnect|enable|disable <server>]"),
         "/sandbox" => {
             let sandbox = metadata.command_context.sandbox_runtime();
             handled(json!({
@@ -3343,6 +4061,12 @@ struct SessionMetadata<'a> {
     mcp_control: Option<&'a Arc<dyn McpControl>>,
     session_state_root: Option<&'a SessionStateRoot>,
     file_histories: &'a [FileHistory],
+}
+
+#[derive(Clone)]
+struct ResumeSessionCandidate {
+    summary: SessionSummary,
+    workspace: RepositoryWorktree,
 }
 
 async fn handle_control_request(
@@ -3548,6 +4272,7 @@ async fn handle_control_request(
             let sandbox = metadata.command_context.sandbox_runtime();
             let effective = json!({
                 "model":engine.model,
+                "reasoningEffort":engine.reasoning_effort().map(ReasoningEffort::as_str),
                 "permissionMode":permission_mode_name(engine.permission_mode()),
                 "outputStyle":metadata.output_style,
                 "availableOutputStyles":metadata.available_output_styles,
@@ -3561,7 +4286,7 @@ async fn handle_control_request(
             Ok(json!({
                 "effective":effective,
                 "sources":[],
-                "applied":{"model":engine.model, "effort":Value::Null},
+                "applied":{"model":engine.model, "effort":engine.reasoning_effort().map(ReasoningEffort::as_str)},
             }))
         }
         "rewind" => (|| -> Result<Value> {
@@ -3675,6 +4400,13 @@ struct RewindCommandOptions {
     confirm: bool,
 }
 
+struct RewindCommitOptions {
+    checkpoint: Option<Uuid>,
+    message_count: usize,
+    files: bool,
+    conversation: bool,
+}
+
 fn checkpoint_catalog(histories: &[FileHistory]) -> Result<Vec<CheckpointInfo>> {
     let mut by_id = std::collections::BTreeMap::<Uuid, CheckpointInfo>::new();
     for history in histories {
@@ -3708,6 +4440,82 @@ fn checkpoint_catalog(histories: &[FileHistory]) -> Result<Vec<CheckpointInfo>> 
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(checkpoints)
+}
+
+fn checkpoint_picker_options(
+    mut checkpoints: Vec<CheckpointInfo>,
+    messages: &[Message],
+) -> Vec<ModelOption> {
+    checkpoints.retain(|checkpoint| {
+        checkpoint.boundary == open_agent_harness::file_history::CheckpointBoundary::UserMessage
+    });
+    let by_message = checkpoints
+        .into_iter()
+        .map(|checkpoint| (checkpoint.message_count, checkpoint))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| selectable_user_message(message))
+        .map(|(message_count, message)| {
+            let checkpoint = by_message.get(&message_count);
+            let prompt = match &message.content {
+                Value::String(text) => text.clone(),
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| {
+                        (block.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| block.get("text").and_then(Value::as_str))
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => String::new(),
+            };
+            ModelOption {
+                value: checkpoint.map_or_else(
+                    || format!("conversation:{message_count}"),
+                    |checkpoint| checkpoint.id.to_string(),
+                ),
+                display_name: bounded_single_line(&prompt, 120),
+                description: format!(
+                    "before message {} · {}",
+                    message_count.saturating_add(1),
+                    checkpoint.map_or_else(
+                        || "conversation only; no code restore".to_owned(),
+                        |checkpoint| format!(
+                            "{} tracked file{}",
+                            checkpoint.tracked_files,
+                            if checkpoint.tracked_files == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    )
+                ),
+            }
+        })
+        .collect()
+}
+
+fn selectable_user_message(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    match &message.content {
+        Value::String(text) => {
+            !text.trim().is_empty()
+                && !text.starts_with("This session continues from an earlier conversation")
+        }
+        Value::Array(blocks) => {
+            !blocks.is_empty()
+                && !blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        }
+        _ => false,
+    }
 }
 
 fn print_checkpoint_catalog(histories: &[FileHistory]) -> Result<()> {
@@ -3831,12 +4639,66 @@ fn print_checkpoint_diff(
 
 fn handle_rewind_command(
     engine: &mut QueryEngine,
-    store: &SessionStore,
-    histories: &[FileHistory],
+    store: &mut SessionStore,
+    histories: &mut Vec<FileHistory>,
+    context: &ToolContext,
     argument: &str,
 ) -> Result<()> {
     if argument.trim() == "list" {
         return print_checkpoint_catalog(histories);
+    }
+    let mut tokens = argument.split_whitespace();
+    if let Some(target) = tokens
+        .next()
+        .and_then(|token| token.strip_prefix("conversation:"))
+    {
+        let message_count = target
+            .parse::<usize>()
+            .context("conversation rewind boundary is invalid")?;
+        if !engine
+            .messages
+            .get(message_count)
+            .is_some_and(selectable_user_message)
+        {
+            bail!("conversation rewind boundary no longer names a user message")
+        }
+        let mut confirm = false;
+        for token in tokens {
+            match token {
+                "--confirm" => confirm = true,
+                "--conversation-only" => {}
+                _ => bail!("conversation-only rewind does not accept {token}"),
+            }
+        }
+        if !confirm {
+            println!("Rewind preview");
+            println!(
+                "  conversation: {} -> {} message(s)",
+                engine.messages.len(),
+                message_count
+            );
+            println!("  workspace: unchanged (no code checkpoint for this message)");
+            println!("  confirm with: /rewind conversation:{message_count} --confirm");
+            return Ok(());
+        }
+        let original = store.id;
+        commit_rewind_fork(
+            engine,
+            store,
+            histories,
+            context,
+            RewindCommitOptions {
+                checkpoint: None,
+                message_count,
+                files: false,
+                conversation: true,
+            },
+        )?;
+        println!(
+            "Conversation restored in fork {}. Original session {original} remains resumable.",
+            store.id
+        );
+        return Ok(());
     }
     let options = parse_rewind_options(engine, histories, argument)?;
     let (stats, message_count) = engine.diff_files(options.checkpoint)?;
@@ -3875,12 +4737,18 @@ fn handle_rewind_command(
         return Ok(());
     }
 
-    let (report, _) = apply_rewind(
+    let original = store.id;
+    let report = commit_rewind_fork(
         engine,
         store,
-        options.checkpoint,
-        options.files,
-        options.conversation,
+        histories,
+        context,
+        RewindCommitOptions {
+            checkpoint: Some(options.checkpoint),
+            message_count,
+            files: options.files,
+            conversation: options.conversation,
+        },
     )?;
     println!("Rewound checkpoint {}.", options.checkpoint);
     if let Some(report) = report {
@@ -3892,9 +4760,132 @@ fn handle_rewind_command(
         );
     }
     if options.conversation {
-        println!("  conversation: {} message(s)", engine.messages.len());
+        println!(
+            "  conversation: {} message(s) in fork {}; original {original} remains resumable",
+            engine.messages.len(),
+            store.id
+        );
     }
     Ok(())
+}
+
+fn commit_rewind_fork(
+    engine: &mut QueryEngine,
+    store: &mut SessionStore,
+    histories: &mut Vec<FileHistory>,
+    context: &ToolContext,
+    options: RewindCommitOptions,
+) -> Result<Option<RewindReport>> {
+    if !options.conversation {
+        let checkpoint = options
+            .checkpoint
+            .context("code-only rewind requires a file checkpoint")?;
+        return engine
+            .rewind_files(checkpoint)
+            .map(|(report, _)| Some(report));
+    }
+    if !store.persistence_enabled() {
+        let report = options
+            .checkpoint
+            .filter(|_| options.files)
+            .map(|checkpoint| engine.rewind_files(checkpoint).map(|(report, _)| report))
+            .transpose()?;
+        if options.message_count > engine.messages.len() {
+            bail!("rewind message_count exceeds the in-memory conversation")
+        }
+        engine.messages.truncate(options.message_count);
+        return Ok(report);
+    }
+    let original_id = store.id;
+    let original_messages = engine.messages.clone();
+    let original_histories = histories.clone();
+    let title = store
+        .title()?
+        .unwrap_or_else(|| suggested_session_title(&engine.messages));
+    let title = format!("{} (Rewind)", bounded_single_line(&title, 470));
+    let (next_store, next_messages) = store.fork_from_with_title(
+        Some(options.message_count),
+        Some(&title),
+        store.persistence_enabled(),
+    )?;
+    let mut next_histories = Vec::with_capacity(histories.len());
+    for history in histories.iter() {
+        match history.fork(next_store.id) {
+            Ok(history) => next_histories.push(history),
+            Err(error) => {
+                let cleanup = discard_failed_rewind_fork(&next_store, original_id, &next_histories);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(format!(
+                        "failed rewind fork cleanup also failed: {cleanup:#}"
+                    )),
+                });
+            }
+        }
+    }
+    if let Err(error) = context.set_file_histories(next_histories.clone()) {
+        let cleanup = discard_failed_rewind_fork(&next_store, original_id, &next_histories);
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!(
+                "failed rewind fork cleanup also failed: {cleanup:#}"
+            )),
+        });
+    }
+    engine.messages = next_messages;
+    let report = options
+        .checkpoint
+        .filter(|_| options.files)
+        .map(|checkpoint| engine.rewind_files(checkpoint).map(|(report, _)| report))
+        .transpose();
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            engine.messages = original_messages;
+            let restore = context.set_file_histories(original_histories);
+            let cleanup = discard_failed_rewind_fork(&next_store, original_id, &next_histories);
+            return Err(match (restore, cleanup) {
+                (Ok(()), Ok(())) => error,
+                (restore, cleanup) => error.context(format!(
+                    "rewind rollback failed: runtime restore={}; private cleanup={}",
+                    restore
+                        .err()
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_else(|| "ok".to_owned()),
+                    cleanup
+                        .err()
+                        .map(|error| format!("{error:#}"))
+                        .unwrap_or_else(|| "ok".to_owned())
+                )),
+            });
+        }
+    };
+    context.set_file_histories(next_histories.clone())?;
+    install_session_state_recorders(context, &next_store);
+    *store = next_store;
+    *histories = next_histories;
+    Ok(report)
+}
+
+fn discard_failed_rewind_fork(
+    store: &SessionStore,
+    expected_parent: Uuid,
+    histories: &[FileHistory],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for history in histories {
+        if let Err(error) = history.discard_failed_fork(store.id) {
+            failures.push(format!("file history: {error:#}"));
+        }
+    }
+    if let Err(error) = store.discard_failed_fork(expected_parent) {
+        failures.push(format!("session: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 fn apply_rewind(
@@ -3936,8 +4927,12 @@ fn apply_rewind(
     Ok((report, message_count))
 }
 
-fn print_resume_sessions(metadata: &SessionMetadata<'_>, argument: &str) -> Result<()> {
-    if !metadata.store.persistence_enabled() {
+fn print_resume_sessions(
+    store: &SessionStore,
+    state_root: Option<&SessionStateRoot>,
+    argument: &str,
+) -> Result<()> {
+    if !store.persistence_enabled() {
         bail!("当前使用 --no-session-persistence，无法 resume")
     }
     let argument = argument.trim();
@@ -3948,9 +4943,9 @@ fn print_resume_sessions(metadata: &SessionMetadata<'_>, argument: &str) -> Resu
         println!("  oah --resume {id}");
         return Ok(());
     }
-    let sessions = match metadata.session_state_root {
-        Some(root) => SessionStore::list_in(metadata.store.cwd(), root, 20)?,
-        None => SessionStore::list(metadata.store.cwd(), 20)?,
+    let sessions = match state_root {
+        Some(root) => SessionStore::list_in(store.cwd(), root, 20)?,
+        None => SessionStore::list(store.cwd(), 20)?,
     };
     if sessions.is_empty() {
         println!("No persisted sessions are available for this workspace.");
@@ -3958,24 +4953,186 @@ fn print_resume_sessions(metadata: &SessionMetadata<'_>, argument: &str) -> Resu
     }
     println!("Recent sessions (newest first):");
     for session in sessions {
-        let current = if session.id == metadata.store.id {
+        let current = if session.id == store.id {
             " (current)"
         } else {
             ""
         };
         println!(
-            "  {}{}{} — {} bytes",
+            "  {}{}{}{} — {} bytes",
             session.id,
             session
                 .title
                 .as_deref()
                 .map_or_else(String::new, |title| format!(" · {title}")),
+            session
+                .tag
+                .as_deref()
+                .map_or_else(String::new, |tag| format!(" · #{tag}")),
             current,
             session.bytes
         );
     }
     println!("Use /resume <session-id>; an interactive terminal switches in-process.");
     Ok(())
+}
+
+async fn resume_session_candidates(
+    context: &ToolContext,
+    store: &SessionStore,
+    state_root: Option<&SessionStateRoot>,
+) -> Result<Vec<ResumeSessionCandidate>> {
+    let current_cwd = std::fs::canonicalize(store.cwd()).unwrap_or_else(|_| store.cwd().to_owned());
+    let fallback_root = context
+        .trusted_roots()
+        .into_iter()
+        .filter(|root| current_cwd.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .unwrap_or_else(|| current_cwd.clone());
+    let worktrees = same_repository_worktrees(context)
+        .await
+        .unwrap_or_else(|_| {
+            vec![RepositoryWorktree {
+                cwd: current_cwd.clone(),
+                root: fallback_root,
+            }]
+        });
+    let mut by_id = std::collections::BTreeMap::<Uuid, ResumeSessionCandidate>::new();
+    for workspace in worktrees.into_iter().take(64) {
+        let sessions = match state_root {
+            Some(root) => SessionStore::list_in(&workspace.cwd, root, 100)?,
+            None => SessionStore::list(&workspace.cwd, 100)?,
+        };
+        for summary in sessions {
+            let candidate = ResumeSessionCandidate {
+                summary: summary.clone(),
+                workspace: workspace.clone(),
+            };
+            match by_id.entry(summary.id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if summary.modified_ms > entry.get().summary.modified_ms =>
+                {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let mut candidates = by_id.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .summary
+            .modified_ms
+            .cmp(&left.summary.modified_ms)
+            .then_with(|| left.summary.id.cmp(&right.summary.id))
+    });
+    candidates.truncate(100);
+    Ok(candidates)
+}
+
+fn resolve_session_selector(sessions: &[SessionSummary], selector: &str) -> Result<Uuid> {
+    if let Ok(id) = selector.parse::<Uuid>() {
+        if sessions.iter().any(|session| session.id == id) {
+            return Ok(id);
+        }
+        bail!("session {id} is not available in this workspace")
+    }
+    let matches = sessions
+        .iter()
+        .filter(|session| session.title.as_deref() == Some(selector))
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [id] => Ok(*id),
+        [] => bail!("no session has the exact title {selector:?}"),
+        _ => bail!("session title {selector:?} is ambiguous; use its UUID"),
+    }
+}
+
+fn suggested_session_title(messages: &[Message]) -> String {
+    conversation_prompt_history(messages)
+        .into_iter()
+        .next()
+        .map(|prompt| bounded_single_line(&prompt, 360))
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or_else(|| "Untitled session".to_owned())
+}
+
+fn unique_session_title(base: &str, sessions: &[SessionSummary], exclude: Option<Uuid>) -> String {
+    let occupied = |candidate: &str| {
+        sessions.iter().any(|session| {
+            Some(session.id) != exclude && session.title.as_deref() == Some(candidate)
+        })
+    };
+    if !occupied(base) {
+        return base.to_owned();
+    }
+    for index in 2..=100 {
+        let candidate = format!("{} ({index})", bounded_single_line(base, 480));
+        if !occupied(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{} ({})", bounded_single_line(base, 460), Uuid::new_v4())
+}
+
+fn unique_branch_title(messages: &[Message], sessions: &[SessionSummary]) -> String {
+    let base = suggested_session_title(messages);
+    let occupied = |candidate: &str| {
+        sessions
+            .iter()
+            .any(|session| session.title.as_deref() == Some(candidate))
+    };
+    let candidate = format!("{} (Branch)", bounded_single_line(&base, 480));
+    if !occupied(&candidate) {
+        return candidate;
+    }
+    for index in 2..=100 {
+        let candidate = format!("{} (Branch {index})", bounded_single_line(&base, 470));
+        if !occupied(&candidate) {
+            return candidate;
+        }
+    }
+    format!(
+        "{} (Branch {})",
+        bounded_single_line(&base, 450),
+        Uuid::new_v4()
+    )
+}
+
+fn fullscreen_session_header(engine: &QueryEngine, store: &SessionStore) -> Result<String> {
+    let title = store
+        .title()?
+        .map(|title| format!("{} · ", bounded_single_line(&title, 120)))
+        .unwrap_or_default();
+    let effort = engine
+        .reasoning_effort()
+        .map(|effort| format!(" · effort {}", effort.as_str()))
+        .unwrap_or_default();
+    Ok(format!(
+        "open-agent-harness · {title}{}{effort} · {:?} · {}",
+        engine.model,
+        engine.permission_mode(),
+        store.id
+    ))
+}
+
+fn merge_background_usage(total: &mut SessionUsage, pending: &Mutex<SessionUsage>) {
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    total.input_tokens = total.input_tokens.saturating_add(pending.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(pending.output_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(pending.cache_creation_input_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(pending.cache_read_input_tokens);
+    *pending = SessionUsage::default();
 }
 
 fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalog) -> Vec<String> {
@@ -4320,13 +5477,25 @@ async fn expand_input_with_clipboard_images(
     Ok(Value::Array(blocks))
 }
 
-fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
-    let context = metadata.command_context;
+fn print_session_status(
+    engine: &QueryEngine,
+    context: &ToolContext,
+    active_store: &SessionStore,
+    plugin_count: usize,
+    hooks: &HookRunner,
+    memory: &AutoMemory,
+) {
     let (used, threshold, window) = engine.context_status();
     let sandbox = context.sandbox_runtime();
     println!("Session status:");
-    println!("  session: {}", metadata.store.id);
+    println!("  session: {}", active_store.id);
     println!("  model: {}", engine.model);
+    println!(
+        "  reasoning effort: {}",
+        engine
+            .reasoning_effort()
+            .map_or("auto", ReasoningEffort::as_str)
+    );
     println!("  cwd: {}", context.cwd().display());
     println!(
         "  permission: {}",
@@ -4339,10 +5508,10 @@ fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
     );
     println!("  trusted roots: {}", context.trusted_roots().len());
     println!("  skills: {}", context.skill_catalog().len());
-    println!("  plugins: {}", metadata.plugin_count);
+    println!("  plugins: {plugin_count}");
     println!(
         "  hooks: {}",
-        if metadata.hooks.is_empty() {
+        if hooks.is_empty() {
             "none"
         } else {
             "configured"
@@ -4350,7 +5519,7 @@ fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
     );
     println!(
         "  memory: {}",
-        if metadata.memory.enabled() {
+        if memory.enabled() {
             "enabled"
         } else {
             "disabled"
@@ -4366,6 +5535,50 @@ fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
             "unavailable"
         }
     );
+}
+
+fn print_local_stats(
+    engine: &QueryEngine,
+    store: &SessionStore,
+    state_root: Option<&SessionStateRoot>,
+) -> Result<()> {
+    let sessions = if store.persistence_enabled() {
+        match state_root {
+            Some(root) => SessionStore::list_in(store.cwd(), root, 100)?,
+            None => SessionStore::list(store.cwd(), 100)?,
+        }
+    } else {
+        Vec::new()
+    };
+    let persisted_bytes = sessions
+        .iter()
+        .fold(0u64, |total, session| total.saturating_add(session.bytes));
+    let user_messages = engine
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .count();
+    let assistant_messages = engine.messages.len().saturating_sub(user_messages);
+    println!("Local activity stats");
+    println!("  current session: {}", store.id);
+    println!(
+        "  messages: {} user · {} assistant/tool",
+        user_messages, assistant_messages
+    );
+    println!(
+        "  tokens: {} input · {} output · {} cache write · {} cache read",
+        engine.usage.input_tokens,
+        engine.usage.output_tokens,
+        engine.usage.cache_creation_input_tokens,
+        engine.usage.cache_read_input_tokens
+    );
+    println!(
+        "  persisted workspace sessions: {}{} · {} bytes",
+        sessions.len(),
+        if sessions.len() == 100 { "+" } else { "" },
+        persisted_bytes
+    );
+    Ok(())
 }
 
 const MAX_CONVERSATION_EXPORT_BYTES: usize = 8 * 1024 * 1024;
@@ -4804,6 +6017,131 @@ fn print_mcp_status(control: Option<&dyn McpControl>) {
     }
 }
 
+async fn interactive_mcp_action(control: &dyn McpControl) -> Result<ModelPickerOutcome> {
+    let statuses = control.status();
+    if statuses.is_empty() {
+        println!("No MCP servers are configured.");
+        return Ok(ModelPickerOutcome::Cancelled);
+    }
+    let servers = statuses
+        .iter()
+        .map(|server| ModelOption {
+            value: server.name.clone(),
+            display_name: server.name.clone(),
+            description: format!("{:?}", server.status).to_ascii_lowercase(),
+        })
+        .collect::<Vec<_>>();
+    let server = match select_searchable_option(
+        &servers,
+        "",
+        "MCP servers",
+        "Type to search. Enter opens server details; Escape closes.",
+    )? {
+        ModelPickerOutcome::Selected(server) => server,
+        ModelPickerOutcome::Cancelled => return Ok(ModelPickerOutcome::Cancelled),
+        ModelPickerOutcome::Exit => return Ok(ModelPickerOutcome::Exit),
+    };
+    let status = statuses
+        .iter()
+        .find(|status| status.name == server)
+        .context("selected MCP server disappeared")?;
+    let toggle = if status.status == McpServerStatusKind::Disabled {
+        "enable"
+    } else {
+        "disable"
+    };
+    let actions = vec![
+        ModelOption {
+            value: "tools".to_owned(),
+            display_name: "Tools".to_owned(),
+            description: "Browse tool descriptions and input schemas".to_owned(),
+        },
+        ModelOption {
+            value: "reconnect".to_owned(),
+            display_name: "Reconnect".to_owned(),
+            description: "Restart this configured connection".to_owned(),
+        },
+        ModelOption {
+            value: toggle.to_owned(),
+            display_name: if toggle == "enable" {
+                "Enable".to_owned()
+            } else {
+                "Disable".to_owned()
+            },
+            description: "Change this session's MCP connection state".to_owned(),
+        },
+    ];
+    match select_option_dialog(
+        &actions,
+        "tools",
+        &format!("MCP · {server}"),
+        "Inspect tools or manage this configured server.",
+    )? {
+        ModelPickerOutcome::Selected(action) if action == "tools" => {
+            print_mcp_tools(control, &server, true).await?;
+            Ok(ModelPickerOutcome::Cancelled)
+        }
+        ModelPickerOutcome::Selected(action) => {
+            Ok(ModelPickerOutcome::Selected(format!("{action} {server}")))
+        }
+        ModelPickerOutcome::Cancelled => Ok(ModelPickerOutcome::Cancelled),
+        ModelPickerOutcome::Exit => Ok(ModelPickerOutcome::Exit),
+    }
+}
+
+async fn print_mcp_tools(control: &dyn McpControl, server: &str, interactive: bool) -> Result<()> {
+    let tools = control.list_tools(server).await?;
+    if tools.is_empty() {
+        println!("MCP server {server} exposes no tools.");
+        return Ok(());
+    }
+    if interactive {
+        let options = tools
+            .iter()
+            .map(|tool| ModelOption {
+                value: tool.name.clone(),
+                display_name: tool.name.clone(),
+                description: bounded_single_line(&tool.description, 160),
+            })
+            .collect::<Vec<_>>();
+        let selected = match select_searchable_option(
+            &options,
+            "",
+            &format!("MCP tools · {server}"),
+            "Type to search. Enter shows the validated input schema.",
+        )? {
+            ModelPickerOutcome::Selected(tool) => tool,
+            ModelPickerOutcome::Cancelled | ModelPickerOutcome::Exit => return Ok(()),
+        };
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == selected)
+            .context("selected MCP tool disappeared")?;
+        println!("{} · {}", tool.server, tool.name);
+        if !tool.description.is_empty() {
+            println!("{}", tool.description);
+        }
+        println!(
+            "Input schema:\n{}",
+            serde_json::to_string_pretty(&tool.input_schema)?
+        );
+    } else {
+        println!("MCP tools from {server}:");
+        for tool in tools {
+            println!(
+                "  {}{}",
+                tool.name,
+                if tool.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", bounded_single_line(&tool.description, 160))
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_sandbox_status(context: &ToolContext) {
     let sandbox = context.sandbox_runtime();
     if !sandbox.enabled() {
@@ -4981,12 +6319,12 @@ fn permission_tab_behavior(tab: PermissionTab) -> Option<&'static str> {
     }
 }
 
-fn ui_settings_snapshot(settings: &UiSettings) -> SettingsSnapshot {
+fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> SettingsSnapshot {
     let choice = |selected: &str, options: &[&str]| SettingValue::Choice {
         selected: selected.to_owned(),
         options: options.iter().map(|value| (*value).to_owned()).collect(),
     };
-    SettingsSnapshot::new(vec![
+    let mut items = vec![
         SettingItem {
             key: "editorMode".to_owned(),
             label: "Editor mode".to_owned(),
@@ -5041,7 +6379,39 @@ fn ui_settings_snapshot(settings: &UiSettings) -> SettingsSnapshot {
             description: "Highlight fenced code in Markdown responses".to_owned(),
             value: SettingValue::Boolean(settings.syntax_highlighting),
         },
-    ])
+    ];
+    let mut style_options = vec!["default".to_owned()];
+    style_options.extend(output_styles.iter().cloned());
+    style_options.sort();
+    style_options.dedup();
+    items.push(SettingItem {
+        key: "outputStyle".to_owned(),
+        label: "Output style".to_owned(),
+        description: "Trusted response style applied on the next session".to_owned(),
+        value: SettingValue::Choice {
+            selected: settings
+                .output_style
+                .clone()
+                .unwrap_or_else(|| "default".to_owned()),
+            options: style_options,
+        },
+    });
+    items.push(SettingItem {
+        key: "reasoningEffort".to_owned(),
+        label: "Reasoning effort".to_owned(),
+        description: "Provider-neutral effort hint applied immediately".to_owned(),
+        value: SettingValue::Choice {
+            selected: settings
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| "auto".to_owned()),
+            options: ["auto", "low", "medium", "high", "max"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+        },
+    });
+    SettingsSnapshot::new(items)
 }
 
 fn setting_value_string(value: &SettingValue) -> String {
@@ -5367,10 +6737,22 @@ fn available_command_suggestions(
             Some("[title]"),
         ),
         (
+            "btw",
+            &[][..],
+            "Ask a one-off side question without changing the main conversation",
+            Some("<question>"),
+        ),
+        (
             "clear",
             &["reset", "new"][..],
             "Start a new conversation and preserve this one for resume",
             Some("[name]"),
+        ),
+        (
+            "color",
+            &[][..],
+            "Set the prompt bar color for this session",
+            Some("<color|default>"),
         ),
         (
             "compact",
@@ -5392,6 +6774,12 @@ fn available_command_suggestions(
             Some("[N]"),
         ),
         ("cost", &[][..], "Show token usage", None),
+        (
+            "effort",
+            &[][..],
+            "Set the provider-neutral reasoning effort hint",
+            Some("[auto|low|medium|high|max]"),
+        ),
         (
             "diff",
             &[][..],
@@ -5435,8 +6823,14 @@ fn available_command_suggestions(
         (
             "mcp",
             &[][..],
-            "Show, reconnect, enable, or disable trusted MCP servers",
-            Some("[status|reconnect|enable|disable <server>]"),
+            "Browse tools or manage trusted MCP servers",
+            Some("[status|tools|reconnect|enable|disable <server>]"),
+        ),
+        (
+            "output-style",
+            &[][..],
+            "Open /config guidance for trusted output styles",
+            None,
         ),
         (
             "model",
@@ -5450,12 +6844,30 @@ fn available_command_suggestions(
             "Inspect or update persistent user permission rules",
             Some("[list|add|remove|clear <allow|ask|deny> [rule|index]]"),
         ),
+        (
+            "plan",
+            &[][..],
+            "Enable plan mode or view the current saved plan",
+            Some("[open|<description>]"),
+        ),
         ("plugin", &[][..], "Show trusted plugin status", None),
+        (
+            "reload-plugins",
+            &[][..],
+            "Activate pending plugin changes in this session",
+            None,
+        ),
         (
             "rename",
             &[][..],
             "Set a private local title for the current session",
             Some("<title>"),
+        ),
+        (
+            "tag",
+            &[][..],
+            "Toggle a searchable local tag on the current session",
+            Some("<tag-name>"),
         ),
         (
             "resume",
@@ -5472,6 +6884,7 @@ fn available_command_suggestions(
         ("sandbox", &[][..], "Show sandbox status", None),
         ("skills", &[][..], "List available Skills", None),
         ("status", &[][..], "Show current session status", None),
+        ("stats", &[][..], "Show local activity statistics", None),
         (
             "statusline",
             &[][..],
@@ -5555,14 +6968,25 @@ fn available_command_suggestions(
             .into_iter()
             .map(ToOwned::to_owned)
             .collect(),
+            "color" => [
+                "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "default",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+            "effort" => ["auto", "low", "medium", "high", "max"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
             "tui" => ["default", "fullscreen"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
-            "mcp" => ["status", "reconnect", "enable", "disable"]
+            "mcp" => ["status", "tools", "reconnect", "enable", "disable"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+            "plan" => ["open"].into_iter().map(ToOwned::to_owned).collect(),
             "permissions" => [
                 "list",
                 "add allow",
@@ -5700,6 +7124,23 @@ fn theme_name(theme: ThemePreset) -> &'static str {
     }
 }
 
+fn normalize_prompt_color(value: &str) -> Result<Option<String>> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(
+        value.as_str(),
+        "default" | "reset" | "none" | "gray" | "grey"
+    ) {
+        return Ok(None);
+    }
+    if matches!(
+        value.as_str(),
+        "red" | "blue" | "green" | "yellow" | "purple" | "orange" | "pink" | "cyan"
+    ) {
+        return Ok(Some(value));
+    }
+    bail!("invalid color; choose red, blue, green, yellow, purple, orange, pink, cyan, or default")
+}
+
 fn save_ui_setting(
     store: Option<&UiSettingsStore>,
     settings: &mut UiSettings,
@@ -5759,6 +7200,48 @@ fn bounded_single_line(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_selector_accepts_uuid_or_unique_exact_title() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let sessions = vec![
+            SessionSummary {
+                id: first,
+                modified_ms: 1,
+                bytes: 10,
+                title: Some("Terminal repair".to_owned()),
+                parent_session_id: None,
+                preview: Some("repair the terminal".to_owned()),
+                color: None,
+                tag: None,
+            },
+            SessionSummary {
+                id: second,
+                modified_ms: 2,
+                bytes: 20,
+                title: Some("MCP audit".to_owned()),
+                parent_session_id: Some(first),
+                preview: Some("audit MCP".to_owned()),
+                color: Some("cyan".to_owned()),
+                tag: Some("audit".to_owned()),
+            },
+        ];
+        assert_eq!(
+            resolve_session_selector(&sessions, &first.to_string()).unwrap(),
+            first
+        );
+        assert_eq!(
+            resolve_session_selector(&sessions, "MCP audit").unwrap(),
+            second
+        );
+        assert!(resolve_session_selector(&sessions, "mcp audit").is_err());
+        assert!(resolve_session_selector(&sessions, &Uuid::new_v4().to_string()).is_err());
+
+        let mut ambiguous = sessions;
+        ambiguous[0].title = Some("MCP audit".to_owned());
+        assert!(resolve_session_selector(&ambiguous, "MCP audit").is_err());
+    }
 
     #[test]
     fn assistant_response_selection_and_export_are_bounded_and_workspace_confined() {

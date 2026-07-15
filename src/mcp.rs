@@ -63,6 +63,7 @@ const MAX_ENV_VARS: usize = 256;
 const MAX_ENV_VALUE_BYTES: usize = 256 * 1024;
 const MAX_LIST_PAGES: usize = 32;
 const MAX_TOOLS_PER_SERVER: usize = 256;
+const MAX_TOOL_NAME_BYTES: usize = 1024;
 const MAX_PROMPTS_PER_SERVER: usize = 256;
 const MAX_RESOURCES: usize = 1024;
 const MAX_RESOURCE_URI_BYTES: usize = 16 * 1024;
@@ -112,6 +113,7 @@ pub struct McpIntegration {
 #[async_trait]
 pub trait McpControl: Send + Sync {
     fn status(&self) -> Vec<McpServerStatus>;
+    async fn list_tools(&self, server: &str) -> Result<Vec<McpToolSummary>>;
     async fn reconnect(&self, server: &str) -> Result<()>;
     async fn enable(&self, server: &str) -> Result<()>;
     async fn disable(&self, server: &str) -> Result<()>;
@@ -129,6 +131,15 @@ pub trait McpControl: Send + Sync {
 pub struct McpServerStatus {
     pub name: String,
     pub status: McpServerStatusKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolSummary {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3278,8 +3289,8 @@ impl McpClient {
                 .get("name")
                 .and_then(Value::as_str)
                 .context("MCP tool definition 缺少 name")?;
-            if original_name.is_empty() || original_name.len() > 1024 {
-                bail!("MCP tool name 为空或超过 1024 字节限制")
+            if original_name.is_empty() || original_name.len() > MAX_TOOL_NAME_BYTES {
+                bail!("MCP tool name 为空或超过 {MAX_TOOL_NAME_BYTES} 字节限制")
             }
             let component = namespace_component(original_name, 64);
             let public_name = format!("mcp__{}__{component}", self.namespace);
@@ -3317,6 +3328,66 @@ impl McpClient {
             }));
         }
         Ok(tools)
+    }
+
+    async fn list_tool_summaries(&self) -> Result<Vec<McpToolSummary>> {
+        if !self.supports_tools {
+            bail!("MCP server {} 未声明 tools capability", self.name)
+        }
+        let values = self
+            .list_paginated("tools/list", "tools", MAX_TOOLS_PER_SERVER)
+            .await?;
+        let mut public_names = HashSet::new();
+        let mut summaries = Vec::with_capacity(values.len());
+        for value in values {
+            let object = value
+                .as_object()
+                .context("MCP tool definition 必须是 object")?;
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .context("MCP tool definition 缺少 name")?;
+            if name.is_empty()
+                || name.len() > MAX_TOOL_NAME_BYTES
+                || name.chars().any(char::is_control)
+            {
+                bail!("MCP tool name 为空、含控制字符或超过 {MAX_TOOL_NAME_BYTES} 字节限制")
+            }
+            let public_name = format!("mcp__{}__{}", self.namespace, namespace_component(name, 64));
+            if !public_names.insert(public_name) {
+                bail!("MCP server {} 的工具名称规范化后冲突", self.name)
+            }
+
+            let description = match object.get("description") {
+                Some(Value::String(description)) => {
+                    if description.len() > MAX_DESCRIPTION_BYTES {
+                        bail!("MCP tool {name} description 超过 {MAX_DESCRIPTION_BYTES} 字节限制")
+                    }
+                    sanitize_text(description, MAX_DESCRIPTION_BYTES)
+                }
+                Some(_) => bail!("MCP tool {name} description 必须是 string"),
+                None => String::new(),
+            };
+            let input_schema = object
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| object_schema(json!({}), &[]));
+            if !input_schema.is_object() {
+                bail!("MCP tool {name} inputSchema 必须是 object")
+            }
+            if serde_json::to_vec(&input_schema)?.len() > MAX_TOOL_SCHEMA_BYTES {
+                bail!("MCP tool {name} inputSchema 超过 {MAX_TOOL_SCHEMA_BYTES} 字节限制")
+            }
+            jsonschema::validator_for(&input_schema)
+                .with_context(|| format!("MCP tool {name} inputSchema 无效"))?;
+            summaries.push(McpToolSummary {
+                server: self.name.clone(),
+                name: name.to_owned(),
+                description,
+                input_schema,
+            });
+        }
+        Ok(summaries)
     }
 
     async fn list_paginated(
@@ -4533,6 +4604,39 @@ impl McpManager {
             .clone()
     }
 
+    fn tool_catalog_client(&self, server: &str) -> Result<Arc<McpClient>> {
+        if server.is_empty()
+            || server.len() > MAX_SERVER_NAME_BYTES
+            || server.chars().any(char::is_control)
+        {
+            bail!("MCP server 名称无效")
+        }
+        let state = self
+            .server_states
+            .get(server)
+            .with_context(|| format!("MCP server {server:?} 不存在"))?;
+        match state.kind {
+            McpServerStateKind::Connected => {}
+            McpServerStateKind::Disabled => {
+                bail!("MCP server {:?} 已禁用", state.name)
+            }
+            McpServerStateKind::Pending
+            | McpServerStateKind::Failed
+            | McpServerStateKind::NeedsAuth => {
+                bail!("MCP server {:?} 未连接", state.name)
+            }
+        }
+        let client = self
+            .clients_snapshot()
+            .into_iter()
+            .find(|client| client.name.eq_ignore_ascii_case(&state.name))
+            .with_context(|| format!("MCP server {:?} 没有可用的已连接 client", state.name))?;
+        if !client.supports_tools {
+            bail!("MCP server {} 未声明 tools capability", client.name)
+        }
+        Ok(client)
+    }
+
     fn insert_connected_client(&self, client: Arc<McpClient>) {
         client.tools_changed.store(true, Ordering::Release);
         let mut clients = self
@@ -4905,6 +5009,12 @@ impl McpManager {
 impl McpControl for McpManager {
     fn status(&self) -> Vec<McpServerStatus> {
         self.server_states.status()
+    }
+
+    async fn list_tools(&self, server: &str) -> Result<Vec<McpToolSummary>> {
+        let client = self.tool_catalog_client(server)?;
+        let _call = client.call_lock.lock().await;
+        client.list_tool_summaries().await
     }
 
     async fn reconnect(&self, server: &str) -> Result<()> {
@@ -5642,14 +5752,29 @@ done
     struct HookTestRpc {
         events: broadcast::Sender<Value>,
         requests: Mutex<Vec<(String, Option<Value>)>>,
+        tools_result: Value,
     }
 
     impl HookTestRpc {
         fn new() -> Self {
+            Self::with_tools(vec![json!({
+                "name":"inspect",
+                "description":"Inspect input",
+                "inputSchema":{
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"],
+                    "additionalProperties":false
+                }
+            })])
+        }
+
+        fn with_tools(tools: Vec<Value>) -> Self {
             let (events, _) = broadcast::channel(4);
             Self {
                 events,
                 requests: Mutex::new(Vec::new()),
+                tools_result: json!({"tools": tools}),
             }
         }
     }
@@ -5662,16 +5787,7 @@ done
                 .await
                 .push((method.to_owned(), params.clone()));
             match method {
-                "tools/list" => Ok(json!({"tools":[{
-                    "name":"inspect",
-                    "description":"Inspect input",
-                    "inputSchema":{
-                        "type":"object",
-                        "properties":{"path":{"type":"string"}},
-                        "required":["path"],
-                        "additionalProperties":false
-                    }
-                }]})),
+                "tools/list" => Ok(self.tools_result.clone()),
                 "tools/call" => Ok(json!({
                     "content":[{"type":"text","text":"hook-called"}],
                     "isError":false
@@ -5699,12 +5815,16 @@ done
         async fn shutdown(&self) {}
     }
 
-    fn hook_test_manager(rpc: Arc<HookTestRpc>) -> McpManager {
+    fn mcp_control_test_manager(
+        rpc: Arc<dyn McpRpc>,
+        supports_tools: bool,
+        state: McpServerStateKind,
+    ) -> McpManager {
         let client = Arc::new(McpClient {
             name: "configured".to_owned(),
             namespace: "configured_ns".to_owned(),
             rpc,
-            supports_tools: true,
+            supports_tools,
             supports_resources: false,
             supports_prompts: false,
             tools_changed: Arc::new(AtomicBool::new(false)),
@@ -5721,12 +5841,16 @@ done
             resource_handles: Arc::new(Mutex::new(ResourceHandleStore::default())),
             server_states: Arc::new(McpServerStates::new(vec![McpServerState {
                 name: "configured".to_owned(),
-                kind: McpServerStateKind::Connected,
+                kind: state,
             }])),
             connection_task: Mutex::new(None),
             strict: true,
             debug: false,
         }
+    }
+
+    fn hook_test_manager(rpc: Arc<HookTestRpc>) -> McpManager {
+        mcp_control_test_manager(rpc, true, McpServerStateKind::Connected)
     }
 
     #[test]
@@ -5779,6 +5903,114 @@ done
                 .collect(),
         );
         assert_eq!(oversized.status().len(), MAX_SERVERS);
+    }
+
+    #[tokio::test]
+    async fn mcp_control_lists_typed_tools_for_connected_capable_server() {
+        let rpc = Arc::new(HookTestRpc::new());
+        let manager = hook_test_manager(rpc.clone());
+        let tools = manager.list_tools("CONFIGURED").await.unwrap();
+        assert_eq!(
+            tools,
+            vec![McpToolSummary {
+                server: "configured".to_owned(),
+                name: "inspect".to_owned(),
+                description: "Inspect input".to_owned(),
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"],
+                    "additionalProperties":false
+                }),
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&tools).unwrap(),
+            json!([{
+                "server":"configured",
+                "name":"inspect",
+                "description":"Inspect input",
+                "inputSchema":{
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"],
+                    "additionalProperties":false
+                }
+            }])
+        );
+        let requests = rpc.requests.lock().await;
+        assert_eq!(requests.as_slice(), [("tools/list".to_owned(), None)]);
+    }
+
+    #[tokio::test]
+    async fn mcp_control_tool_catalog_fails_closed_before_rpc() {
+        let unknown_rpc = Arc::new(HookTestRpc::new());
+        let unknown = hook_test_manager(unknown_rpc.clone());
+        let error = unknown.list_tools("configured_ns").await.unwrap_err();
+        assert!(error.to_string().contains("不存在"), "{error:#}");
+        assert!(unknown_rpc.requests.lock().await.is_empty());
+
+        let disabled_rpc = Arc::new(HookTestRpc::new());
+        let disabled =
+            mcp_control_test_manager(disabled_rpc.clone(), true, McpServerStateKind::Disabled);
+        let error = disabled.list_tools("configured").await.unwrap_err();
+        assert!(error.to_string().contains("已禁用"), "{error:#}");
+        assert!(disabled_rpc.requests.lock().await.is_empty());
+
+        let incapable_rpc = Arc::new(HookTestRpc::new());
+        let incapable =
+            mcp_control_test_manager(incapable_rpc.clone(), false, McpServerStateKind::Connected);
+        let error = incapable.list_tools("configured").await.unwrap_err();
+        assert!(
+            error.to_string().contains("未声明 tools capability"),
+            "{error:#}"
+        );
+        assert!(incapable_rpc.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_control_tool_catalog_rejects_count_and_field_limits() {
+        let too_many = (0..=MAX_TOOLS_PER_SERVER)
+            .map(|index| json!({"name":format!("tool-{index}")}))
+            .collect();
+        let manager = hook_test_manager(Arc::new(HookTestRpc::with_tools(too_many)));
+        let error = manager.list_tools("configured").await.unwrap_err();
+        assert!(error.to_string().contains("超过 256 项限制"), "{error:#}");
+
+        let oversized_name = "n".repeat(MAX_TOOL_NAME_BYTES + 1);
+        let manager = hook_test_manager(Arc::new(HookTestRpc::with_tools(vec![json!({
+            "name": oversized_name
+        })])));
+        let error = manager.list_tools("configured").await.unwrap_err();
+        assert!(error.to_string().contains("tool name"), "{error:#}");
+
+        let oversized_description = "d".repeat(MAX_DESCRIPTION_BYTES + 1);
+        let manager = hook_test_manager(Arc::new(HookTestRpc::with_tools(vec![json!({
+            "name":"oversized-description",
+            "description":oversized_description
+        })])));
+        let error = manager.list_tools("configured").await.unwrap_err();
+        assert!(error.to_string().contains("description 超过"), "{error:#}");
+
+        let oversized_schema_text = "s".repeat(MAX_TOOL_SCHEMA_BYTES);
+        let manager = hook_test_manager(Arc::new(HookTestRpc::with_tools(vec![json!({
+            "name":"oversized-schema",
+            "inputSchema":{"type":"object", "description":oversized_schema_text}
+        })])));
+        let error = manager.list_tools("configured").await.unwrap_err();
+        assert!(error.to_string().contains("inputSchema 超过"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn mcp_control_tool_catalog_rejects_malformed_definitions() {
+        for definition in [
+            json!({"name":"bad-description", "description":false}),
+            json!({"name":"bad-schema", "inputSchema":[]}),
+            json!({"description":"missing name"}),
+        ] {
+            let manager = hook_test_manager(Arc::new(HookTestRpc::with_tools(vec![definition])));
+            assert!(manager.list_tools("configured").await.is_err());
+        }
     }
 
     #[tokio::test]

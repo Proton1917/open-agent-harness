@@ -15,13 +15,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::permissions::UserPermissionRules;
+use crate::{permissions::UserPermissionRules, protocol::ReasoningEffort};
 
 pub const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const MAX_UI_SETTINGS_BYTES: u64 = 64 * 1024;
 pub const MAX_STATUS_LINE_COMMAND_BYTES: usize = 4 * 1024;
 pub const MAX_STATUS_LINE_PADDING: u8 = 16;
 pub const MAX_STATUS_LINE_REFRESH_SECONDS: u64 = 24 * 60 * 60;
+pub const MAX_OUTPUT_STYLE_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -111,6 +112,10 @@ pub struct UiSettings {
     pub syntax_highlighting: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_line: Option<StatusLineConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "UserPermissionRules::is_empty")]
     pub permission_rules: UserPermissionRules,
 }
@@ -124,6 +129,8 @@ impl Default for UiSettings {
             copy_on_select: true,
             syntax_highlighting: true,
             status_line: None,
+            output_style: None,
+            reasoning_effort: None,
             permission_rules: UserPermissionRules::default(),
         }
     }
@@ -133,6 +140,14 @@ impl UiSettings {
     pub fn validate(&self) -> Result<()> {
         if let Some(status_line) = &self.status_line {
             status_line.validate()?;
+        }
+        if let Some(output_style) = &self.output_style {
+            validate_output_style(output_style)?;
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            if ReasoningEffort::parse(effort)?.is_none() {
+                bail!("reasoningEffort must be low, medium, high, or max when persisted")
+            }
         }
         self.permission_rules.validate()?;
         Ok(())
@@ -160,6 +175,18 @@ impl UiSettings {
                 next.syntax_highlighting = value
                     .parse::<bool>()
                     .context("syntaxHighlighting must be true or false")?;
+            }
+            "outputStyle" => {
+                next.output_style = if matches!(value.trim(), "default" | "null" | "none") {
+                    None
+                } else {
+                    validate_output_style(value)?;
+                    Some(value.to_owned())
+                };
+            }
+            "reasoningEffort" => {
+                next.reasoning_effort =
+                    ReasoningEffort::parse(value)?.map(|effort| effort.as_str().to_owned());
             }
             "statusLine" => {
                 next.status_line = if value.trim() == "null" {
@@ -217,6 +244,17 @@ impl UiSettings {
         *self = next;
         Ok(())
     }
+}
+
+fn validate_output_style(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.len() > MAX_OUTPUT_STYLE_NAME_BYTES
+        || value.chars().any(char::is_control)
+    {
+        bail!("outputStyle is empty, too long, padded, or contains control characters")
+    }
+    Ok(())
 }
 
 fn parse_permission_rule_array(value: &str, key: &str) -> Result<Vec<String>> {
@@ -326,6 +364,14 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     UiSettingSpec {
         key: "copyOnSelect",
         value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "outputStyle",
+        value_kind: UiSettingValueKind::Text,
+    },
+    UiSettingSpec {
+        key: "reasoningEffort",
+        value_kind: UiSettingValueKind::Text,
     },
     UiSettingSpec {
         key: "statusLine",
@@ -737,6 +783,8 @@ mod tests {
                 refresh_interval: Some(30),
                 hide_vim_mode_indicator: true,
             }),
+            output_style: Some("plugin:brief".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
             permission_rules: UserPermissionRules {
                 allow: vec!["Bash(cargo test:*)".to_owned()],
                 ask: vec!["Write(**)".to_owned()],

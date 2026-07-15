@@ -88,6 +88,96 @@ async fn compact_replaces_history_with_formatted_continuation() {
 }
 
 #[tokio::test]
+async fn compact_from_preserves_the_selected_prefix_and_summarizes_only_the_suffix() {
+    const PREFIX: &str = "prefix-must-remain-byte-for-byte";
+    const SELECTED: &str = "selected-suffix-only";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request: Value = serde_json::from_slice(&read_http_body(&mut stream)).unwrap();
+        let serialized = request.to_string();
+        assert!(!serialized.contains(PREFIX));
+        assert!(serialized.contains(SELECTED));
+        write_sse_response(&mut stream, &summary_stream());
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let prefix = vec![
+        Message::user_text(PREFIX),
+        Message::assistant(vec![
+            serde_json::json!({"type":"text","text":"prefix reply"}),
+        ]),
+    ];
+    let original = [
+        prefix.clone(),
+        vec![
+            Message::user_text(SELECTED),
+            Message::assistant(vec![
+                serde_json::json!({"type":"text","text":"suffix reply"}),
+            ]),
+        ],
+    ]
+    .concat();
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 4096,
+            system: "test system".into(),
+            messages: original.clone(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+
+    let stats = engine.compact_from(2, None).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(stats.messages_before, 4);
+    assert_eq!(stats.messages_after, 3);
+    assert_eq!(engine.messages[..2], prefix);
+    assert!(
+        engine.messages[2]
+            .content
+            .as_str()
+            .unwrap()
+            .contains("Current work preserved")
+    );
+
+    let before_invalid = engine.messages.clone();
+    assert!(
+        engine
+            .compact_from(before_invalid.len(), None)
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.messages, before_invalid);
+}
+
+#[tokio::test]
 async fn query_auto_compacts_before_normal_model_round() {
     const CURRENT_PROMPT: &str = "current-prompt-must-remain-verbatim";
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

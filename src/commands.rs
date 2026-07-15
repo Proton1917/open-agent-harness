@@ -55,12 +55,20 @@ const RESERVED_COMMANDS: &[&str] = &[
     "mcp",
     "sandbox",
     "plugin",
+    "reload-plugins",
     "help",
     "add-dir",
     "files",
     "rename",
+    "tag",
     "branch",
     "agents",
+    "plan",
+    "btw",
+    "stats",
+    "output-style",
+    "color",
+    "effort",
 ];
 
 const DEFAULT_LOOP_MINUTES: u64 = 10;
@@ -256,8 +264,14 @@ pub enum CommandOutcome {
     AddDirectory(String),
     ShowFiles(String),
     RenameSession(String),
+    TagSession(String),
     BranchSession(String),
     ShowAgents,
+    Plan(String),
+    SideQuestion(String),
+    ShowStats,
+    ConfigureColor(String),
+    ConfigureEffort(String),
     TerminalSetup,
     ConfigureUi(String),
     ConfigureTheme(String),
@@ -276,6 +290,7 @@ pub enum CommandOutcome {
     ManageMcp(String),
     ShowSandbox,
     ShowPlugins,
+    ReloadPlugins,
     Submit(String),
     NotCommand,
 }
@@ -326,8 +341,20 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
         "/add-dir" => CommandOutcome::AddDirectory(argument.to_owned()),
         "/files" => CommandOutcome::ShowFiles(argument.to_owned()),
         "/rename" => CommandOutcome::RenameSession(argument.to_owned()),
+        "/tag" => CommandOutcome::TagSession(argument.to_owned()),
         "/branch" => CommandOutcome::BranchSession(argument.to_owned()),
         "/agents" => CommandOutcome::ShowAgents,
+        "/plan" => CommandOutcome::Plan(argument.to_owned()),
+        "/btw" => CommandOutcome::SideQuestion(argument.to_owned()),
+        "/stats" => CommandOutcome::ShowStats,
+        "/color" => CommandOutcome::ConfigureColor(argument.to_owned()),
+        "/effort" => CommandOutcome::ConfigureEffort(argument.to_owned()),
+        "/output-style" => {
+            println!(
+                "/output-style is deprecated. Use /config and choose Output style; changes apply on the next session."
+            );
+            CommandOutcome::Handled
+        }
         "/context" => {
             let (used, auto_threshold, effective_window) = engine.context_status();
             println!(
@@ -363,6 +390,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
         "/mcp" => CommandOutcome::ManageMcp(argument.to_owned()),
         "/sandbox" => CommandOutcome::ShowSandbox,
         "/plugin" => CommandOutcome::ShowPlugins,
+        "/reload-plugins" => CommandOutcome::ReloadPlugins,
         "/help" => CommandOutcome::ShowHelp,
         _ => {
             eprintln!("Unknown command: {command}");

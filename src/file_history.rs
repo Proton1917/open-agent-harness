@@ -750,6 +750,27 @@ impl FileHistory {
         Ok(destination)
     }
 
+    /// Removes private file-history state belonging to a just-created failed
+    /// fork. Callers must provide the exact generated session id.
+    pub fn discard_failed_fork(&self, expected_session_id: Uuid) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.session_id != expected_session_id {
+            bail!("refusing to discard file history for a different session")
+        }
+        let metadata = fs::symlink_metadata(&self.directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("refusing to discard symlink or non-directory file history")
+        }
+        let manifest = self.load_manifest()?;
+        if manifest.session_id != expected_session_id {
+            bail!("failed fork file-history manifest has the wrong session id")
+        }
+        fs::remove_dir_all(&self.directory)?;
+        Ok(())
+    }
+
     fn prepare_changes(
         &self,
         manifest: &Manifest,
@@ -2186,6 +2207,22 @@ mod tests {
         );
         fork.rewind(checkpoint).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn failed_fork_cleanup_requires_exact_ownership_and_preserves_the_source() {
+        let (_workspace, _storage, history) = history();
+        let fork_id = Uuid::new_v4();
+        let fork = history.fork(fork_id).unwrap();
+        let fork_directory = fork.directory.clone();
+        let source_directory = history.directory.clone();
+
+        assert!(fork_directory.is_dir());
+        assert!(fork.discard_failed_fork(Uuid::new_v4()).is_err());
+        assert!(fork_directory.is_dir());
+        fork.discard_failed_fork(fork_id).unwrap();
+        assert!(!fork_directory.exists());
+        assert!(source_directory.is_dir());
     }
 
     #[test]

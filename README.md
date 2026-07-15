@@ -6,12 +6,13 @@
 
 An open, provider-neutral coding-agent harness written in Rust.
 
-The compatibility target is the provider-neutral general behavior visible in
-the static 2026-03-31 comparison snapshot, plus selected provider-neutral
-extensions identified in a later checksummed archive review. This is an
-independent behavioral implementation: it does not claim identical source
-structure, prompts, wording, assets, account behavior, or vendor-specific
-features.
+The compatibility target is the provider-neutral general behavior in the
+source-available 2026-03-31 snapshot, plus selected provider-neutral backend
+extensions identified in a later checksummed archive review. The interactive
+CLI frontend is designed only from that source-available snapshot; the later
+archive is not frontend evidence. This is an independent behavioral
+implementation: it does not claim identical source structure, prompts,
+wording, assets, account behavior, or vendor-specific features.
 
 Its reason for existing fits in one sentence: the core machinery of a coding agent is neither complicated nor mysterious, and any attempt to turn it into proprietary property—lashed to one company’s API and account system—is an enclosure of developers. Anthropic has done exactly that, and with unusual thoroughness. It locked ordinary engineering practice inside a closed binary, then added another checkpoint to the chain: inspect where your IP comes from, inspect the country code of your phone number, and decide whether you qualify as a member of “humanity.”
 
@@ -23,22 +24,24 @@ This repository is our answer. It has no account system, and therefore nobody to
 
 ### Current implementation status
 
-The declared provider-neutral surface has now been aligned against the static
-2026-03-31 comparison snapshot and supplemented with the generally useful open
-features identified in the checksummed 2.1.207 archive review. This includes
-the transactional model/tool loop, permission and filesystem boundaries,
-sessions and control streaming, local agents and teams, Skills and plugins,
-hooks, MCP/OAuth/WebSocket, LSP, scheduling, monitoring, declarative workflows,
-media, structured interaction, and opt-in local memory.
+The declared provider-neutral surface has now been aligned against the
+source-available 2026-03-31 snapshot. Selected generally useful backend
+features were additionally checked against a later archive, but terminal
+layout, input, rendering, keys, dialogs, and slash behavior use the March 31
+source only. The open surface includes the transactional model/tool loop,
+permission and filesystem boundaries, sessions and control streaming, local
+agents and teams, Skills and plugins, hooks, MCP/OAuth/WebSocket, LSP,
+scheduling, monitoring, declarative workflows, media, structured interaction,
+and opt-in local memory.
 
-The release gate currently contains 776 test entries: 772 pass and four are
-intentionally ignored helper-process entry points exercised by their parent
-tests. Formatting, Rust 1.85 all-target checks, Clippy with warnings denied,
-the release build, the repository audit, and the Windows GNU cross-check all
-pass; the same test and Clippy gate also runs natively on macOS and Windows in
-CI. The exact behavior matrix, evidence, and deliberate exclusions are in
+Formatting, Rust 1.85 all-target checks, all-target tests, Clippy with warnings
+denied, the release build, and the repository audit form the local release
+gate; the same test and Clippy gate runs natively on Linux, macOS, and Windows
+in CI. The exact behavior matrix, evidence, and deliberate exclusions are in
 [the migration audit](MIGRATION.md) and the
-[provider-neutral parity audit](docs/GENERIC_PARITY_2026-03-31.md). This status
+[provider-neutral parity audit](docs/GENERIC_PARITY_2026-03-31.md), with the
+frontend authority recorded in
+[the March 31 source audit](docs/TERMINAL_FRONTEND_AUDIT_2026-03-31.md). This status
 does not weaken the criticism above and does not turn behavioral compatibility
 into a claim that proprietary source, prompts, assets, accounts, or hosted
 services were copied.
@@ -56,11 +59,15 @@ At its heart, an agent is a loop: the model requests a tool, the harness execute
 
 The interactive CLI is an original Rust implementation of the conversational terminal pattern: scrollback remains ordinary terminal history, while a bordered composer stays at the bottom of each input turn. Its raw-mode frames use explicit CRLF, a single buffered write, and synchronized-output markers where supported; resize repaints only the owned composer instead of erasing the visible conversation, input height is viewport-bounded, and Ctrl-G or Unix job-control suspend restores raw/alternate-screen state before handing the terminal away. Editing is grapheme-aware for CJK, combining marks, flags, and ZWJ emoji, with multiline navigation, private persistent history, `Ctrl-R` reverse search, `Ctrl-S` session/project/everywhere scope cycling, a bounded kill ring and `Alt-Y`, undo, prompt stash, external-editor handoff, and the usual Ctrl/Option word and line operations. Hot-reloaded user keybindings support contexts, chords, and explicit unbinding; `/vim` supplies Insert, Normal, Visual, and Visual Line editing without changing the non-TTY protocol. `\`+Enter, Shift/Option+Enter, and `Ctrl-J` insert a newline. `Shift+Tab` cycles the safe interactive modes without ever entering bypass mode. Double Esc saves a nonempty draft before clearing it and opens checkpoint rewind from an empty composer. The `Ctrl-C`/`Ctrl-D` double-press window is 800 ms; nonempty `Ctrl-D` forward-deletes one grapheme. A permission prompt can allow once, deny, interrupt, or remember only the exact normalized action for the current process; it shows bounded action/edit-diff summaries plus the complete exact JSON, while deny rules and Plan mode still win. Non-TTY input keeps the plain line protocol, and `--print` retains its exact machine-readable formats.
 
-Typing `/` immediately opens a bounded command palette assembled from built-ins, trusted custom commands, current user-invocable Skills, and namespaced prompts advertised by connected MCP servers. Further typing filters the list; Up/Down or Ctrl-N/Ctrl-P wraps selection, Tab completes without executing, Enter accepts (argument-taking entries wait for arguments), and Esc dismisses the palette until the input changes. At most six centered suggestions are painted in the normal composer, including trusted dynamic argument candidates. The live catalog includes status, task, Skill, hook, memory, MCP, sandbox and plugin views plus `/doctor`, `/terminal-setup`, `/diff`, `/rewind`, `/resume`, `/rename`, `/branch`, `/transcript`, `/config`, `/theme`, `/statusline`, `/copy`, and `/export`; `/model` or Alt-P opens a provider-neutral picker sized to the current terminal. The theme picker covers auto, dark/light, daltonized and ANSI variants, previews a bounded diff sample, toggles syntax highlighting with Ctrl-T, and rolls back on Escape. A trusted status line refreshes asynchronously when model/mode/Vim state changes and at its configured idle interval. `Ctrl-O` opens a bounded alternate-screen transcript with compact/show-all views, scrolling, case-insensitive regex search, per-occurrence match navigation, and an explicit dump back to native scrollback. Assistant Markdown is rendered from a control-sanitized structured IR with headings, lists, quotes, fenced code, bounded tables, optional syntax highlighting and credential-free HTTP(S) links; fullscreen clicks can open those links, expand bounded tool output, or open a canonical file only when it remains inside a trusted workspace. `/tui` enters a bounded full-screen transcript with mouse and grapheme-aware keyboard scrolling/selection plus native or bounded OSC 52 clipboard copy while preserving the primary terminal screen. `/permissions`, `/config`, and `/tasks` open searchable alternate-screen dialogs; permission changes persist only in private user settings, while task stop/output actions still pass through the tool boundary. Clipboard image paste creates bounded navigable attachments. Typing `@` opens an ignore-aware workspace-file picker with prefix, basename, substring and fuzzy ranking, including correct whole-token replacement when the cursor is in the middle of a quoted or unquoted reference. Quoted paths and optional `#Lstart-Lend` line ranges are accepted, while explicit text and media attachment totals remain bounded. `/mcp enable|disable|reconnect <server>` changes only already trusted server definitions and refreshes discovery. `/clear` first archives the current conversation; `/copy [N]` copies a bounded assistant response, and `/export [file]` exports public transcript content without private reasoning or silent overwrite.
+Typing `/` immediately opens a bounded command palette assembled from built-ins, trusted custom commands, current user-invocable Skills, and namespaced prompts advertised by connected MCP servers. Further typing filters the list; Up/Down or Ctrl-N/Ctrl-P wraps selection, Tab completes without executing, Enter accepts (argument-taking entries wait for arguments), and Esc dismisses the palette until the input changes. Slash tokens later in ordinary prompt text receive non-executing Tab/Right completion. At most six centered suggestions are painted in the normal composer, including trusted dynamic argument candidates. The live catalog includes status, task, Skill, hook, memory, MCP, sandbox and plugin views plus `/doctor`, `/terminal-setup`, `/diff`, `/rewind`, `/resume`, `/rename`, `/tag`, `/branch`, `/transcript`, `/config`, `/theme`, `/statusline`, `/copy`, and `/export`; `/model` or Alt-P opens a provider-neutral picker sized to the current terminal. The theme picker covers auto, dark/light, daltonized and ANSI variants, previews a bounded diff sample, toggles syntax highlighting with Ctrl-T, and rolls back on Escape. A trusted status line refreshes asynchronously when model/mode/Vim state changes and at its configured idle interval. `Ctrl-O` opens a bounded alternate-screen transcript with compact/show-all views, scrolling, case-insensitive regex search, per-occurrence match navigation, and an explicit dump back to native scrollback. Assistant Markdown is rendered from a control-sanitized structured IR with headings, lists, quotes, fenced code, bounded tables, optional syntax highlighting and credential-free HTTP(S) links; parallel tools, retries, elapsed/stalled state, and multiline failures stay visible through bounded render paths. Fullscreen clicks can open safe links, expand bounded tool output, or open a canonical file only when it remains inside a trusted workspace. `/tui` enters a bounded full-screen transcript with mouse and grapheme-aware keyboard scrolling/selection plus native or bounded OSC 52 clipboard copy while preserving the primary terminal screen. `/permissions`, `/config`, `/tasks`, and `/mcp` expose searchable typed dialogs; permission changes persist only in private user settings, while task stop/output actions still pass through the tool boundary. Clipboard image paste creates bounded navigable attachments. Long text paste strips ANSI, expands tabs, and remains a compact `[Pasted text #N ...]` reference in the composer while the full text is restored for submission. Typing `@` opens an ignore-aware workspace-file picker with prefix, basename, substring and fuzzy ranking, including correct whole-token replacement when the cursor is in the middle of a quoted or unquoted reference. Quoted paths and optional `#Lstart-Lend` line ranges are accepted, while explicit text and media attachment totals remain bounded. `/mcp enable|disable|reconnect <server>` changes only already trusted server definitions and refreshes discovery. `/clear` first archives the current conversation; `/resume` searches compatible local worktrees; `/rewind` can restore or summarize from a selected message boundary; `/copy [N]` copies a bounded assistant response, and `/export [file]` exports public transcript content without private reasoning or silent overwrite.
 
 An input beginning with `!` uses a distinct shell composer and runs through the same schema, hook, permission, sandbox, timeout, capture, and process-tree path as the Bash tool; unlike the proprietary product, it never bypasses the user's permission policy. Its bounded output is shown and supplied to the next model turn, Tab completes from this session's shell history, and idle composers now yield to ready scheduled prompts while stashing a draft for `Ctrl-S` recovery. Stream-JSON clients execute every advertised built-in slash command locally and receive structured `command_result` events instead of accidentally sending `/clear`, `/status`, or `/rewind` to the model.
 
-The interface follows observable terminal behavior, not copied code or assets. There is no JavaScript renderer hiding behind the binary: input editing, cursor control, event rendering, interruption, and mode state live in `src/terminal.rs`, while engine events come from `src/query.rs`.
+The interface is an original Rust implementation guided exclusively by the
+source-available March 31 frontend behavior, not copied code or assets and not
+the later archive. There is no JavaScript renderer hiding behind the binary:
+input editing, cursor control, event rendering, interruption, and mode state
+live in `src/terminal.rs`, while engine events come from `src/query.rs`.
 
 ### Endpoint: loyal to no server, aware of no border
 
@@ -181,12 +188,11 @@ processes. MCP elicitation serializes that server's RPC reader while it waits.
 Headless and direct local TTY interaction share a configured ceiling of at most
 120 seconds, and timeout does not leave a detached stdin reader. See
 [the March 31 behavior audit](docs/GENERIC_PARITY_2026-03-31.md) for the exact
-non-claims. The primary terminal stream still does not claim the reference's
-rich Markdown/table/syntax renderer, clickable file/URL/tool-result regions,
-persistent `/permissions` rule editor, live task-tree footer/dialog, custom
-themes, or pixel-identical modal layout; those remaining frontend boundaries
-are tracked in
-[the 2.1.207 terminal audit](docs/TERMINAL_FRONTEND_AUDIT_2_1_207.md).
+non-claims. The terminal implements the declared generic Markdown, trusted
+actions, permission/task dialogs, and theme surfaces, but still does not claim
+custom proprietary themes, brand styling, exact wording/layout, or pixel
+identity. The frontend evidence and boundaries are tracked in
+[the March 31 source audit](docs/TERMINAL_FRONTEND_AUDIT_2026-03-31.md).
 
 Executable and network integrations are accepted only from `~/.open-agent-harness/settings.json` or an explicit `--settings` value. A repository cannot smuggle them in through its own settings file. A compact example:
 
@@ -347,7 +353,7 @@ MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discriminati
 
 一个开放、提供方无关的 Rust coding-agent harness。
 
-兼容目标是静态 2026-03-31 对照快照中可观察的、提供方无关的通用行为，并补入后续校验归档审校中确认的精选通用扩展。这是一套独立的行为实现，不声称源码结构、提示词、措辞、资产、账号行为或厂商专属功能完全一致。
+兼容目标是有源码的 2026-03-31 快照中提供方无关的通用行为，并补入后续校验归档审校中确认的精选通用后端扩展。交互 CLI 前端只以该源码快照为设计依据，后续归档不作为前端证据。这是一套独立的行为实现，不声称源码结构、提示词、措辞、资产、账号行为或厂商专属功能完全一致。
 
 它存在的理由可以用一句话说完：coding agent 的核心机制不复杂，也不神秘，任何把它包装成专有资产、绑死在自家 API 和账号体系上的行为，都是对开发者的圈占。Anthropic 就是这么干的——而且干得比谁都彻底。它不仅把最普通的工程实践锁进闭源二进制，还给这套锁链加了一道额外的检查：看你的 IP 来自哪里，看你的手机号是哪国区号，然后决定你配不配当“人类”的一员。
 
@@ -359,9 +365,9 @@ MIT. See [LICENSE](LICENSE). For anyone, anywhere on Earth, without discriminati
 
 ## 当前实现状态
 
-当前声明的 provider-neutral 能力已经按静态 2026-03-31 对照快照完成一致化，并补入 2.1.207 校验归档审校中确认的、具有通用价值的开放功能。覆盖范围包括事务式模型/工具循环、权限与文件系统边界、session 与 control stream、本地 agent/team、Skill/plugin、hook、MCP/OAuth/WebSocket、LSP、调度、Monitor、声明式 Workflow、媒体、结构化交互以及显式开启的本地 memory。
+当前声明的 provider-neutral 能力已经按有源码的 2026-03-31 快照完成一致化。后续归档只用于补充核查通用后端能力；终端布局、输入、渲染、按键、对话框和 slash 交互全部以 3.31 源码为准。覆盖范围包括事务式模型/工具循环、权限与文件系统边界、session 与 control stream、本地 agent/team、Skill/plugin、hook、MCP/OAuth/WebSocket、LSP、调度、Monitor、声明式 Workflow、媒体、结构化交互以及显式开启的本地 memory。
 
-当前 release gate 共 776 个测试项：772 项通过，4 个是由父测试实际调用、按设计 ignored 的子进程入口。格式检查、Rust 1.85 all-targets、Clippy 零警告、release 构建、仓库审计和 Windows GNU 交叉检查全部通过；同一套测试与 Clippy gate 也在 CI 中原生运行于 macOS 和 Windows。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)与[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
+本地 release gate 包括格式检查、Rust 1.85 all-targets、全目标测试、Clippy 零警告、release 构建和仓库审计；同一套测试与 Clippy gate 会在 CI 中原生运行于 Linux、macOS 和 Windows。精确能力矩阵、验证证据和明确排除项见[迁移审计](MIGRATION.md)、[通用行为审校报告](docs/GENERIC_PARITY_2026-03-31.md)与[3.31 源码前端审校](docs/TERMINAL_FRONTEND_AUDIT_2026-03-31.md)。这一状态说明不会削弱上面的批评，也不把行为兼容偷换成复制专有源码、提示词、资产、账号体系或托管服务。
 
 ## 消息循环
 
@@ -376,11 +382,11 @@ Agent 的核心就是一个循环：模型请求工具，harness 执行，结果
 
 交互 CLI 是一套原创 Rust 会话终端：历史内容留在正常 scrollback 中，每轮输入使用带上下边框的 composer。raw mode 帧显式使用 CRLF 与单次缓冲写入，支持时启用 synchronized output；resize 只重绘自己占用的 composer，不再清掉屏幕上的会话，输入高度受 viewport 约束。编辑按 grapheme 处理 CJK、组合字符、旗帜和 ZWJ emoji，支持多行移动、私有持久化历史、`Ctrl-R` 反向搜索、`Ctrl-S` 在 session/project/everywhere 间切换范围、有界 kill ring 与 `Alt-Y`、undo、prompt stash、外部编辑器，以及常用 Ctrl/Option 词级与行级操作。用户 keybinding 支持热重载、context、chord 与显式解绑；`/vim` 提供 Insert、Normal、Visual 和 Visual Line 编辑，同时不改变非 TTY 协议。`\`+Enter、Shift/Option+Enter 与 `Ctrl-J` 都能换行。`Shift+Tab` 只在安全交互模式之间循环；双 Esc 会先把非空草稿存入历史再清空，空输入时则进入 checkpoint rewind；`Ctrl-C`/`Ctrl-D` 的双击窗口为 800ms，非空 `Ctrl-D` 向前删除一个 grapheme。权限提示可选择仅允许一次、拒绝、中断，或只在当前进程记住同一个精确规范化动作；deny 与 Plan mode 始终优先。非 TTY 仍使用朴素行协议，`--print` 的机器可读格式保持不变。
 
-输入第一个 `/` 就会立即打开有界命令面板，来源包括内置命令、可信 custom command 和当前可由用户调用的 Skill；继续输入会过滤，方向键或 Ctrl-N/Ctrl-P 循环选择，Tab 只补全不执行，Enter 接受（需要参数的 Skill 会等待参数），Esc 在输入再次变化前关闭面板。实时目录包含 status、task、Skill、hook、memory、MCP、sandbox、plugin 视图以及 `/diff`、`/rewind`、`/resume`、`/transcript`、`/config`、`/theme`、`/statusline`、`/copy`、`/export`；`/model` 或 Alt-P 进入会按终端高度收缩的提供方无关模型选择器。`Ctrl-O` 打开有界 alternate-screen transcript，支持 compact/show-all、滚动、搜索、跳转匹配和显式倒回原生 scrollback；`/tui` 则进入有界全屏 transcript，支持鼠标/键盘滚动、选择和复制，并恢复原主屏。`Ctrl-T` 同时显示 persistent task、后台工作和 cron，`/tasks output|stop <id>` 可查看或停止指定后台项；从剪贴板粘贴图片会形成有界且可导航的附件。输入 `@` 会打开遵循 ignore 规则的工作区文件选择器并沿用相同键盘流程；光标停在带引号或不带引号的 token 中间时也会替换完整 token，不再残留重复后缀。支持可选 `#Lstart-Lend` 行范围，显式文本与 media 附件总量仍有硬上限。`/clear` 会先归档当前会话；`/copy [N]` 复制有界 assistant 回复，`/export [file]` 只导出公开 transcript，不包含私有 reasoning，也不会静默覆盖已有文件。
+输入第一个 `/` 就会立即打开有界命令面板，来源包括内置命令、可信 custom command、当前可由用户调用的 Skill 与已连接 MCP prompt；继续输入会过滤，方向键或 Ctrl-N/Ctrl-P 循环选择，Tab 只补全不执行，Enter 接受（需要参数的条目会等待参数），Esc 在输入再次变化前关闭面板。普通 prompt 中间出现的 slash token 也可用 Tab/右方向键补全，但不会被执行。实时目录包含 status、task、Skill、hook、memory、MCP、sandbox、plugin 视图以及 `/diff`、`/rewind`、`/resume`、`/rename`、`/tag`、`/branch`、`/transcript`、`/config`、`/theme`、`/statusline`、`/copy`、`/export`；`/model` 或 Alt-P 进入会按终端高度收缩的提供方无关模型选择器。`Ctrl-O` 打开有界 alternate-screen transcript，支持 compact/show-all、滚动、搜索、跳转匹配和显式倒回原生 scrollback；流式 Markdown、并行工具、请求重试、耗时/停滞状态和多行错误都通过有界安全路径显示。`/tui` 进入有界全屏 transcript，支持鼠标/键盘滚动、选择和复制，并恢复原主屏。`Ctrl-T` 同时显示 persistent task、后台工作和 cron，`/tasks output|stop <id>` 可查看或停止指定后台项；从剪贴板粘贴图片会形成有界且可导航的附件。长文本粘贴会去掉 ANSI、把 Tab 展开为四个空格，并在 composer 中保留紧凑的 `[Pasted text #N ...]` 引用，提交时才还原完整内容。输入 `@` 会打开遵循 ignore 规则的工作区文件选择器并沿用相同键盘流程；光标停在带引号或不带引号的 token 中间时也会替换完整 token，不再残留重复后缀。支持可选 `#Lstart-Lend` 行范围，显式文本与 media 附件总量仍有硬上限。`/clear` 会先归档当前会话；`/resume` 可搜索兼容 worktree；`/rewind` 可从选定消息边界恢复或总结；`/copy [N]` 复制有界 assistant 回复，`/export [file]` 只导出公开 transcript，不包含私有 reasoning，也不会静默覆盖已有文件。
 
 以 `!` 开头会进入独立 shell composer，并复用 Bash 工具的 schema、hook、权限、sandbox、timeout、capture 与进程树回收链路；它不会像专有产品那样绕开用户权限策略。输出会有界显示并进入下一轮模型上下文，Tab 从本会话 shell 历史补全；定时任务就绪时，空闲 composer 会让出执行权，并把正在写的草稿 stash 起来供 `Ctrl-S` 恢复。Stream-JSON 客户端现在也会在本地执行所有已公布的内置 slash 命令并收到结构化 `command_result`，不会再把 `/clear`、`/status` 或 `/rewind` 错送给模型。
 
-这里复刻的是可观察的终端行为，不是专有代码或资产。二进制背后没有藏着 JavaScript renderer：输入编辑、光标控制、事件渲染、中断和模式状态都在 `src/terminal.rs`，引擎事件来自 `src/query.rs`。
+这里是严格以 3.31 有源码前端行为为依据的原创 Rust 实现，不复制专有代码或资产，也不以 2.1.207 归档推导前端。二进制背后没有藏着 JavaScript renderer：输入编辑、光标控制、事件渲染、中断和模式状态都在 `src/terminal.rs`，引擎事件来自 `src/query.rs`。
 
 ## Endpoint：不效忠任何服务器，不识别任何国界
 

@@ -90,6 +90,57 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
 }
 
 #[test]
+fn composer_collapses_large_paste_expands_on_submit_and_completes_mid_input_slash() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+    terminal.write_all(b"please /mo").unwrap();
+    let hinted = read_until(
+        &mut terminal,
+        "Tab/Right completes /model",
+        Duration::from_secs(3),
+    );
+    assert!(hinted.contains("please /mo"));
+    terminal.write_all(b"\t").unwrap();
+    let completed = read_until(&mut terminal, "please /model", Duration::from_secs(3));
+    assert!(completed.contains("Completed /model"));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+
+    let pasted = format!("/tag {}", "x".repeat(801));
+    terminal.write_all(b"\x1b[200~").unwrap();
+    terminal.write_all(pasted.as_bytes()).unwrap();
+    terminal.write_all(b"\x1b[201~").unwrap();
+    let collapsed = read_until(&mut terminal, "[Pasted text #1]", Duration::from_secs(3));
+    assert!(collapsed.contains("Large paste collapsed"));
+
+    terminal.write_all(b"\r").unwrap();
+    let rejected = read_until(
+        &mut terminal,
+        "Session tag unchanged:",
+        Duration::from_secs(3),
+    );
+    assert!(
+        rejected.contains("Session tag unchanged:"),
+        "expanded slash command was not dispatched: {rejected}"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    drop(terminal);
+    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+}
+
+#[test]
 fn composer_restores_terminal_around_job_control_suspend() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
@@ -291,7 +342,9 @@ fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
     let (mut child, mut terminal) = spawn_terminal(&[]);
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
 
-    terminal.write_all(b"/statusline cat\r").unwrap();
+    terminal
+        .write_all(b"/statusline grep -o '\"permissionMode\":\"[^\"]*\"'\r")
+        .unwrap();
     let mut configured = read_until(
         &mut terminal,
         "Status line configured from trusted user settings.",
@@ -398,8 +451,8 @@ fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
 
     terminal.write_all(b"/status\r").unwrap();
     let status = read_until(&mut terminal, "Session status:", Duration::from_secs(3));
-    if !status.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !status.contains("/ commands") {
+        let _ = read_until(&mut terminal, "/ commands", Duration::from_secs(3));
     }
     terminal.write_all(b"\x12").unwrap();
     let search = read_until(&mut terminal, "reverse-i-search", Duration::from_secs(3));
@@ -432,7 +485,11 @@ fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
     let viewer = read_until(&mut terminal, "transcript", Duration::from_secs(3));
     assert!(viewer.contains("Transcript is empty."));
     terminal.write_all(b"q").unwrap();
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let _ = read_until(
+        &mut terminal,
+        "Returned from transcript",
+        Duration::from_secs(3),
+    );
 
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(

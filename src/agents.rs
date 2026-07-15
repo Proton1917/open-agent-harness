@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::{
     api::ModelClient,
     config::Settings,
+    protocol::ReasoningEffort,
     query::{QueryEngine, QueryOptions},
     tools::{
         AsyncOwner, Tool, ToolContext, ToolOutput, ToolRegistry, atomic_write_private,
@@ -375,6 +376,7 @@ pub(crate) struct AgentRuntime {
     client: ModelClient,
     registry: ToolRegistry,
     model: RwLock<String>,
+    effort: RwLock<Option<ReasoningEffort>>,
     max_tokens: u32,
     system: String,
     debug: bool,
@@ -539,6 +541,7 @@ impl AgentRuntime {
             client,
             registry,
             model: RwLock::new(model),
+            effort: RwLock::new(None),
             max_tokens,
             system,
             debug,
@@ -576,6 +579,13 @@ impl AgentRuntime {
             .model
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = model;
+    }
+
+    pub(crate) fn set_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
+        *self
+            .effort
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = effort;
     }
 
     fn default_model(&self) -> String {
@@ -1346,8 +1356,14 @@ impl AgentRuntime {
             system.push_str("\n</subagent-start-hook-context>");
         }
         let descendant_owner = context.async_owner();
+        let mut client = self.client.clone();
+        let effort = *self
+            .effort
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.set_effort(effort);
         let mut engine = QueryEngine::new(
-            self.client.clone(),
+            client,
             registry,
             context,
             QueryOptions {
@@ -1360,6 +1376,7 @@ impl AgentRuntime {
                 compact_config: None,
             },
         );
+        engine.set_reasoning_effort(effort);
         if let Some(custom_agent) = &custom_agent {
             engine.set_max_tool_rounds(custom_agent.max_turns)?;
         }

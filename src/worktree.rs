@@ -147,6 +147,35 @@ pub struct RestoredWorkspace {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryWorktree {
+    pub cwd: PathBuf,
+    pub root: PathBuf,
+}
+
+/// Returns the current repository's registered worktrees, preserving the
+/// launch directory's relative subdirectory when it exists in another
+/// worktree. This is a read-only discovery surface used by `/resume`.
+pub async fn same_repository_worktrees(context: &ToolContext) -> Result<Vec<RepositoryWorktree>> {
+    let cwd = std::fs::canonicalize(context.cwd())?;
+    let scrubber = context.secret_env_scrubber();
+    let repo_root = repository_root(&cwd, &scrubber).await?;
+    let relative = cwd
+        .strip_prefix(&repo_root)
+        .context("current cwd is outside its repository root")?;
+    let mut entries = registered_worktrees(&repo_root, &scrubber)
+        .await?
+        .into_iter()
+        .map(|root| RepositoryWorktree {
+            cwd: corresponding_cwd(&root, relative),
+            root,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.root.cmp(&right.root));
+    entries.dedup_by(|left, right| left.root == right.root);
+    Ok(entries)
+}
+
 impl WorktreeIntegration {
     pub async fn restore_session(
         &self,

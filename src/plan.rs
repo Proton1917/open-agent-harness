@@ -1,5 +1,6 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    fs::OpenOptions,
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     sync::Arc,
 };
@@ -19,6 +20,23 @@ use crate::{
 };
 
 const MAX_PLAN_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlan {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+/// Reads the latest privately stored plan for the active workspace. The path is derived entirely
+/// from the canonical trusted workspace key; callers cannot select an arbitrary file.
+pub fn load_latest_plan(context: &ToolContext) -> Result<Option<StoredPlan>> {
+    load_latest_plan_from_root(context, &default_plan_storage_root()?)
+}
+
+/// Clears the active workspace's session plan at an explicit conversation boundary.
+pub fn clear_latest_plan(context: &ToolContext) -> Result<bool> {
+    clear_latest_plan_from_root(context, &default_plan_storage_root()?)
+}
 
 pub fn plan_tools() -> Vec<Arc<dyn Tool>> {
     plan_tools_with_storage(None)
@@ -159,13 +177,11 @@ impl Tool for ExitPlanModeTool {
 
 impl ExitPlanModeTool {
     fn save_plan(&self, context: &ToolContext, plan: &str) -> Result<()> {
-        let root = self.storage_root.clone().map(Ok).unwrap_or_else(|| {
-            Ok::<_, anyhow::Error>(
-                dirs::home_dir()
-                    .context("无法确定 plan storage 主目录")?
-                    .join(".open-agent-harness/plans"),
-            )
-        })?;
+        let root = self
+            .storage_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_plan_storage_root)?;
         let directory = root.join(workspace_key(&context.workspace_root()));
         if std::fs::symlink_metadata(&directory)
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -176,6 +192,93 @@ impl ExitPlanModeTool {
         atomic_write_private(&directory.join("latest.md"), plan)
     }
 }
+
+fn default_plan_storage_root() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("无法确定 plan storage 主目录")?
+        .join(".open-agent-harness/plans"))
+}
+
+fn load_latest_plan_from_root(
+    context: &ToolContext,
+    storage_root: &std::path::Path,
+) -> Result<Option<StoredPlan>> {
+    let directory = storage_root.join(workspace_key(&context.workspace_root()));
+    // Reuse the private directory validator so every managed component is rejected if it became a
+    // symlink. Creating an empty private directory on the first read is harmless and keeps the
+    // security boundary identical to the save path.
+    ensure_private_directory(&directory)?;
+    let path = directory.join("latest.md");
+    let before = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if before.file_type().is_symlink() || !before.is_file() {
+        bail!("stored plan must be a regular non-symlink file")
+    }
+    if before.len() > MAX_PLAN_BYTES as u64 {
+        bail!("stored plan exceeds the {MAX_PLAN_BYTES}-byte limit")
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_plan_nofollow(&mut options);
+    let file = options
+        .open(&path)
+        .with_context(|| format!("无法安全读取 stored plan {}", path.display()))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != before.len() {
+        bail!("stored plan changed while being opened")
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_PLAN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PLAN_BYTES {
+        bail!("stored plan exceeds the {MAX_PLAN_BYTES}-byte limit")
+    }
+    let content = String::from_utf8(bytes).context("stored plan is not valid UTF-8")?;
+    validate_plan(&content)?;
+    Ok(Some(StoredPlan { path, content }))
+}
+
+fn clear_latest_plan_from_root(
+    context: &ToolContext,
+    storage_root: &std::path::Path,
+) -> Result<bool> {
+    let directory = storage_root.join(workspace_key(&context.workspace_root()));
+    ensure_private_directory(&directory)?;
+    let path = directory.join("latest.md");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("stored plan must be a regular non-symlink file")
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("unable to clear stored plan {}", path.display()))?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn configure_plan_nofollow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_plan_nofollow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_plan_nofollow(_options: &mut OpenOptions) {}
 
 fn validate_plan(plan: &str) -> Result<()> {
     if plan.trim().is_empty() || plan.len() > MAX_PLAN_BYTES {
@@ -387,5 +490,61 @@ mod tests {
             .await;
         assert!(child_exit.is_error);
         assert_eq!(root.permissions.effective_mode(), PermissionMode::Plan);
+    }
+
+    #[test]
+    fn latest_plan_read_is_bounded_and_workspace_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("plans");
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, vec![], vec![]),
+        );
+        assert!(
+            load_latest_plan_from_root(&context, &storage)
+                .unwrap()
+                .is_none()
+        );
+
+        let path = storage
+            .join(workspace_key(&context.workspace_root()))
+            .join("latest.md");
+        atomic_write_private(&path, "# Safe plan\n\nImplement the terminal flow.").unwrap();
+        let loaded = load_latest_plan_from_root(&context, &storage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.path, path);
+        assert_eq!(
+            loaded.content,
+            "# Safe plan\n\nImplement the terminal flow."
+        );
+
+        assert!(clear_latest_plan_from_root(&context, &storage).unwrap());
+        assert!(!path.exists());
+        assert!(!clear_latest_plan_from_root(&context, &storage).unwrap());
+
+        atomic_write_private(&path, "# Safe plan\n\nImplement the terminal flow.").unwrap();
+
+        std::fs::write(&path, vec![b'x'; MAX_PLAN_BYTES + 1]).unwrap();
+        assert!(load_latest_plan_from_root(&context, &storage).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_plan_read_rejects_symlink_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("plans");
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, vec![], vec![]),
+        );
+        let directory = storage.join(workspace_key(&context.workspace_root()));
+        ensure_private_directory(&directory).unwrap();
+        let target = temp.path().join("outside.md");
+        std::fs::write(&target, "outside").unwrap();
+        symlink(&target, directory.join("latest.md")).unwrap();
+        assert!(load_latest_plan_from_root(&context, &storage).is_err());
     }
 }

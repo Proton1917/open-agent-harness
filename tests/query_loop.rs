@@ -215,6 +215,82 @@ async fn prompt_suggestion_is_tool_free_and_does_not_mutate_transcript() {
     assert!(requests[1].to_string().contains("Suggest one concise"));
 }
 
+#[tokio::test]
+async fn side_question_is_tool_free_contextual_and_does_not_mutate_transcript() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let response = text_stream();
+        let (mut stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&read_http_body(&mut stream)).unwrap());
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: vec![open_agent_harness::types::Message::user_text(
+                "The workspace uses Rust".to_owned(),
+            )],
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    let transcript = engine.messages.clone();
+    let answer = engine
+        .answer_side_question("Which language does the workspace use?")
+        .await
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(answer, "迁移链路完成");
+    assert_eq!(engine.messages, transcript);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["tools"], json!([]));
+    let encoded = requests[0].to_string();
+    assert!(encoded.contains("The workspace uses Rust"));
+    assert!(encoded.contains("Which language does the workspace use?"));
+    assert!(encoded.contains("do not call tools"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn post_tool_batch_runs_once_before_the_next_model_request() {

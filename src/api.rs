@@ -1,4 +1,4 @@
-use std::{ops::Range, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -11,7 +11,10 @@ use tokio::time::sleep;
 
 use crate::{
     config::EndpointConfig,
-    protocol::{ApiFormat, RequestParts, StreamDecoder, encode_request, parse_response},
+    protocol::{
+        ApiFormat, ReasoningEffort, RequestParts, StreamDecoder, encode_request_with_effort,
+        parse_response,
+    },
     types::{Message, ModelResponse},
 };
 
@@ -20,6 +23,16 @@ pub struct ModelClient {
     http: Client,
     endpoint: EndpointConfig,
     messages_url: reqwest::Url,
+    effort: Option<ReasoningEffort>,
+    retry_sink: Option<Arc<dyn Fn(ApiRetryEvent) + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRetryEvent {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_ms: u128,
+    pub reason: String,
 }
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -138,7 +151,28 @@ impl ModelClient {
             http,
             endpoint,
             messages_url,
+            effort: None,
+            retry_sink: None,
         })
+    }
+
+    pub fn set_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.effort = effort;
+    }
+
+    pub fn set_retry_sink(&mut self, sink: Option<Arc<dyn Fn(ApiRetryEvent) + Send + Sync>>) {
+        self.retry_sink = sink;
+    }
+
+    fn notify_retry(&self, attempt: u32, delay: Duration, reason: impl Into<String>) {
+        if let Some(sink) = &self.retry_sink {
+            sink(ApiRetryEvent {
+                attempt,
+                max_attempts: 4,
+                delay_ms: delay.as_millis(),
+                reason: reason.into(),
+            });
+        }
     }
 
     pub async fn messages(
@@ -150,7 +184,7 @@ impl ModelClient {
         tools: &[Value],
         on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<MessageResult> {
-        let body = encode_request(
+        let body = encode_request_with_effort(
             self.endpoint.api_format,
             RequestParts {
                 model,
@@ -162,6 +196,7 @@ impl ModelClient {
                 chat_tokens_field: self.endpoint.chat_tokens_field,
                 include_stream_usage: self.endpoint.include_stream_usage,
             },
+            self.effort,
         )?;
         let encoded_body = serde_json::to_vec(&body).context("无法编码 model request")?;
         if encoded_body.len() > MAX_REQUEST_BYTES {
@@ -182,7 +217,9 @@ impl ModelClient {
                 Err(error) => {
                     last_error = Some(opaque_transport_error("API 请求", &error));
                     if attempt < 3 {
-                        sleep(Duration::from_secs(1 << attempt)).await;
+                        let delay = Duration::from_secs(1 << attempt);
+                        self.notify_retry(attempt + 2, delay, "transport error");
+                        sleep(delay).await;
                         continue;
                     }
                     break;
@@ -228,12 +265,11 @@ impl ModelClient {
             let error = api_error(status, &text, self.endpoint.token.as_deref());
             if retryable(status) && attempt < 3 {
                 last_error = Some(error);
-                sleep(
-                    retry_after
-                        .unwrap_or_else(|| Duration::from_secs(1 << attempt))
-                        .min(MAX_RETRY_DELAY),
-                )
-                .await;
+                let delay = retry_after
+                    .unwrap_or_else(|| Duration::from_secs(1 << attempt))
+                    .min(MAX_RETRY_DELAY);
+                self.notify_retry(attempt + 2, delay, format!("HTTP {}", status.as_u16()));
+                sleep(delay).await;
                 continue;
             }
             return Err(error);
@@ -768,6 +804,85 @@ mod tests {
             .expect("truncated SSE body must fail");
         assert!(!format!("{error}").contains(sentinel));
         assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[tokio::test]
+    async fn retry_observer_reports_bounded_attempt_before_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                if attempt == 0 {
+                    let body = r#"{"error":"busy"}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nretry-after: 0\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = r#"{"id":"retry-ok","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut config = endpoint(&format!("http://{address}"), "/chat/completions");
+        config.stream = false;
+        let mut client = ModelClient::new(config).unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<ApiRetryEvent>::new()));
+        let captured = Arc::clone(&events);
+        client.set_retry_sink(Some(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
+        let response = client
+            .messages(
+                "test-model",
+                32,
+                "",
+                &[Message::user_text("hello")],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.response.id, "retry-ok");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![ApiRetryEvent {
+                attempt: 2,
+                max_attempts: 4,
+                delay_ms: 0,
+                reason: "HTTP 503".to_owned(),
+            }]
+        );
     }
 
     #[test]

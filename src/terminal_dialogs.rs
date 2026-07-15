@@ -374,6 +374,7 @@ enum PermissionMode {
     Browse,
     Search,
     Add,
+    ConfirmDelete,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +436,7 @@ impl PermissionManagerDialog {
         match self.mode {
             PermissionMode::Search => self.handle_search(input),
             PermissionMode::Add => self.handle_add(input),
+            PermissionMode::ConfirmDelete => self.handle_confirm_delete(input),
             PermissionMode::Browse => self.handle_browse(input),
         }
     }
@@ -465,19 +467,8 @@ impl PermissionManagerDialog {
                 }
             }
             DialogInput::Character('x') | DialogInput::Delete => {
-                if let Some(item) = self.selected_item().cloned() {
-                    return DialogUpdate::Action(if self.tab == PermissionTab::Workspace {
-                        PermissionManagerAction::RemoveWorkspace {
-                            id: item.id,
-                            path: item.label,
-                        }
-                    } else {
-                        PermissionManagerAction::DeleteRule {
-                            tab: self.tab,
-                            id: item.id,
-                            rule: item.label,
-                        }
-                    });
+                if self.selected_item().is_some() && self.tab != PermissionTab::Recent {
+                    self.mode = PermissionMode::ConfirmDelete;
                 }
             }
             DialogInput::Enter => {
@@ -541,6 +532,38 @@ impl PermissionManagerDialog {
         DialogUpdate::Continue
     }
 
+    fn handle_confirm_delete(
+        &mut self,
+        input: DialogInput,
+    ) -> DialogUpdate<PermissionManagerAction> {
+        match input {
+            DialogInput::Escape | DialogInput::Character('n' | 'N') => {
+                self.mode = PermissionMode::Browse;
+            }
+            DialogInput::Enter | DialogInput::Character('y' | 'Y') => {
+                let Some(item) = self.selected_item().cloned() else {
+                    self.mode = PermissionMode::Browse;
+                    return DialogUpdate::Continue;
+                };
+                self.mode = PermissionMode::Browse;
+                return DialogUpdate::Action(if self.tab == PermissionTab::Workspace {
+                    PermissionManagerAction::RemoveWorkspace {
+                        id: item.id,
+                        path: item.label,
+                    }
+                } else {
+                    PermissionManagerAction::DeleteRule {
+                        tab: self.tab,
+                        id: item.id,
+                        rule: item.label,
+                    }
+                });
+            }
+            _ => {}
+        }
+        DialogUpdate::Continue
+    }
+
     fn filtered_indices(&self) -> Vec<usize> {
         let needle = self.query.to_lowercase();
         self.data
@@ -594,6 +617,13 @@ impl PermissionManagerDialog {
                 };
                 lines.push(format!("{label}: {}_", self.input));
             }
+            PermissionMode::ConfirmDelete => {
+                let label = self
+                    .selected_item()
+                    .map(|item| item.label.as_str())
+                    .unwrap_or("selected entry");
+                lines.push(format!("Delete {label:?}? y/Enter confirm · n/Esc cancel"));
+            }
             PermissionMode::Browse if !self.query.is_empty() => {
                 lines.push(format!("Filter: {}", self.query));
             }
@@ -623,7 +653,11 @@ impl PermissionManagerDialog {
                 lines.push(format!("{marker} {}{detail}", item.label));
             }
         }
-        lines.push("←/→ tabs · ↑/↓ select · / search · a add · x delete · Esc close".to_owned());
+        lines.push(if self.mode == PermissionMode::ConfirmDelete {
+            "y/Enter confirm · n/Esc cancel".to_owned()
+        } else {
+            "←/→ tabs · ↑/↓ select · / search · a add · x delete · Esc close".to_owned()
+        });
         DialogFrame::new(lines, None, width, height)
     }
 }
@@ -1386,6 +1420,10 @@ mod tests {
         dialog.handle(DialogInput::Escape);
         assert_eq!(
             dialog.handle(DialogInput::Character('x')),
+            DialogUpdate::Continue
+        );
+        assert_eq!(
+            dialog.handle(DialogInput::Enter),
             DialogUpdate::Action(PermissionManagerAction::DeleteRule {
                 tab: PermissionTab::Allow,
                 id: "allow-1".to_owned(),
@@ -1417,6 +1455,10 @@ mod tests {
         assert_eq!(dialog.tab(), PermissionTab::Workspace);
         assert_eq!(
             dialog.handle(DialogInput::Character('x')),
+            DialogUpdate::Continue
+        );
+        assert_eq!(
+            dialog.handle(DialogInput::Enter),
             DialogUpdate::Action(PermissionManagerAction::RemoveWorkspace {
                 id: "ws".to_owned(),
                 path: "/safe".to_owned(),

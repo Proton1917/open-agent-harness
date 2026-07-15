@@ -5,14 +5,14 @@ use serde_json::{Value, json};
 
 use crate::{
     agents::{AgentRegistryFilter, AgentRuntime, AgentToolPolicy, CustomAgentCatalog},
-    api::{ModelClient, is_size_rejection},
+    api::{ApiRetryEvent, ModelClient, is_size_rejection},
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     file_history::{CheckpointBoundary, DiffStats, RewindReport},
-    hooks::blocking_feedback,
+    hooks::{HookRunner, blocking_feedback},
     messages::normalize_for_api,
     permissions::PermissionMode,
     prompt::{permission_mode_section, registered_tools_section},
-    protocol::validate_direct_user_content,
+    protocol::{ReasoningEffort, validate_direct_user_content},
     session::sanitize_transport_text,
     skills::{
         SkillExecutionContext, SkillInvocation, SkillInvocationSource, decode_user_skill_submission,
@@ -20,7 +20,7 @@ use crate::{
     structured_output::STRUCTURED_OUTPUT_TOOL_NAME,
     tokens::{estimate_messages, rough_token_count},
     tools::{ToolContext, ToolExecutionObserver, ToolOutput, ToolRegistry},
-    types::{Message, Role, SessionUsage},
+    types::{Message, Role, SessionUsage, Usage},
 };
 
 const MAX_TOOL_ROUNDS: usize = 64;
@@ -35,6 +35,8 @@ const MAX_STOP_FEEDBACK_ROUNDS: usize = 3;
 const MAX_HOOK_FEEDBACK_BYTES: usize = 64 * 1024;
 const MAX_BACKGROUND_CONTEXT_BYTES: usize = 192 * 1024;
 const MAX_PROMPT_SUGGESTION_BYTES: usize = 2 * 1024;
+const MAX_SIDE_QUESTION_BYTES: usize = 32 * 1024;
+const MAX_SIDE_ANSWER_BYTES: usize = 256 * 1024;
 const COMPACT_RETRY_MARKER: &str = "[earlier conversation truncated for compaction retry]";
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type QueryEventSink = Arc<dyn Fn(&QueryEvent) + Send + Sync>;
@@ -44,6 +46,12 @@ pub enum QueryEvent {
     TurnStarted,
     RequestStarted {
         round: usize,
+    },
+    RequestRetry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u128,
+        reason: String,
     },
     AssistantMessage {
         content: Vec<Value>,
@@ -97,6 +105,7 @@ struct TurnInterrupted;
 pub struct QueryEngine {
     client: ModelClient,
     pub model: String,
+    effort: Option<ReasoningEffort>,
     max_tokens: u32,
     system: String,
     registry: ToolRegistry,
@@ -132,6 +141,64 @@ pub struct QueryOptions {
     pub compact_config: Option<CompactConfig>,
 }
 
+pub struct SideQuestionRequest {
+    client: ModelClient,
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<Message>,
+}
+
+pub struct SideQuestionAnswer {
+    pub text: String,
+    pub usage: Option<Usage>,
+}
+
+impl SideQuestionRequest {
+    pub async fn answer(self) -> Result<SideQuestionAnswer> {
+        let result = self
+            .client
+            .messages(
+                &self.model,
+                self.max_tokens,
+                &self.system,
+                &self.messages,
+                &[],
+                None,
+            )
+            .await?;
+        if result.response.stop_reason.as_deref() == Some("tool_use")
+            || result
+                .response
+                .content
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        {
+            bail!("/btw response attempted to call a tool")
+        }
+        let answer = result
+            .response
+            .content
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .trim()
+            .to_owned();
+        if answer.is_empty() {
+            bail!("/btw response did not contain text")
+        }
+        if answer.len() > MAX_SIDE_ANSWER_BYTES || answer.contains('\0') {
+            bail!("/btw response exceeds the {MAX_SIDE_ANSWER_BYTES}-byte limit or contains NUL")
+        }
+        Ok(SideQuestionAnswer {
+            text: answer,
+            usage: result.response.usage,
+        })
+    }
+}
+
 impl QueryEngine {
     pub fn new(
         client: ModelClient,
@@ -156,6 +223,7 @@ impl QueryEngine {
         Self {
             client,
             model: options.model,
+            effort: None,
             max_tokens: options.max_tokens,
             system: options.system,
             registry,
@@ -480,6 +548,18 @@ impl QueryEngine {
     }
 
     pub fn set_event_sink(&mut self, event_sink: Option<QueryEventSink>) {
+        let retry_sink = event_sink.as_ref().map(|sink| {
+            let sink = Arc::clone(sink);
+            Arc::new(move |event: ApiRetryEvent| {
+                sink(&QueryEvent::RequestRetry {
+                    attempt: event.attempt,
+                    max_attempts: event.max_attempts,
+                    delay_ms: event.delay_ms,
+                    reason: event.reason,
+                });
+            }) as Arc<dyn Fn(ApiRetryEvent) + Send + Sync>
+        });
+        self.client.set_retry_sink(retry_sink);
         self.event_sink = event_sink;
     }
 
@@ -500,6 +580,22 @@ impl QueryEngine {
             runtime.set_default_model(model.clone());
         }
         self.model = model;
+    }
+
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.effort
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.client.set_effort(effort);
+        if let Ok(runtime) = self.tool_context.agent_runtime() {
+            runtime.set_reasoning_effort(effort);
+        }
+        self.effort = effort;
+    }
+
+    pub fn replace_hooks(&mut self, hooks: Arc<HookRunner>) {
+        self.tool_context.set_hooks(hooks);
     }
 
     /// Executes a local slash-command action through the same registry path
@@ -1216,6 +1312,39 @@ impl QueryEngine {
         Ok((!suggestion.is_empty()).then_some(suggestion))
     }
 
+    /// Answers a one-off side question against the current conversation without exposing tools or
+    /// appending either the question or answer to the primary transcript. This is the provider-
+    /// neutral `/btw` path used by the interactive terminal.
+    pub fn prepare_side_question(&self, question: &str) -> Result<SideQuestionRequest> {
+        let question = question.trim();
+        if question.is_empty() {
+            bail!("Usage: /btw <question>")
+        }
+        if question.len() > MAX_SIDE_QUESTION_BYTES || question.contains('\0') {
+            bail!("/btw question exceeds the {MAX_SIDE_QUESTION_BYTES}-byte limit or contains NUL")
+        }
+
+        let mut messages = normalize_for_api(&self.messages);
+        messages.push(Message::user_text(format!(
+            "<side-question>\n{question}\n</side-question>\n\nAnswer this one question directly from the conversation context. This is a separate one-off response: do not call tools, claim to take actions, or alter the main task. If the context does not contain the answer, say so."
+        )));
+        Ok(SideQuestionRequest {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens.min(4_096),
+            system: self.effective_system_prompt(),
+            messages,
+        })
+    }
+
+    pub async fn answer_side_question(&mut self, question: &str) -> Result<String> {
+        let answer = self.prepare_side_question(question)?.answer().await?;
+        if let Some(usage) = &answer.usage {
+            self.usage.add(usage);
+        }
+        Ok(answer.text)
+    }
+
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.registry
             .definitions()
@@ -1242,8 +1371,39 @@ impl QueryEngine {
     }
 
     pub async fn compact(&mut self, custom_instructions: Option<&str>) -> Result<CompactStats> {
-        self.compact_preserving_suffix(custom_instructions, Vec::new(), None)
+        self.compact_preserving_suffix(custom_instructions, Vec::new(), None, None, 0)
             .await
+    }
+
+    /// Summarizes the conversation from a selected message boundary onward,
+    /// while preserving the earlier prefix byte-for-byte. This backs the
+    /// interactive rewind selector's provider-neutral "Summarize from here"
+    /// action.
+    pub async fn compact_from(
+        &mut self,
+        start: usize,
+        custom_instructions: Option<&str>,
+    ) -> Result<CompactStats> {
+        let full_messages_before = self.messages.len();
+        if start >= full_messages_before || full_messages_before.saturating_sub(start) < 2 {
+            bail!("selected boundary must leave at least two messages to summarize")
+        }
+        let full_before_tokens = self.estimated_tokens();
+        let selected = self.messages.split_off(start);
+        let prefix = std::mem::replace(&mut self.messages, selected);
+        let result = self
+            .compact_preserving_suffix(
+                custom_instructions,
+                Vec::new(),
+                Some(full_before_tokens),
+                Some(full_messages_before),
+                start,
+            )
+            .await;
+        let compacted_or_restored = std::mem::take(&mut self.messages);
+        self.messages = prefix;
+        self.messages.extend(compacted_or_restored);
+        result
     }
 
     async fn compact_preserving_suffix(
@@ -1251,6 +1411,8 @@ impl QueryEngine {
         custom_instructions: Option<&str>,
         suffix: Vec<Message>,
         full_before_tokens: Option<usize>,
+        full_messages_before: Option<usize>,
+        preserved_prefix_messages: usize,
     ) -> Result<CompactStats> {
         if !self.compact_config.enabled {
             self.messages.extend(suffix);
@@ -1262,7 +1424,8 @@ impl QueryEngine {
         }
         self.emit(QueryEvent::CompactStarted);
         let prefix_messages = self.messages.len();
-        let messages_before = prefix_messages.saturating_add(suffix.len());
+        let messages_before =
+            full_messages_before.unwrap_or_else(|| prefix_messages.saturating_add(suffix.len()));
         let before_tokens = full_before_tokens.unwrap_or_else(|| self.estimated_tokens());
         let summary = async {
             self.tool_context
@@ -1340,7 +1503,7 @@ impl QueryEngine {
             before_tokens,
             after_tokens: self.estimated_tokens(),
             messages_before,
-            messages_after: self.messages.len(),
+            messages_after: preserved_prefix_messages.saturating_add(self.messages.len()),
         };
         let post_hook = self
             .tool_context
@@ -1372,8 +1535,9 @@ impl QueryEngine {
             bail!("可压缩历史前缀至少需要两条消息")
         }
         let before_tokens = self.estimated_tokens();
+        let messages_before = self.messages.len();
         let suffix = self.messages.split_off(prefix_len);
-        self.compact_preserving_suffix(None, suffix, Some(before_tokens))
+        self.compact_preserving_suffix(None, suffix, Some(before_tokens), Some(messages_before), 0)
             .await
     }
 

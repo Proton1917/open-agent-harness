@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -28,6 +28,10 @@ const MAX_SESSION_LIST_SCAN: usize = 10_000;
 const MAX_SESSION_LIST_RESULTS: usize = 100;
 const MAX_SESSION_METADATA_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_TITLE_BYTES: usize = 512;
+const MAX_SESSION_TAG_BYTES: usize = 128;
+const SESSION_COLORS: &[&str] = &[
+    "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
+];
 const SESSION_METADATA_VERSION: u8 = 1;
 const REDACTED_SECRET: &str = "[secret-redacted]";
 const REDACTED_PATH: &str = "[absolute-path-redacted]";
@@ -58,6 +62,10 @@ struct SessionMetadata {
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
 }
 
 impl SessionMetadata {
@@ -67,6 +75,8 @@ impl SessionMetadata {
             session_id,
             title: None,
             parent_session_id: None,
+            color: None,
+            tag: None,
         }
     }
 }
@@ -114,6 +124,9 @@ pub struct SessionSummary {
     pub bytes: u64,
     pub title: Option<String>,
     pub parent_session_id: Option<Uuid>,
+    pub preview: Option<String>,
+    pub color: Option<String>,
+    pub tag: Option<String>,
 }
 
 impl SessionWorkspaceState {
@@ -286,7 +299,12 @@ impl SessionStore {
                 modified_ms,
                 bytes: metadata.len(),
                 title: sidecar.as_ref().and_then(|metadata| metadata.title.clone()),
-                parent_session_id: sidecar.and_then(|metadata| metadata.parent_session_id),
+                parent_session_id: sidecar
+                    .as_ref()
+                    .and_then(|metadata| metadata.parent_session_id),
+                preview: session_preview(&path).ok().flatten(),
+                color: sidecar.as_ref().and_then(|metadata| metadata.color.clone()),
+                tag: sidecar.and_then(|metadata| metadata.tag),
             });
         }
         sessions.sort_by(|left, right| {
@@ -594,6 +612,10 @@ impl SessionStore {
             let mut metadata = SessionMetadata::new(destination.id);
             metadata.title = title;
             metadata.parent_session_id = Some(self.id);
+            if let Some(source) = read_session_metadata(&self.file, self.id)? {
+                metadata.color = source.color;
+                metadata.tag = source.tag;
+            }
             if let Err(error) = write_session_metadata(&destination.file, &metadata) {
                 let _ = fs::remove_file(&destination.file);
                 return Err(error);
@@ -615,6 +637,96 @@ impl SessionStore {
             .unwrap_or_else(|| SessionMetadata::new(self.id));
         metadata.title = Some(title);
         write_session_metadata(&self.file, &metadata)
+    }
+
+    pub fn title(&self) -> Result<Option<String>> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(read_session_metadata(&self.file, self.id)?.and_then(|metadata| metadata.title))
+    }
+
+    pub fn color(&self) -> Result<Option<String>> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(read_session_metadata(&self.file, self.id)?.and_then(|metadata| metadata.color))
+    }
+
+    pub fn set_color(&self, color: Option<&str>) -> Result<()> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let color = color.map(validate_session_color).transpose()?;
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metadata = read_session_metadata(&self.file, self.id)?
+            .unwrap_or_else(|| SessionMetadata::new(self.id));
+        metadata.color = color;
+        write_session_metadata(&self.file, &metadata)
+    }
+
+    pub fn tag(&self) -> Result<Option<String>> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(read_session_metadata(&self.file, self.id)?.and_then(|metadata| metadata.tag))
+    }
+
+    /// Stores one searchable local tag. Supplying the active tag toggles it
+    /// off, matching the source-available terminal command behavior.
+    pub fn toggle_tag(&self, tag: &str) -> Result<Option<String>> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            bail!("当前会话未启用持久化，无法保存标签")
+        }
+        let tag = validate_session_tag(tag, &self.cwd)?;
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metadata = read_session_metadata(&self.file, self.id)?
+            .unwrap_or_else(|| SessionMetadata::new(self.id));
+        if metadata.tag.as_deref() == Some(tag.as_str()) {
+            metadata.tag = None;
+        } else {
+            metadata.tag = Some(tag);
+        }
+        let result = metadata.tag.clone();
+        write_session_metadata(&self.file, &metadata)?;
+        Ok(result)
+    }
+
+    /// Removes a fork created by this process when a multi-surface rewind
+    /// cannot be committed. The parent linkage is verified before either
+    /// private file is removed, so this cannot target an unrelated session.
+    pub fn discard_failed_fork(&self, expected_parent: Uuid) -> Result<()> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let metadata = read_session_metadata(&self.file, self.id)?
+            .context("failed fork is missing its private metadata")?;
+        if metadata.parent_session_id != Some(expected_parent) {
+            bail!("refusing to discard a session without the expected parent linkage")
+        }
+        let transcript = fs::symlink_metadata(&self.file).with_context(|| {
+            format!(
+                "failed fork transcript is unavailable: {}",
+                self.file.display()
+            )
+        })?;
+        if transcript.file_type().is_symlink() || !transcript.is_file() {
+            bail!("refusing to discard a symlink or non-file failed fork")
+        }
+        let metadata_path = session_metadata_path(&self.file)?;
+        let metadata_file = fs::symlink_metadata(&metadata_path)?;
+        if metadata_file.file_type().is_symlink() || !metadata_file.is_file() {
+            bail!("refusing to discard symlink or non-file session metadata")
+        }
+        fs::remove_file(&self.file)?;
+        fs::remove_file(metadata_path)?;
+        Ok(())
     }
 
     /// Loads the currently effective history, after compact boundaries.
@@ -888,6 +1000,47 @@ impl SessionStore {
         replace_private_transcript(&self.file, &contents)
     }
 
+    /// Starts a genuinely new empty conversation while leaving this session untouched.
+    ///
+    /// `/clear` is a session boundary, not an in-place transcript rewrite. The new session keeps
+    /// the trusted workspace/cwd state needed by the live terminal, receives a fresh id, and
+    /// records this session as its parent so `/resume` can still identify the lineage.
+    pub fn start_new_after_clear(&self) -> Result<Self> {
+        let id = Uuid::new_v4();
+        let workspace = self.workspace_state();
+        let current_cwd = self.current_cwd_state();
+        let file = if self.enabled {
+            self.file
+                .parent()
+                .context("current transcript is missing its project directory")?
+                .join(format!("{id}.jsonl"))
+        } else {
+            PathBuf::new()
+        };
+        let destination = Self {
+            id,
+            cwd: self.cwd.clone(),
+            file,
+            enabled: self.enabled,
+            workspace: Arc::new(Mutex::new(workspace.clone())),
+            current_cwd: Arc::new(Mutex::new(current_cwd.clone())),
+            write_lock: Arc::new(Mutex::new(())),
+        };
+        if self.enabled {
+            let record = Record::from_state(id, &workspace, current_cwd.as_ref(), true, None);
+            let mut contents = Vec::new();
+            append_record_bytes(&mut contents, &record)?;
+            replace_private_transcript(&destination.file, &contents)?;
+            let mut metadata = SessionMetadata::new(id);
+            metadata.parent_session_id = Some(self.id);
+            if let Err(error) = write_session_metadata(&destination.file, &metadata) {
+                let _ = fs::remove_file(&destination.file);
+                return Err(error);
+            }
+        }
+        Ok(destination)
+    }
+
     /// Preserves the current conversation as a resumable session before
     /// starting an empty history in this live runtime. The live store keeps
     /// its id so existing tool/file-history recorders remain valid; callers
@@ -994,6 +1147,94 @@ fn open_private_transcript(path: &Path) -> Result<fs::File> {
 
 fn load_messages(file: &Path) -> Result<Vec<Message>> {
     Ok(load_transcript(file)?.messages)
+}
+
+fn session_preview(file: &Path) -> Result<Option<String>> {
+    const MAX_PREVIEW_SCAN_BYTES: u64 = 512 * 1024;
+    const MAX_PREVIEW_RECORDS: usize = 2_048;
+    if fs::symlink_metadata(file)?.file_type().is_symlink() {
+        bail!("refusing to preview a symlink transcript")
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut input = options.open(file)?;
+    let size = input.metadata()?.len();
+    let offset = size.saturating_sub(MAX_PREVIEW_SCAN_BYTES);
+    input.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_PREVIEW_SCAN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if offset > 0 {
+        let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Ok(None);
+        };
+        bytes.drain(..=first_newline);
+    }
+    let mut preview = None;
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if index >= MAX_PREVIEW_RECORDS || line.is_empty() {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<Record>(line) else {
+            continue;
+        };
+        if record.compact_boundary {
+            preview = None;
+        }
+        if preview.is_none() {
+            preview = record.message.as_ref().and_then(session_message_preview);
+        }
+    }
+    Ok(preview)
+}
+
+fn session_message_preview(message: &Message) -> Option<String> {
+    if message.role != crate::types::Role::User {
+        return None;
+    }
+    let text = match &message.content {
+        Value::String(text)
+            if !text.starts_with("This session continues from an earlier conversation") =>
+        {
+            text.clone()
+        }
+        Value::Array(blocks)
+            if !blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result")) =>
+        {
+            let text = blocks
+                .iter()
+                .filter_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.trim().is_empty() {
+                "[attachment]".to_owned()
+            } else {
+                text
+            }
+        }
+        _ => return None,
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let mut preview = collapsed.chars().take(160).collect::<String>();
+    if collapsed.chars().count() > 160 {
+        preview.push('…');
+    }
+    Some(preview)
 }
 
 fn load_transcript(file: &Path) -> Result<LoadedTranscript> {
@@ -1295,6 +1536,20 @@ fn validate_session_title_value(title: &str, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_session_tag(tag: &str, cwd: &Path) -> Result<String> {
+    let tag = tag.trim().trim_start_matches('#');
+    if tag.is_empty() || tag.len() > MAX_SESSION_TAG_BYTES {
+        bail!("session 标签必须为 1..={MAX_SESSION_TAG_BYTES} 字节")
+    }
+    if tag.chars().any(char::is_control) || tag.chars().any(char::is_whitespace) {
+        bail!("session 标签不能包含空白或控制字符")
+    }
+    if sanitize_text(tag, None, cwd) != tag || looks_absolute_path(tag) {
+        bail!("session 标签不能包含 secret、endpoint 凭据或本机绝对路径")
+    }
+    Ok(tag.to_owned())
+}
+
 fn validate_session_metadata(metadata: &SessionMetadata, expected_id: Uuid) -> Result<()> {
     if metadata.version != SESSION_METADATA_VERSION || metadata.session_id != expected_id {
         bail!("session metadata 版本或 session id 不匹配")
@@ -1309,7 +1564,23 @@ fn validate_session_metadata(metadata: &SessionMetadata, expected_id: Uuid) -> R
             bail!("session metadata 标题无效")
         }
     }
+    if let Some(color) = &metadata.color {
+        validate_session_color(color)?;
+    }
+    if let Some(tag) = &metadata.tag {
+        if validate_session_tag(tag, Path::new("<session-metadata>"))? != *tag {
+            bail!("session metadata 标签无效")
+        }
+    }
     Ok(())
+}
+
+fn validate_session_color(color: &str) -> Result<String> {
+    let color = color.trim().to_ascii_lowercase();
+    if !SESSION_COLORS.contains(&color.as_str()) {
+        bail!("session color must be one of {}", SESSION_COLORS.join(", "))
+    }
+    Ok(color)
 }
 
 fn read_session_metadata(transcript: &Path, expected_id: Uuid) -> Result<Option<SessionMetadata>> {
@@ -1725,11 +1996,16 @@ mod tests {
         );
         store.append(&[Message::user_text("hello")]).unwrap();
         store.rename("  会话标题  ").unwrap();
+        assert_eq!(
+            store.toggle_tag("#terminal-fix").unwrap().as_deref(),
+            Some("terminal-fix")
+        );
 
         let metadata_path = session_metadata_path(&store.file).unwrap();
         let metadata = read_session_metadata(&store.file, id).unwrap().unwrap();
         assert_eq!(metadata.title.as_deref(), Some("会话标题"));
         assert_eq!(metadata.parent_session_id, None);
+        assert_eq!(metadata.tag.as_deref(), Some("terminal-fix"));
         assert!(
             !fs::read_to_string(&metadata_path)
                 .unwrap()
@@ -1751,14 +2027,18 @@ mod tests {
         let fork_metadata = read_session_metadata(&fork.file, fork.id).unwrap().unwrap();
         assert_eq!(fork_metadata.title.as_deref(), Some("Branch α"));
         assert_eq!(fork_metadata.parent_session_id, Some(id));
+        assert_eq!(fork_metadata.tag.as_deref(), Some("terminal-fix"));
 
         let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
         let source_summary = listed.iter().find(|summary| summary.id == id).unwrap();
         assert_eq!(source_summary.title.as_deref(), Some("会话标题"));
         assert_eq!(source_summary.parent_session_id, None);
+        assert_eq!(source_summary.tag.as_deref(), Some("terminal-fix"));
         let fork_summary = listed.iter().find(|summary| summary.id == fork.id).unwrap();
         assert_eq!(fork_summary.title.as_deref(), Some("Branch α"));
         assert_eq!(fork_summary.parent_session_id, Some(id));
+        assert_eq!(fork_summary.tag.as_deref(), Some("terminal-fix"));
+        assert_eq!(store.toggle_tag("terminal-fix").unwrap(), None);
         assert!(
             !directory
                 .path()
@@ -1795,6 +2075,21 @@ mod tests {
         );
         assert!(store.rename(&absolute_title).is_err());
         assert!(store.rename("api_key=not-a-real-key").is_err());
+
+        assert!(store.toggle_tag("").is_err());
+        assert!(store.toggle_tag("two words").is_err());
+        assert!(store.toggle_tag("control\0tag").is_err());
+        assert!(
+            store
+                .toggle_tag(&"x".repeat(MAX_SESSION_TAG_BYTES + 1))
+                .is_err()
+        );
+        assert!(
+            store
+                .toggle_tag(workspace.path().to_string_lossy().as_ref())
+                .is_err()
+        );
+        assert!(store.toggle_tag("api_key=not-a-real-key").is_err());
 
         let exact = "界".repeat(MAX_SESSION_TITLE_BYTES / "界".len());
         store.rename(&exact).unwrap();
@@ -2026,6 +2321,43 @@ mod tests {
     }
 
     #[test]
+    fn clear_starts_fresh_session_without_rewriting_the_old_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let store = test_store(
+            temp.path(),
+            temp.path().join(format!("{session_id}.jsonl")),
+            session_id,
+        );
+        let previous = vec![Message::user_text("old conversation stays here")];
+        store.append(&previous).unwrap();
+        store.rename("Old title").unwrap();
+        let old_bytes = fs::read(&store.file).unwrap();
+
+        let next = store.start_new_after_clear().unwrap();
+
+        assert_ne!(next.id, store.id);
+        assert_eq!(fs::read(&store.file).unwrap(), old_bytes);
+        assert_eq!(load_messages(&store.file).unwrap(), previous);
+        assert!(load_messages(&next.file).unwrap().is_empty());
+        assert_eq!(
+            read_session_metadata(&store.file, store.id)
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Old title")
+        );
+        assert_eq!(
+            read_session_metadata(&next.file, next.id)
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            Some(store.id)
+        );
+    }
+
+    #[test]
     fn transcript_preserves_tool_data_while_redacting_secrets_and_paths() {
         let temp = tempfile::tempdir().unwrap();
         let store = test_store(
@@ -2075,11 +2407,8 @@ mod tests {
     #[test]
     fn fork_and_truncate_preserve_exact_message_prefixes() {
         let temp = tempfile::tempdir().unwrap();
-        let store = test_store(
-            temp.path(),
-            temp.path().join("source.jsonl"),
-            Uuid::new_v4(),
-        );
+        let id = Uuid::new_v4();
+        let store = test_store(temp.path(), temp.path().join(format!("{id}.jsonl")), id);
         let messages = vec![
             Message::user_text("one"),
             Message::assistant(vec![serde_json::json!({"type":"text","text":"two"})]),
@@ -2095,6 +2424,25 @@ mod tests {
         assert_eq!(store.truncate_history(1).unwrap(), messages[..1]);
         assert_eq!(store.load_history().unwrap(), messages[..1]);
         assert!(store.truncate_history(2).is_err());
+    }
+
+    #[test]
+    fn failed_session_fork_cleanup_requires_parent_linkage() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let store = test_store(temp.path(), temp.path().join(format!("{id}.jsonl")), id);
+        store.append(&[Message::user_text("one")]).unwrap();
+        let (fork, _) = store.fork_from(None, true).unwrap();
+        let fork_metadata = session_metadata_path(&fork.file).unwrap();
+
+        assert!(fork.file.is_file());
+        assert!(fork_metadata.is_file());
+        assert!(fork.discard_failed_fork(Uuid::new_v4()).is_err());
+        assert!(fork.file.is_file());
+        fork.discard_failed_fork(id).unwrap();
+        assert!(!fork.file.exists());
+        assert!(!fork_metadata.exists());
+        assert!(store.file.is_file());
     }
 
     #[test]

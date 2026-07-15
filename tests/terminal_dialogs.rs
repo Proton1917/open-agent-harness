@@ -15,6 +15,18 @@ fn permission_manager_emits_actions_without_mutating_input_data() {
     assert_eq!(dialog.tab(), PermissionTab::Allow);
     assert_eq!(
         dialog.handle(DialogInput::Character('x')),
+        DialogUpdate::Continue
+    );
+    assert_eq!(
+        dialog.handle(DialogInput::Character('n')),
+        DialogUpdate::Continue
+    );
+    assert_eq!(
+        dialog.handle(DialogInput::Character('x')),
+        DialogUpdate::Continue
+    );
+    assert_eq!(
+        dialog.handle(DialogInput::Enter),
         DialogUpdate::Action(PermissionManagerAction::DeleteRule {
             tab: PermissionTab::Allow,
             id: "read".to_owned(),

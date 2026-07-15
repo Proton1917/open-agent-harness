@@ -8,10 +8,14 @@ The P0 permission gaps and the previously listed common-workflow gaps have been
 closed for the declared open surface.
 
 A follow-up static review of the separately checksummed 2.1.207 archive was
-used only to identify additional provider-neutral behavior that remains useful
-outside any vendor account or hosted service. The resulting additions are
-listed below. They extend the open surface; they do not change the March 31
-baseline or turn this document into a claim of proprietary-product parity.
+used only to identify additional provider-neutral backend behavior that remains
+useful outside any vendor account or hosted service. It is not a frontend
+design source. Interactive CLI layout, editing, rendering, key behavior,
+dialogs, and commands are audited exclusively against the source-available
+2026-03-31 snapshot; see
+`TERMINAL_FRONTEND_AUDIT_2026-03-31.md`. Backend additions do not change the
+March 31 baseline or turn this document into a claim of proprietary-product
+parity.
 
 This is a behavioral compatibility statement, not a claim of source
 reproduction. The project does not claim identical source structure, prompts,
