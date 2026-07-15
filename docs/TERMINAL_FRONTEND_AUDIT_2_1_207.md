@@ -6,9 +6,8 @@ This audit covers provider-neutral terminal behavior only. It does not claim
 source, prompt, wording, asset, account, subscription, telemetry, hosted
 service, or brand parity.
 
-The normative version baseline is the checksummed local archive:
-
-`reference/claude-code-2.1.207-reverse-engineering-20260712.tar.zst`
+The normative version baseline is the checksummed local 2.1.207 archive under
+`reference/`.
 
 Evidence below refers to line numbers in
 `decompiled/formatted/$bunfs/root/src/entrypoints/cli.js` inside that archive.

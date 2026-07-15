@@ -321,7 +321,9 @@ impl PtySession {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 Err(error) => panic!("terminal read failed: {error}"),
             }
         }
@@ -343,7 +345,9 @@ impl PtySession {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Err(error) => panic!("terminal read failed: {error}"),
             }
         }

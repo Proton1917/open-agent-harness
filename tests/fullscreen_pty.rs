@@ -205,7 +205,9 @@ fn read_until(terminal: &mut File, needle: &str, timeout: Duration) -> String {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                thread::sleep(Duration::from_millis(20));
+            }
             Err(error) => panic!("terminal read failed: {error}"),
         }
     }
@@ -225,7 +227,9 @@ fn drain_terminal(terminal: &mut File, quiet_for: Duration) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => panic!("terminal read failed: {error}"),
         }
     }
@@ -246,7 +250,9 @@ fn wait_for_raw_mode(terminal: &mut File, timeout: Duration) {
         match terminal.read(&mut drain) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => panic!("terminal read failed: {error}"),
         }
         thread::sleep(Duration::from_millis(10));
