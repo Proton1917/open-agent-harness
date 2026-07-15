@@ -331,7 +331,7 @@ fn read_until(
     let mut output = std::mem::take(pending_output);
     let mut buffer = [0u8; 8192];
     while started.elapsed() < timeout {
-        if let Some(found) = take_through_needle(&mut output, pending_output, needle.as_bytes()) {
+        if let Some(found) = take_through_needle(&output, pending_output, needle.as_bytes()) {
             return found;
         }
         match terminal.read(&mut buffer) {
@@ -357,7 +357,7 @@ fn read_until(
 }
 
 fn take_through_needle(
-    output: &mut Vec<u8>,
+    output: &[u8],
     pending_output: &mut Vec<u8>,
     needle: &[u8],
 ) -> Option<String> {
