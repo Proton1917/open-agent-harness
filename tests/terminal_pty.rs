@@ -288,18 +288,20 @@ fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
 
     terminal.write_all(b"/statusline cat\r").unwrap();
-    let configured = read_until(
+    let mut configured = read_until(
         &mut terminal,
         "Status line configured from trusted user settings.",
         Duration::from_secs(3),
     );
     assert!(configured.contains("Status line configured"));
-    let initial = read_until(
-        &mut terminal,
-        "\"permissionMode\":\"default\"",
-        Duration::from_secs(5),
-    );
-    assert!(initial.contains("\"permissionMode\":\"default\""));
+    if !configured.contains("\"permissionMode\":\"default\"") {
+        configured.push_str(&read_until(
+            &mut terminal,
+            "\"permissionMode\":\"default\"",
+            Duration::from_secs(5),
+        ));
+    }
+    assert!(configured.contains("\"permissionMode\":\"default\""));
 
     terminal.write_all(b"\x1b[Z").unwrap();
     let refreshed = read_until(
