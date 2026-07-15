@@ -762,7 +762,10 @@ fn validate_private_directory_metadata(metadata: &fs::Metadata) -> Result<()> {
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
     let mut builder = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
