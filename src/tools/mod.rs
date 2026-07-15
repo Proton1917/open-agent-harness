@@ -5019,8 +5019,10 @@ pub(crate) fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
             bail!("拒绝 NTFS alternate data stream 路径")
         }
         for component in normalized.split('/') {
-            if component.ends_with(['.', ' '])
-                || (component.len() >= 3 && component.chars().all(|ch| ch == '.'))
+            let navigation_component = matches!(component, "." | "..");
+            if !navigation_component
+                && (component.ends_with(['.', ' '])
+                    || (component.len() >= 3 && component.chars().all(|ch| ch == '.')))
             {
                 bail!("拒绝 Windows 可疑路径规范化形式")
             }
@@ -5324,6 +5326,23 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_paths_allow_navigation_but_reject_ambiguous_trailing_dots() {
+        for path in [".", "..", r"C:\Users\user\workspace\.", r"nested\.."] {
+            assert!(
+                reject_windows_network_or_device_path(path).is_ok(),
+                "ordinary navigation component was rejected: {path}"
+            );
+        }
+        for path in ["...", r"C:\Users\user\workspace\file."] {
+            assert!(
+                reject_windows_network_or_device_path(path).is_err(),
+                "ambiguous trailing-dot component was accepted: {path}"
+            );
+        }
     }
 
     struct BarrierTool {
