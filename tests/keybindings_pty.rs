@@ -218,6 +218,7 @@ fn write_keybindings_atomic(home: &Path, contents: &str) {
 struct PtySession {
     child: Child,
     terminal: File,
+    pending_output: Vec<u8>,
 }
 
 impl PtySession {
@@ -226,11 +227,17 @@ impl PtySession {
     }
 
     fn read_until(&mut self, needle: &str, timeout: Duration) -> String {
-        read_until(&mut self.terminal, &mut self.child, needle, timeout)
+        read_until(
+            &mut self.terminal,
+            &mut self.child,
+            &mut self.pending_output,
+            needle,
+            timeout,
+        )
     }
 
     fn read_available(&mut self, timeout: Duration) -> String {
-        read_available(&mut self.terminal, timeout)
+        read_available(&mut self.terminal, &mut self.pending_output, timeout)
     }
 
     fn wait_for_raw_mode(&self, timeout: Duration) {
@@ -309,22 +316,27 @@ fn spawn_terminal(home: &Path) -> PtySession {
     PtySession {
         child,
         terminal: unsafe { File::from_raw_fd(master) },
+        pending_output: Vec::new(),
     }
 }
 
-fn read_until(terminal: &mut File, child: &mut Child, needle: &str, timeout: Duration) -> String {
+fn read_until(
+    terminal: &mut File,
+    child: &mut Child,
+    pending_output: &mut Vec<u8>,
+    needle: &str,
+    timeout: Duration,
+) -> String {
     let started = Instant::now();
-    let mut output = Vec::new();
+    let mut output = std::mem::take(pending_output);
     let mut buffer = [0u8; 8192];
     while started.elapsed() < timeout {
+        if let Some(found) = take_through_needle(&mut output, pending_output, needle.as_bytes()) {
+            return found;
+        }
         match terminal.read(&mut buffer) {
             Ok(0) => break,
-            Ok(count) => {
-                output.extend_from_slice(&buffer[..count]);
-                if String::from_utf8_lossy(&output).contains(needle) {
-                    return String::from_utf8_lossy(&output).into_owned();
-                }
-            }
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -344,9 +356,22 @@ fn read_until(terminal: &mut File, child: &mut Child, needle: &str, timeout: Dur
     )
 }
 
-fn read_available(terminal: &mut File, timeout: Duration) -> String {
+fn take_through_needle(
+    output: &mut Vec<u8>,
+    pending_output: &mut Vec<u8>,
+    needle: &[u8],
+) -> Option<String> {
+    let position = output
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let end = position + needle.len();
+    *pending_output = output.split_off(end);
+    Some(String::from_utf8_lossy(output).into_owned())
+}
+
+fn read_available(terminal: &mut File, pending_output: &mut Vec<u8>, timeout: Duration) -> String {
     let started = Instant::now();
-    let mut output = Vec::new();
+    let mut output = std::mem::take(pending_output);
     let mut buffer = [0u8; 8192];
     while started.elapsed() < timeout {
         match terminal.read(&mut buffer) {
