@@ -223,20 +223,27 @@ is accurate; “complete parity with the proprietary product” is not.
 - The interactive composer does not accept a concurrent one-off side query
   while another model turn is active. Opt-in prompt suggestions run only after
   a completed print-mode turn and are never auto-executed.
-- The main conversation remains in native terminal scrollback rather than the
-  snapshot's always-on fullscreen cell renderer. The transcript viewer uses an
-  alternate screen, but the main REPL does not yet provide mouse selection,
-  virtualized scroll, sticky/new-message overlays, custom themes, a dynamic
-  status-line command, or a `/tui` renderer switch.
-- Prompt editing does not yet provide configurable hot-reloaded keybindings,
-  Vim Normal/Visual modes, or clipboard image ingestion. `/diff`, `/rewind`,
-  `/resume`, and `/tasks` expose their generic data and safe actions, but do
-  not reproduce the snapshot's proprietary React/Ink modal layouts or live
-  process hot-swap. These are explicit UI boundaries, not claims of parity.
+- The main conversation supports both native scrollback and an optional
+  `/tui fullscreen` virtual viewport with sticky-bottom/unseen state, resize,
+  wheel/page scrolling, mouse word/line/drag selection and bounded native
+  clipboard copy. Keyboard-only shift-selection extension is not declared.
+- Prompt editing now provides private hot-reloaded contextual keybindings,
+  Vim Insert/Normal/Visual operation, scoped persistent history, visible and
+  removable clipboard images, draft-preserving model/transcript/todo modals,
+  safe UI settings, theme presets and a trusted bounded status-line command.
+  Theme preview/custom editing and status-line refresh while the composer is
+  completely idle remain outside the declared integration surface.
+- `/diff`, `/rewind`, `/resume`, `/tasks`, `/copy`, and `/export` expose their
+  generic data and safe actions, but do not reproduce proprietary React/Ink
+  layouts or live process hot-swap. These are explicit UI boundaries, not
+  claims of parity.
 - The slash palette does not copy private usage ranking or vendor command
-  inventory, and the model picker does not discover a vendor catalog or carry
-  account, entitlement, billing, fast-mode, or proprietary effort behavior.
-  Its options are explicit trusted configuration plus the active model.
+  inventory. Builtin/custom/Skill conflicts and ranking are deterministic;
+  direct MCP prompt entries and terminal-rendered dynamic argument candidates
+  are not yet declared. The model picker does not discover a vendor catalog or
+  carry account, entitlement, billing, fast-mode, or proprietary effort
+  behavior; its options are explicit trusted configuration plus the active
+  model.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
 - `ConfigChange` covers the accepted project-Skill hot-refresh boundary only.

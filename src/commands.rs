@@ -21,6 +21,8 @@ const RESERVED_COMMANDS: &[&str] = &[
     "exit",
     "quit",
     "clear",
+    "reset",
+    "new",
     "model",
     "cost",
     "permissions",
@@ -29,10 +31,22 @@ const RESERVED_COMMANDS: &[&str] = &[
     "init",
     "loop",
     "status",
+    "vim",
+    "keybindings",
+    "config",
+    "theme",
+    "statusline",
+    "tui",
+    "copy",
+    "export",
     "tasks",
+    "bashes",
+    "transcript",
     "diff",
+    "checkpoint",
     "rewind",
     "resume",
+    "continue",
     "skills",
     "hooks",
     "memory",
@@ -223,11 +237,19 @@ pub(crate) fn validate_command_name(name: &str) -> Result<()> {
 
 pub enum CommandOutcome {
     Handled,
-    Cleared,
+    Clear(String),
     Exit,
     SelectModel,
     ShowHelp,
     ShowStatus,
+    ToggleVim,
+    ConfigureKeybindings,
+    ConfigureUi(String),
+    ConfigureTheme(String),
+    ConfigureStatusLine(String),
+    ConfigureTui(String),
+    CopyResponse(String),
+    ExportConversation(String),
     ShowTasks(String),
     ShowTranscript,
     ShowDiff(String),
@@ -252,11 +274,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
     let argument = input[split..].trim();
     match command {
         "/exit" | "/quit" => CommandOutcome::Exit,
-        "/clear" => {
-            engine.clear();
-            println!("Conversation cleared.");
-            CommandOutcome::Cleared
-        }
+        "/clear" | "/reset" | "/new" => CommandOutcome::Clear(argument.to_owned()),
         "/model" if argument.is_empty() => CommandOutcome::SelectModel,
         "/model" if MODEL_INFO_ARGS.contains(&argument) => {
             println!("Current model: {}", engine.model);
@@ -307,6 +325,14 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             CommandOutcome::Handled
         }
         "/status" => CommandOutcome::ShowStatus,
+        "/vim" => CommandOutcome::ToggleVim,
+        "/keybindings" => CommandOutcome::ConfigureKeybindings,
+        "/config" => CommandOutcome::ConfigureUi(argument.to_owned()),
+        "/theme" => CommandOutcome::ConfigureTheme(argument.to_owned()),
+        "/statusline" => CommandOutcome::ConfigureStatusLine(argument.to_owned()),
+        "/tui" => CommandOutcome::ConfigureTui(argument.to_owned()),
+        "/copy" => CommandOutcome::CopyResponse(argument.to_owned()),
+        "/export" => CommandOutcome::ExportConversation(argument.to_owned()),
         "/tasks" | "/bashes" => CommandOutcome::ShowTasks(argument.to_owned()),
         "/transcript" => CommandOutcome::ShowTranscript,
         "/diff" => CommandOutcome::ShowDiff(argument.to_owned()),

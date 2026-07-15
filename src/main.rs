@@ -9,6 +9,7 @@ const MAX_SYSTEM_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Parser;
 use ignore::{DirEntry, WalkBuilder};
 use serde_json::{Value, json};
@@ -20,12 +21,18 @@ use open_agent_harness::{
     api::ModelClient,
     auto_memory::{AutoMemory, AutoMemoryExtractor},
     cli::{Cli, HarnessCommand, InputFormat, OutputFormat},
+    clipboard::{ClipboardImage, write_clipboard_text},
+    command_palette::{
+        CommandCatalog, CommandDescriptor, CommandKind, CommandSource, MAX_PALETTE_RESULTS,
+    },
     commands::{self, CommandOutcome, CustomCommandCatalog},
     config::{DEFAULT_MODEL, EndpointConfig, ModelOption, Settings, endpoint_config},
     control::{ControlHandle, ControlSession, InboundMessage},
     file_history::{CheckpointInfo, CheckpointStatus, FileHistory, RewindReport},
     hooks::{HookExecutionEvent, HookObserver, HookRunner},
+    input_history::{HistoryContext, HistoryQuery, HistoryScope, InputHistoryStore},
     interactions::UserInteractionHandler,
+    keybindings::KeybindingManager,
     lsp::configure_lsp,
     mcp::{McpControl, McpHookInvoker, connect_mcp},
     permissions::{PermissionManager, PermissionMode},
@@ -35,13 +42,19 @@ use open_agent_harness::{
     prompt::{default_system_prompt, init_prompt},
     query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions, TextDeltaSink},
     session::{SessionStateRoot, SessionStore},
+    statusline::{StatusLineOutcome, StatusLineRunner},
     structured_output::StructuredOutputTool,
     terminal::{
-        ConversationUi, FileSuggestion, InputEditor, ModelPickerOutcome, SlashCommandSuggestion,
-        select_model, view_transcript,
+        ConversationUi, FileSuggestion, InputEditor, InputReadActions, InputReadContext,
+        ModelPickerOutcome, SlashCommandSuggestion, TuiMode, open_file_in_external_editor,
+        select_model, select_rewind_checkpoint, select_theme, view_transcript,
     },
     tools::{MemoryTool, TeamTool, ToolContext, ToolRegistry, ToolService},
     types::{Message, Role},
+    ui_settings::{
+        EditorMode, ThemePreset, TuiMode as PersistedTuiMode, UiSettingSource, UiSettings,
+        UiSettingsStore,
+    },
     web_tools::configure_web,
     worktree::configure_worktree,
 };
@@ -584,7 +597,33 @@ async fn run(
     }
 
     let interactive_outcome = async {
+        let ui_settings_store = if enhanced_terminal && !cli.bare {
+            match UiSettingsStore::default_user() {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    eprintln!("UI settings persistence disabled: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut ui_settings = match &ui_settings_store {
+            Some(store) => match store.load() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!("UI settings rejected; using defaults: {error:#}");
+                    UiSettings::default()
+                }
+            },
+            None => UiSettings::default(),
+        };
+        let status_line_runner = StatusLineRunner::default();
+        if enhanced_terminal && ui_settings.tui_mode == PersistedTuiMode::Fullscreen {
+            ui.set_tui_mode(TuiMode::Fullscreen)?;
+        }
         if enhanced_terminal {
+            ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
             ui.banner(
                 &engine.model,
                 &command_context.cwd(),
@@ -599,8 +638,59 @@ async fn run(
         }
         let mut initial = cli.prompt.clone();
         let mut editor = InputEditor::default();
+        if enhanced_terminal {
+            editor.attach_ui(ui.clone());
+        }
+        if ui_settings.editor_mode == EditorMode::Vim {
+            editor.toggle_vim();
+        }
+        let persistent_history = if enhanced_terminal && !cli.bare {
+            let opened = InputHistoryStore::open_default().and_then(|history| {
+                let context = HistoryContext::new(
+                    opaque_workspace_key(&command_context.cwd()),
+                    store.id,
+                )?;
+                Ok((history, context))
+            });
+            match opened {
+                Ok((history, context)) => {
+                    let project = history.search(
+                        &context,
+                        &HistoryQuery::new(HistoryScope::Project, "", 100),
+                    );
+                    let everywhere = history.search(
+                        &context,
+                        &HistoryQuery::new(HistoryScope::Everywhere, "", 100),
+                    );
+                    match (project, everywhere) {
+                        (Ok(project), Ok(everywhere)) => editor.seed_scoped_history(
+                            project.into_iter().rev().map(|entry| entry.record.text),
+                            everywhere
+                                .into_iter()
+                                .rev()
+                                .map(|entry| entry.record.text),
+                        ),
+                        (project, everywhere) => {
+                            let error = project.err().or_else(|| everywhere.err());
+                            eprintln!(
+                                "Persistent input history unavailable: {:#}",
+                                error.expect("one scoped history query failed")
+                            );
+                        }
+                    }
+                    Some((history, context))
+                }
+                Err(error) => {
+                    eprintln!("Persistent input history disabled: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         editor.seed_history(conversation_prompt_history(&engine.messages));
         loop {
+            let mut clipboard_images = Vec::new();
             let input = match initial.take() {
                 Some(prompt) => prompt,
                 None => match command_context.take_scheduled_prompt()? {
@@ -611,20 +701,109 @@ async fn run(
                         prompt
                     }
                     None if enhanced_terminal => {
+                        ui.set_fullscreen_header(format!(
+                            "open-agent-harness · {} · {:?} · {}",
+                            engine.model,
+                            engine.permission_mode(),
+                            store.id
+                        ))?;
                         // Workspace discovery can add user-invocable Skills while a session is
                         // running. Rebuild the command palette at the prompt boundary so `/`
                         // always reflects the current command catalog.
                         let slash_commands =
                             available_command_suggestions(&command_context, &custom_commands);
                         let file_suggestions = workspace_file_suggestions(&command_context);
+                        let todo_lines = {
+                            let todos = command_context.todos.lock().await;
+                            todos
+                                .iter()
+                                .map(|todo| {
+                                    let marker = match todo.status.as_str() {
+                                        "completed" => "✓",
+                                        "in_progress" => "◐",
+                                        _ => "○",
+                                    };
+                                    format!("  {marker} {}", todo.content)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        let status_line = if let Some(config) = &ui_settings.status_line {
+                            let public_status = json!({
+                                "model": engine.model,
+                                "permissionMode": permission_mode_name(engine.permission_mode()),
+                                "sessionId": store.id,
+                                "workspaceKey": opaque_workspace_key(&command_context.cwd()),
+                            });
+                            match status_line_runner
+                                .run(config, true, &public_status, &command_context.cwd())
+                                .await
+                            {
+                                Ok(StatusLineOutcome::Rendered(rendered)) => Some(rendered.text),
+                                Ok(StatusLineOutcome::Empty | StatusLineOutcome::Stale) => None,
+                                Err(error) => {
+                                    eprintln!("Status line unavailable: {error}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let mut scheduled_prompt = || command_context.take_scheduled_prompt();
+                        let initial_mode = engine.permission_mode();
+                        let mode_locked = engine.permission_mode_locked();
+                        let transcript_snapshot = transcript_lines(&engine.messages);
+                        let mut model_picker = || {
+                            let mut options = model_options.clone();
+                            if !options.iter().any(|option| option.value == engine.model) {
+                                options.push(ModelOption {
+                                    value: engine.model.clone(),
+                                    display_name: engine.model.clone(),
+                                    description: "Current model".to_owned(),
+                                });
+                            }
+                            let outcome = select_model(&options, &engine.model)?;
+                            if let ModelPickerOutcome::Selected(model) = &outcome {
+                                engine.set_model(model.clone());
+                                ui.set_fullscreen_header(format!(
+                                    "open-agent-harness · {} · {:?} · {}",
+                                    engine.model,
+                                    engine.permission_mode(),
+                                    store.id
+                                ))?;
+                            }
+                            Ok(outcome)
+                        };
+                        let rewind_options = checkpoint_catalog(session_metadata.file_histories)?
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, checkpoint)| ModelOption {
+                                value: checkpoint.id.to_string(),
+                                display_name: format!("Message boundary {}", index + 1),
+                                description: format!(
+                                    "{} messages · {} tracked files",
+                                    checkpoint.message_count, checkpoint.tracked_files
+                                ),
+                            })
+                            .collect::<Vec<_>>();
+                        let mut rewind_picker = || select_rewind_checkpoint(&rewind_options);
+                        let mut transcript_viewer = || view_transcript(&transcript_snapshot);
                         let Some(read) = editor
                             .read(
-                                engine.permission_mode(),
-                                engine.permission_mode_locked(),
-                                &slash_commands,
-                                &file_suggestions,
-                                &mut scheduled_prompt,
+                                initial_mode,
+                                mode_locked,
+                                InputReadContext {
+                                    commands: &slash_commands,
+                                    files: &file_suggestions,
+                                    todos: &todo_lines,
+                                    status_line: status_line.as_deref(),
+                                    theme: ui_settings.theme,
+                                },
+                                InputReadActions {
+                                    scheduled_prompt: &mut scheduled_prompt,
+                                    model_picker: &mut model_picker,
+                                    rewind_picker: &mut rewind_picker,
+                                    transcript_viewer: &mut transcript_viewer,
+                                },
                             )?
                         else {
                             break;
@@ -632,7 +811,10 @@ async fn run(
                         if let Err(error) = engine.set_permission_mode(read.permission_mode) {
                             eprintln!("Mode unchanged: {error:#}");
                         }
-                        read.text
+                        clipboard_images = read.clipboard_images;
+                        let text = read.text;
+                        editor.finish_prompt();
+                        text
                     }
                     None => read_prompt()?,
                 },
@@ -642,6 +824,14 @@ async fn run(
             }
             if input.trim().is_empty() {
                 continue;
+            }
+            if let Some((history, context)) = &persistent_history {
+                if let Err(error) = history.append(context, input.clone()) {
+                    eprintln!("Input history was not persisted: {error:#}");
+                }
+            }
+            if enhanced_terminal {
+                ui.record_user_input(input.trim())?;
             }
             let mut input =
                 match resolve_extension_input(input, &command_context, &custom_commands, &hooks)
@@ -775,8 +965,32 @@ async fn run(
             }
             let input = match commands::handle(input.trim(), &mut engine) {
                 CommandOutcome::Exit => break,
-                CommandOutcome::Cleared => {
-                    store.clear_history()?;
+                CommandOutcome::Clear(name) => {
+                    match store.archive_and_clear_history() {
+                        Ok(archive_id) => {
+                            engine.clear();
+                            if enhanced_terminal {
+                                ui.replace_fullscreen_transcript(&transcript_lines(
+                                    &engine.messages,
+                                ))?;
+                            }
+                            if let Some(archive_id) = archive_id {
+                                let label = if name.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({})", bounded_single_line(&name, 80))
+                                };
+                                println!(
+                                    "Conversation cleared{label}. Previous conversation preserved as resumable session {archive_id}."
+                                );
+                            } else {
+                                println!("Conversation cleared.");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Clear failed; conversation unchanged: {error:#}");
+                        }
+                    }
                     continue;
                 }
                 CommandOutcome::Handled => continue,
@@ -813,6 +1027,207 @@ async fn run(
                 }
                 CommandOutcome::ShowStatus => {
                     print_session_status(&engine, &session_metadata);
+                    continue;
+                }
+                CommandOutcome::ToggleVim => {
+                    if !enhanced_terminal {
+                        eprintln!("Vim editing requires an interactive terminal.");
+                    } else {
+                        let enabled = editor.toggle_vim();
+                        if let Err(error) = save_ui_setting(
+                            ui_settings_store.as_ref(),
+                            &mut ui_settings,
+                            "editorMode",
+                            if enabled { "vim" } else { "normal" },
+                        ) {
+                            eprintln!("Editor mode changed for this run but was not saved: {error:#}");
+                        }
+                        if enabled {
+                            println!(
+                                "Editor mode set to vim. Use Escape to switch between INSERT and NORMAL."
+                            );
+                        } else {
+                            println!("Editor mode set to standard keyboard bindings.");
+                        }
+                    }
+                    continue;
+                }
+                CommandOutcome::ConfigureKeybindings => {
+                    if !enhanced_terminal {
+                        eprintln!("Keybinding editing requires an interactive terminal.");
+                        continue;
+                    }
+                    let path = KeybindingManager::default_user_path()
+                        .context("cannot determine the user keybindings path")?;
+                    let created = open_agent_harness::keybindings::create_default_file(&path)?;
+                    if created {
+                        println!("Created {}", path.display());
+                    }
+                    open_file_in_external_editor(&path)?;
+                    println!("Reloaded keybindings from {}", path.display());
+                    continue;
+                }
+                CommandOutcome::ConfigureUi(argument) => {
+                    if argument.is_empty() {
+                        println!("{}", serde_json::to_string_pretty(&ui_settings)?);
+                        println!(
+                            "Mutable keys: editorMode, tuiMode, theme, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator"
+                        );
+                        continue;
+                    }
+                    let Some((key, value)) = argument.split_once('=') else {
+                        eprintln!("Usage: /config [key=value]");
+                        continue;
+                    };
+                    match save_ui_setting(
+                        ui_settings_store.as_ref(),
+                        &mut ui_settings,
+                        key.trim(),
+                        value.trim(),
+                    ) {
+                        Ok(()) => {
+                            apply_ui_runtime(&ui_settings, &mut editor, &ui)?;
+                            println!("Updated UI setting {}.", key.trim());
+                        }
+                        Err(error) => eprintln!("UI setting unchanged: {error:#}"),
+                    }
+                    continue;
+                }
+                CommandOutcome::ConfigureTheme(argument) => {
+                    if argument.is_empty() {
+                        if !enhanced_terminal {
+                            println!("Theme: {}", theme_name(ui_settings.theme));
+                            println!("Themes: auto, dark, light, daltonized, no-color");
+                            continue;
+                        }
+                        let options = [
+                            ("auto", "Auto", "Follow terminal appearance"),
+                            ("dark", "Dark", "Dark-background color tokens"),
+                            ("light", "Light", "Light-background color tokens"),
+                            (
+                                "daltonized",
+                                "Daltonized",
+                                "Color-vision-friendly status tokens",
+                            ),
+                            ("no-color", "No color", "Disable ANSI color styling"),
+                        ]
+                        .into_iter()
+                        .map(|(value, display_name, description)| ModelOption {
+                            value: value.to_owned(),
+                            display_name: display_name.to_owned(),
+                            description: description.to_owned(),
+                        })
+                        .collect::<Vec<_>>();
+                        match select_theme(&options, theme_name(ui_settings.theme))? {
+                            ModelPickerOutcome::Selected(theme) => match save_ui_setting(
+                                ui_settings_store.as_ref(),
+                                &mut ui_settings,
+                                "theme",
+                                &theme,
+                            ) {
+                                Ok(()) => println!("Theme set to {}.", theme),
+                                Err(error) => eprintln!("Theme unchanged: {error:#}"),
+                            },
+                            ModelPickerOutcome::Cancelled => {
+                                println!("Theme unchanged: {}.", theme_name(ui_settings.theme));
+                            }
+                            ModelPickerOutcome::Exit => break,
+                        }
+                    } else {
+                        match save_ui_setting(
+                            ui_settings_store.as_ref(),
+                            &mut ui_settings,
+                            "theme",
+                            argument.trim(),
+                        ) {
+                            Ok(()) => println!("Theme set to {:?}.", ui_settings.theme),
+                            Err(error) => eprintln!("Theme unchanged: {error:#}"),
+                        }
+                    }
+                    continue;
+                }
+                CommandOutcome::ConfigureStatusLine(argument) => {
+                    if argument.is_empty() {
+                        match &ui_settings.status_line {
+                            Some(config) => println!(
+                                "Status line: command={:?}, padding={}, refresh={:?}",
+                                config.command, config.padding, config.refresh_interval
+                            ),
+                            None => println!("Status line: disabled"),
+                        }
+                    } else {
+                        let (key, value) = if matches!(argument.as_str(), "off" | "disable") {
+                            ("statusLine", "null")
+                        } else {
+                            ("statusLine.command", argument.as_str())
+                        };
+                        match save_ui_setting(
+                            ui_settings_store.as_ref(),
+                            &mut ui_settings,
+                            key,
+                            value,
+                        ) {
+                            Ok(()) if ui_settings.status_line.is_some() => {
+                                println!("Status line configured from trusted user settings.")
+                            }
+                            Ok(()) => println!("Status line disabled."),
+                            Err(error) => eprintln!("Status line unchanged: {error:#}"),
+                        }
+                    }
+                    continue;
+                }
+                CommandOutcome::ConfigureTui(argument) => {
+                    if !enhanced_terminal {
+                        eprintln!("TUI mode requires an interactive terminal.");
+                        continue;
+                    }
+                    match argument.as_str() {
+                        "" => ui.response(&format!("TUI mode: {}", ui.tui_mode().label()))?,
+                        "default" => {
+                            ui.set_tui_mode(TuiMode::Default)?;
+                            if let Err(error) = save_ui_setting(
+                                ui_settings_store.as_ref(),
+                                &mut ui_settings,
+                                "tuiMode",
+                                "default",
+                            ) {
+                                eprintln!("TUI mode changed for this run but was not saved: {error:#}");
+                            }
+                            ui.response("TUI mode: default")?;
+                        }
+                        "fullscreen" => {
+                            ui.set_tui_mode(TuiMode::Fullscreen)?;
+                            if let Err(error) = save_ui_setting(
+                                ui_settings_store.as_ref(),
+                                &mut ui_settings,
+                                "tuiMode",
+                                "fullscreen",
+                            ) {
+                                eprintln!("TUI mode changed for this run but was not saved: {error:#}");
+                            }
+                            ui.response("TUI mode: fullscreen")?;
+                        }
+                        _ => ui.response("Usage: /tui [default|fullscreen]")?,
+                    }
+                    continue;
+                }
+                CommandOutcome::CopyResponse(argument) => {
+                    match copy_assistant_response(&engine.messages, &argument) {
+                        Ok(index) => println!("Copied assistant response {index}."),
+                        Err(error) => eprintln!("Copy failed: {error:#}"),
+                    }
+                    continue;
+                }
+                CommandOutcome::ExportConversation(argument) => {
+                    match export_conversation(
+                        &engine.messages,
+                        &command_context.cwd(),
+                        &argument,
+                    ) {
+                        Ok(Some(path)) => println!("Conversation exported to {}", path.display()),
+                        Ok(None) => println!("Conversation exported to clipboard."),
+                        Err(error) => eprintln!("Export failed: {error:#}"),
+                    }
                     continue;
                 }
                 CommandOutcome::ShowTasks(argument) => {
@@ -904,7 +1319,7 @@ async fn run(
             let content = if let Some(content) = direct_content {
                 content
             } else {
-                match expand_explicit_file_mentions(&engine, input).await {
+                match expand_input_with_clipboard_images(&engine, input, clipboard_images).await {
                     Ok(content) => content,
                     Err(error) => {
                         eprintln!("Attachment failed: {error:#}");
@@ -935,6 +1350,9 @@ async fn run(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if enhanced_terminal {
+        let _ = ui.set_tui_mode(TuiMode::Default);
+    }
     let reason = if interactive_outcome.is_ok() {
         "interactive_exit"
     } else {
@@ -2100,6 +2518,11 @@ async fn handle_control_slash_command(
             "messageCount":engine.messages.len(),
             "viewer":"Ctrl-O transcript viewer is available in an interactive TTY"
         })),
+        "/tui" if argument.is_empty() || argument == "default" => handled(json!({
+            "mode":"default",
+            "interactive":false
+        })),
+        "/tui" => bail!("/tui fullscreen requires an interactive TTY"),
         "/help" => handled(json!({
             "commands":command_descriptors(metadata.command_context, metadata.commands)
         })),
@@ -2764,6 +3187,9 @@ fn available_command_names(context: &ToolContext, commands: &CustomCommandCatalo
         "status",
         "tasks",
         "transcript",
+        "tui",
+        "vim",
+        "keybindings",
     ]
     .into_iter()
     .map(ToOwned::to_owned)
@@ -3065,6 +3491,48 @@ async fn expand_explicit_file_mentions(engine: &QueryEngine, input: String) -> R
     Ok(Value::Array(blocks))
 }
 
+async fn expand_input_with_clipboard_images(
+    engine: &QueryEngine,
+    input: String,
+    clipboard_images: Vec<ClipboardImage>,
+) -> Result<Value> {
+    let content = expand_explicit_file_mentions(engine, input).await?;
+    if clipboard_images.is_empty() {
+        return Ok(content);
+    }
+    let mut blocks = match content {
+        Value::String(text) => vec![json!({"type":"text", "text":text})],
+        Value::Array(blocks) => blocks,
+        other => bail!("无法把剪贴板图片附加到 {other}"),
+    };
+    let mut media_bytes = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) != Some("text"))
+        .try_fold(0usize, |total, block| {
+            total
+                .checked_add(serde_json::to_vec(block)?.len())
+                .ok_or_else(|| anyhow!("附加媒体大小溢出"))
+        })?;
+    for image in clipboard_images {
+        let block = json!({
+            "type":"image",
+            "source":{
+                "type":"base64",
+                "media_type":image.media_type,
+                "data":BASE64_STANDARD.encode(image.bytes)
+            }
+        });
+        media_bytes = media_bytes
+            .checked_add(serde_json::to_vec(&block)?.len())
+            .ok_or_else(|| anyhow!("附加媒体大小溢出"))?;
+        if media_bytes > MAX_EXPLICIT_FILE_MEDIA_BYTES {
+            bail!("附加媒体总量超过 12 MiB")
+        }
+        blocks.push(block);
+    }
+    Ok(Value::Array(blocks))
+}
+
 fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
     let context = metadata.command_context;
     let (used, threshold, window) = engine.context_status();
@@ -3113,30 +3581,138 @@ fn print_session_status(engine: &QueryEngine, metadata: &SessionMetadata<'_>) {
     );
 }
 
+const MAX_CONVERSATION_EXPORT_BYTES: usize = 8 * 1024 * 1024;
+
+fn assistant_response_text(message: &Message) -> Option<String> {
+    if message.role != Role::Assistant {
+        return None;
+    }
+    match &message.content {
+        Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        Value::Array(blocks) => {
+            let mut output = String::new();
+            for text in blocks.iter().filter_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            }) {
+                if !output.is_empty() {
+                    output.push_str("\n\n");
+                }
+                if output.len().saturating_add(text.len()) > MAX_CONVERSATION_EXPORT_BYTES {
+                    return None;
+                }
+                output.push_str(text);
+            }
+            (!output.trim().is_empty()).then_some(output)
+        }
+        _ => None,
+    }
+}
+
+fn copy_assistant_response(messages: &[Message], argument: &str) -> Result<usize> {
+    let index = if argument.trim().is_empty() {
+        1
+    } else {
+        argument
+            .trim()
+            .parse::<usize>()
+            .context("/copy expects a positive response number")?
+    };
+    if index == 0 || index > 100 {
+        bail!("/copy response number must be between 1 and 100")
+    }
+    let response = messages
+        .iter()
+        .rev()
+        .filter_map(assistant_response_text)
+        .nth(index - 1)
+        .with_context(|| format!("assistant response {index} is unavailable"))?;
+    write_clipboard_text(&response).map_err(|error| anyhow!(error.to_string()))?;
+    Ok(index)
+}
+
+fn export_conversation(
+    messages: &[Message],
+    workspace: &std::path::Path,
+    argument: &str,
+) -> Result<Option<PathBuf>> {
+    let text = transcript_lines(messages).join("\n");
+    if text.len() > MAX_CONVERSATION_EXPORT_BYTES {
+        bail!("conversation export exceeds the 8 MiB limit")
+    }
+    let filename = argument.trim();
+    if filename.is_empty() {
+        write_clipboard_text(&text).map_err(|error| anyhow!(error.to_string()))?;
+        return Ok(None);
+    }
+    if filename.contains(['\0', '\n', '\r']) {
+        bail!("export filename contains forbidden control data")
+    }
+    let relative = std::path::Path::new(filename);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        bail!("export filename must stay inside the current workspace")
+    }
+    let workspace = std::fs::canonicalize(workspace).context("cannot resolve export workspace")?;
+    let destination = workspace.join(relative);
+    let parent = destination
+        .parent()
+        .context("export filename has no parent directory")?;
+    let parent = std::fs::canonicalize(parent).context("export parent directory is unavailable")?;
+    if !parent.starts_with(&workspace) {
+        bail!("export filename escapes the current workspace")
+    }
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        bail!("export destination already exists")
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&destination)
+        .context("cannot create export file")?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    Ok(Some(destination))
+}
+
 fn transcript_lines(messages: &[Message]) -> Vec<String> {
     const MAX_TRANSCRIPT_LINES: usize = 10_000;
     const MAX_TRANSCRIPT_LINE_BYTES: usize = 16 * 1024;
-    let mut lines = Vec::new();
+    let data_limit = MAX_TRANSCRIPT_LINES - 1;
+    let mut lines = std::collections::VecDeque::new();
+    let mut truncated = false;
     for message in messages {
-        if lines.len() >= MAX_TRANSCRIPT_LINES {
-            break;
-        }
-        lines.push(match message.role {
-            Role::User => "You".to_owned(),
-            Role::Assistant => "Assistant".to_owned(),
-        });
+        push_recent_transcript_line(
+            &mut lines,
+            match message.role {
+                Role::User => "You".to_owned(),
+                Role::Assistant => "Assistant".to_owned(),
+            },
+            data_limit,
+            &mut truncated,
+        );
         match &message.content {
             Value::String(text) => push_transcript_text(
                 &mut lines,
                 text,
-                MAX_TRANSCRIPT_LINES,
+                data_limit,
                 MAX_TRANSCRIPT_LINE_BYTES,
+                &mut truncated,
             ),
             Value::Array(blocks) => {
                 for block in blocks {
-                    if lines.len() >= MAX_TRANSCRIPT_LINES {
-                        break;
-                    }
                     let kind = block
                         .get("type")
                         .and_then(Value::as_str)
@@ -3148,12 +3724,18 @@ fn transcript_lines(messages: &[Message]) -> Vec<String> {
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default(),
-                            MAX_TRANSCRIPT_LINES,
+                            data_limit,
                             MAX_TRANSCRIPT_LINE_BYTES,
+                            &mut truncated,
                         ),
                         "tool_use" => {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            lines.push(format!("  [tool call: {name}]"));
+                            push_recent_transcript_line(
+                                &mut lines,
+                                format!("  [tool call: {name}]"),
+                                data_limit,
+                                &mut truncated,
+                            );
                         }
                         "tool_result" => {
                             let status = if block
@@ -3165,34 +3747,60 @@ fn transcript_lines(messages: &[Message]) -> Vec<String> {
                             } else {
                                 "result"
                             };
-                            lines.push(format!("  [tool {status}]"));
+                            push_recent_transcript_line(
+                                &mut lines,
+                                format!("  [tool {status}]"),
+                                data_limit,
+                                &mut truncated,
+                            );
                             if let Some(content) = block.get("content").and_then(Value::as_str) {
                                 push_transcript_text(
                                     &mut lines,
                                     content,
-                                    MAX_TRANSCRIPT_LINES,
+                                    data_limit,
                                     MAX_TRANSCRIPT_LINE_BYTES,
+                                    &mut truncated,
                                 );
                             }
                         }
                         "image" | "document" => {
-                            lines.push(format!("  [{kind} attachment]"));
+                            push_recent_transcript_line(
+                                &mut lines,
+                                format!("  [{kind} attachment]"),
+                                data_limit,
+                                &mut truncated,
+                            );
                         }
-                        "thinking" | "reasoning" => lines.push("  [reasoning hidden]".to_owned()),
-                        other => lines.push(format!("  [{other}]")),
+                        "thinking" | "reasoning" => push_recent_transcript_line(
+                            &mut lines,
+                            "  [reasoning hidden]".to_owned(),
+                            data_limit,
+                            &mut truncated,
+                        ),
+                        other => push_recent_transcript_line(
+                            &mut lines,
+                            format!("  [{other}]"),
+                            data_limit,
+                            &mut truncated,
+                        ),
                     }
                 }
             }
-            _ => lines.push("  [unsupported content]".to_owned()),
+            _ => push_recent_transcript_line(
+                &mut lines,
+                "  [unsupported content]".to_owned(),
+                data_limit,
+                &mut truncated,
+            ),
         }
-        lines.push(String::new());
+        push_recent_transcript_line(&mut lines, String::new(), data_limit, &mut truncated);
     }
     if messages.is_empty() {
-        lines.push("Transcript is empty.".to_owned());
-    } else if lines.len() >= MAX_TRANSCRIPT_LINES {
-        lines.push("… transcript line limit reached".to_owned());
+        lines.push_back("Transcript is empty.".to_owned());
+    } else if truncated {
+        lines.push_front("… earlier transcript lines omitted".to_owned());
     }
-    lines
+    lines.into_iter().collect()
 }
 
 fn conversation_prompt_history(messages: &[Message]) -> Vec<String> {
@@ -3228,22 +3836,38 @@ fn conversation_prompt_history(messages: &[Message]) -> Vec<String> {
 }
 
 fn push_transcript_text(
-    lines: &mut Vec<String>,
+    lines: &mut std::collections::VecDeque<String>,
     text: &str,
     max_lines: usize,
     max_line_bytes: usize,
+    truncated: &mut bool,
 ) {
     for source in text.lines() {
-        if lines.len() >= max_lines {
-            return;
-        }
         let mut end = source.len().min(max_line_bytes);
         while !source.is_char_boundary(end) {
             end -= 1;
         }
         let suffix = if end < source.len() { "…" } else { "" };
-        lines.push(format!("  {}{suffix}", &source[..end]));
+        push_recent_transcript_line(
+            lines,
+            format!("  {}{suffix}", &source[..end]),
+            max_lines,
+            truncated,
+        );
     }
+}
+
+fn push_recent_transcript_line(
+    lines: &mut std::collections::VecDeque<String>,
+    line: String,
+    max_lines: usize,
+    truncated: &mut bool,
+) {
+    if lines.len() == max_lines {
+        lines.pop_front();
+        *truncated = true;
+    }
+    lines.push_back(line);
 }
 
 async fn print_task_status(
@@ -3415,14 +4039,31 @@ fn available_command_suggestions(
     commands: &CustomCommandCatalog,
 ) -> Vec<SlashCommandSuggestion> {
     let mut suggestions = [
-        ("clear", &[][..], "Clear conversation history", None),
+        (
+            "clear",
+            &["reset", "new"][..],
+            "Start a new conversation and preserve this one for resume",
+            Some("[name]"),
+        ),
         (
             "compact",
             &[][..],
             "Compact conversation context",
             Some("[instructions]"),
         ),
+        (
+            "config",
+            &[][..],
+            "Show or update safe user terminal settings",
+            Some("[key=value]"),
+        ),
         ("context", &[][..], "Show context usage", None),
+        (
+            "copy",
+            &[][..],
+            "Copy a recent assistant response to the clipboard",
+            Some("[N]"),
+        ),
         ("cost", &[][..], "Show token usage", None),
         (
             "diff",
@@ -3431,6 +4072,12 @@ fn available_command_suggestions(
             Some("[list|checkpoint-id|number]"),
         ),
         ("exit", &["quit"][..], "Exit the session", None),
+        (
+            "export",
+            &[][..],
+            "Export the conversation to a workspace file or clipboard",
+            Some("[filename]"),
+        ),
         ("help", &[][..], "Show available commands", None),
         ("hooks", &[][..], "Show hook configuration status", None),
         ("init", &[][..], "Create or improve AGENTS.md", None),
@@ -3481,15 +4128,45 @@ fn available_command_suggestions(
         ("skills", &[][..], "List available Skills", None),
         ("status", &[][..], "Show current session status", None),
         (
+            "statusline",
+            &[][..],
+            "Show, disable, or configure the trusted status line",
+            Some("[off|command]"),
+        ),
+        (
             "tasks",
             &["bashes"][..],
             "List or manage persistent tasks, background work, and cron jobs",
             Some("[output|stop <task-id>]"),
         ),
         (
+            "theme",
+            &[][..],
+            "Show or choose the terminal theme",
+            Some("[auto|dark|light|daltonized|no-color]"),
+        ),
+        (
             "transcript",
             &[][..],
             "Open the bounded searchable transcript viewer",
+            None,
+        ),
+        (
+            "tui",
+            &[][..],
+            "Show or switch the terminal layout",
+            Some("[default|fullscreen]"),
+        ),
+        (
+            "vim",
+            &[][..],
+            "Toggle Vim and standard editing modes",
+            None,
+        ),
+        (
+            "keybindings",
+            &[][..],
+            "Open the hot-reloaded keybinding configuration",
             None,
         ),
     ]
@@ -3505,42 +4182,176 @@ fn available_command_suggestions(
     )
     .collect::<Vec<_>>();
 
-    let mut used = suggestions
-        .iter()
-        .map(|suggestion| suggestion.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+    let fallback_suggestions = suggestions.clone();
+    let mut descriptors = suggestions
+        .drain(..)
+        .map(|suggestion| {
+            let mut descriptor = CommandDescriptor::new(
+                suggestion.name,
+                suggestion.description,
+                CommandKind::Builtin,
+                CommandSource::Builtin,
+            );
+            descriptor.aliases = suggestion.aliases;
+            descriptor.argument_hint = suggestion.argument_hint;
+            descriptor
+        })
+        .collect::<Vec<_>>();
     for (name, definition) in commands.iter() {
-        if used.insert(name.clone()) {
-            suggestions.push(SlashCommandSuggestion {
-                name: name.clone(),
-                aliases: Vec::new(),
-                description: definition.description.clone(),
-                argument_hint: Some("[arguments]".to_owned()),
-                execute_on_enter: true,
-            });
-        }
+        let mut descriptor = CommandDescriptor::new(
+            name.clone(),
+            definition.description.clone(),
+            CommandKind::Custom,
+            CommandSource::UserSettings,
+        );
+        descriptor.argument_hint = Some("[arguments]".to_owned());
+        descriptors.push(descriptor);
     }
+    let mut skills_with_arguments = std::collections::BTreeSet::new();
     for (name, skill) in context.skill_catalog().iter() {
-        if skill.user_invocable && used.insert(name.clone()) {
-            suggestions.push(SlashCommandSuggestion {
-                name: name.clone(),
-                aliases: Vec::new(),
-                description: skill.description.clone(),
-                argument_hint: skill.argument_hint.clone(),
-                execute_on_enter: skill.argument_names.is_empty(),
-            });
+        if skill.user_invocable {
+            let mut descriptor = CommandDescriptor::new(
+                name.clone(),
+                skill.description.clone(),
+                CommandKind::Skill,
+                CommandSource::ProjectSettings,
+            );
+            descriptor.argument_hint = skill.argument_hint.clone();
+            descriptor.argument_names.clone_from(&skill.argument_names);
+            if !skill.argument_names.is_empty() {
+                skills_with_arguments.insert(name.clone());
+            }
+            descriptors.push(descriptor);
         }
     }
-    suggestions
+    let catalog = match CommandCatalog::try_new(descriptors) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("Command palette metadata rejected: {error}");
+            return fallback_suggestions;
+        }
+    };
+    match catalog.suggestions("/", MAX_PALETTE_RESULTS) {
+        Ok(ranked) => ranked
+            .into_iter()
+            .map(|suggestion| SlashCommandSuggestion {
+                execute_on_enter: suggestion.kind != CommandKind::Skill
+                    || !skills_with_arguments.contains(&suggestion.name),
+                name: suggestion.name,
+                aliases: suggestion.aliases,
+                description: suggestion.description,
+                argument_hint: suggestion.argument_hint,
+            })
+            .collect(),
+        Err(error) => {
+            eprintln!("Command palette unavailable: {error}");
+            fallback_suggestions
+        }
+    }
 }
 
 fn permission_mode_name(mode: PermissionMode) -> &'static str {
     mode.as_setting()
 }
 
+fn theme_name(theme: ThemePreset) -> &'static str {
+    match theme {
+        ThemePreset::Auto => "auto",
+        ThemePreset::Dark => "dark",
+        ThemePreset::Light => "light",
+        ThemePreset::Daltonized => "daltonized",
+        ThemePreset::NoColor => "no-color",
+    }
+}
+
+fn save_ui_setting(
+    store: Option<&UiSettingsStore>,
+    settings: &mut UiSettings,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let store = store.context("user UI settings store is unavailable")?;
+    let mut next = settings.clone();
+    next.apply_setting(UiSettingSource::User, key, value)?;
+    store.save(&next)?;
+    *settings = next;
+    Ok(())
+}
+
+fn apply_ui_runtime(
+    settings: &UiSettings,
+    editor: &mut InputEditor,
+    ui: &ConversationUi,
+) -> Result<()> {
+    let wants_vim = settings.editor_mode == EditorMode::Vim;
+    if editor.vim_mode().is_some() != wants_vim {
+        editor.toggle_vim();
+    }
+    ui.set_tui_mode(match settings.tui_mode {
+        PersistedTuiMode::Default => TuiMode::Default,
+        PersistedTuiMode::Fullscreen => TuiMode::Fullscreen,
+    })?;
+    Ok(())
+}
+
+fn opaque_workspace_key(path: &std::path::Path) -> String {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let hash = canonical
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u128::from(*byte)).wrapping_mul(PRIME)
+        });
+    format!("{hash:032x}")
+}
+
+fn bounded_single_line(value: &str, limit: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(limit)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_response_selection_and_export_are_bounded_and_workspace_confined() {
+        let messages = vec![
+            Message::assistant(vec![json!({"type":"text","text":"older"})]),
+            Message::user_text("question"),
+            Message::assistant(vec![
+                json!({"type":"text","text":"newer"}),
+                json!({"type":"reasoning","text":"private"}),
+            ]),
+        ];
+        assert_eq!(
+            assistant_response_text(&messages[0]).as_deref(),
+            Some("older")
+        );
+        assert_eq!(
+            assistant_response_text(&messages[2]).as_deref(),
+            Some("newer")
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        let path = export_conversation(&messages, workspace.path(), "conversation.txt")
+            .unwrap()
+            .unwrap();
+        let exported = std::fs::read_to_string(path).unwrap();
+        assert!(exported.contains("older"));
+        assert!(exported.contains("newer"));
+        assert!(!exported.contains("private"));
+        assert!(export_conversation(&messages, workspace.path(), "../escape.txt").is_err());
+        assert!(export_conversation(&messages, workspace.path(), "conversation.txt").is_err());
+    }
 
     #[test]
     fn runtime_status_commands_are_present_in_palette_and_control_catalog() {

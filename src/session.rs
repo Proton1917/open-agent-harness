@@ -762,6 +762,25 @@ impl SessionStore {
         append_record_bytes(&mut contents, &record)?;
         replace_private_transcript(&self.file, &contents)
     }
+
+    /// Preserves the current conversation as a resumable session before
+    /// starting an empty history in this live runtime. The live store keeps
+    /// its id so existing tool/file-history recorders remain valid; callers
+    /// receive the fresh archive id to expose through `/resume`.
+    pub fn archive_and_clear_history(&self) -> Result<Option<Uuid>> {
+        if !self.enabled || !self.file.exists() {
+            self.clear_history()?;
+            return Ok(None);
+        }
+        let (archive, messages) = self.fork_from(None, true)?;
+        if messages.is_empty() {
+            let _ = fs::remove_file(&archive.file);
+            self.clear_history()?;
+            return Ok(None);
+        }
+        self.clear_history()?;
+        Ok(Some(archive.id))
+    }
 }
 
 fn project_directory(cwd: &Path) -> Result<PathBuf> {
@@ -1520,6 +1539,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn archive_and_clear_keeps_previous_conversation_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let store = test_store(
+            temp.path(),
+            temp.path().join(format!("{session_id}.jsonl")),
+            session_id,
+        );
+        let previous = vec![
+            Message::user_text("preserve me"),
+            Message::assistant(vec![serde_json::json!({"type":"text","text":"kept"})]),
+        ];
+        store.append(&previous).unwrap();
+        let archive_id = store.archive_and_clear_history().unwrap().unwrap();
+        let archive_file = temp.path().join(format!("{archive_id}.jsonl"));
+        assert_eq!(load_messages(&archive_file).unwrap(), previous);
+        assert!(load_messages(&store.file).unwrap().is_empty());
+        assert_ne!(archive_id, store.id);
     }
 
     #[test]
