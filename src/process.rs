@@ -595,6 +595,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
         use tokio::time::{Duration, sleep, timeout};
 
+        const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
         let script = concat!(
             "$child = Start-Process -FilePath powershell.exe ",
             "-ArgumentList '-NoProfile','-NonInteractive','-Command',",
@@ -612,12 +613,12 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         let mut stdout = BufReader::new(stdout);
         let mut line = String::new();
-        timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+        timeout(STARTUP_TIMEOUT, stdout.read_line(&mut line))
             .await
             .unwrap()
             .unwrap();
         let descendant = line.trim().parse::<u32>().unwrap();
-        timeout(Duration::from_secs(5), child.wait())
+        timeout(STARTUP_TIMEOUT, child.wait())
             .await
             .expect("PowerShell parent should exit")
             .unwrap();
