@@ -74,6 +74,12 @@ The frontend comparison is grounded principally in these source files:
 - `/btw` runs a tool-free contextual side question without blocking or mutating
   the main transcript. `/copy` and `/export` expose bounded public answer text
   without private reasoning or silent overwrite.
+- Explicitly enabled prompt suggestions use one replaceable, tool-free
+  background request after successful turns. A short single-line result is an
+  empty-composer placeholder: Enter sends it, while Tab or Right accepts it for
+  editing. Key or paste activity aborts the request and advances a generation
+  guard; a delayed stale completion cannot reappear. The request is absent from
+  the transcript, and the same option retains the stream-JSON push surface.
 
 ### Rendering, progress, and dialogs
 
@@ -105,6 +111,9 @@ The frontend comparison is grounded principally in these source files:
 - Real-PTY fixtures mark the master descriptor close-on-exec, drain terminal
   output while awaiting a clean exit, and assert that controlling-PTY hangup
   cannot leave detached harness children behind.
+- A real-PTY prompt-suggestion fixture delays one response until after typing,
+  proves the stale generation stays hidden, then proves re-arming, Enter
+  acceptance, tool-free registration, and delivery into the next main request.
 - Completed interactive turns arm one bounded idle-notification timer. Any
   terminal event or next scheduled/submitted prompt cancels it; a real-PTY
   regression proves cancellation and re-arming. Delivery supports sanitized

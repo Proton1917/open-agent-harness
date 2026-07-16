@@ -118,6 +118,8 @@ pub struct UiSettings {
     #[serde(default = "default_true")]
     pub syntax_highlighting: bool,
     #[serde(default)]
+    pub prompt_suggestion_enabled: bool,
+    #[serde(default)]
     pub preferred_notif_channel: NotificationChannel,
     #[serde(default = "default_idle_notification_threshold_ms")]
     pub message_idle_notif_threshold_ms: u64,
@@ -139,6 +141,7 @@ impl Default for UiSettings {
             theme: ThemePreset::default(),
             copy_on_select: true,
             syntax_highlighting: true,
+            prompt_suggestion_enabled: false,
             preferred_notif_channel: NotificationChannel::default(),
             message_idle_notif_threshold_ms: DEFAULT_IDLE_NOTIFICATION_THRESHOLD_MS,
             status_line: None,
@@ -195,6 +198,11 @@ impl UiSettings {
                 next.syntax_highlighting = value
                     .parse::<bool>()
                     .context("syntaxHighlighting must be true or false")?;
+            }
+            "promptSuggestionEnabled" => {
+                next.prompt_suggestion_enabled = value
+                    .parse::<bool>()
+                    .context("promptSuggestionEnabled must be true or false")?;
             }
             "preferredNotifChannel" => {
                 next.preferred_notif_channel = NotificationChannel::parse(value)?;
@@ -400,6 +408,10 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     },
     UiSettingSpec {
         key: "syntaxHighlighting",
+        value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "promptSuggestionEnabled",
         value_kind: UiSettingValueKind::Boolean,
     },
     UiSettingSpec {
@@ -822,6 +834,7 @@ mod tests {
             theme: ThemePreset::DarkDaltonized,
             copy_on_select: false,
             syntax_highlighting: false,
+            prompt_suggestion_enabled: true,
             preferred_notif_channel: NotificationChannel::Ghostty,
             message_idle_notif_threshold_ms: 90_000,
             status_line: Some(StatusLineConfig {
@@ -984,6 +997,33 @@ mod tests {
                 .iter()
                 .any(|spec| spec.key == "messageIdleNotifThresholdMs")
         );
+    }
+
+    #[test]
+    fn prompt_suggestions_are_explicit_typed_and_transactional() {
+        let mut settings = UiSettings::default();
+        assert!(!settings.prompt_suggestion_enabled);
+        settings
+            .apply_setting(UiSettingSource::User, "promptSuggestionEnabled", "true")
+            .unwrap();
+        assert!(settings.prompt_suggestion_enabled);
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["promptSuggestionEnabled"],
+            true
+        );
+        assert!(
+            UI_SETTING_REGISTRY
+                .iter()
+                .any(|spec| spec.key == "promptSuggestionEnabled")
+        );
+
+        let before = settings.clone();
+        assert!(
+            settings
+                .apply_setting(UiSettingSource::User, "promptSuggestionEnabled", "yes")
+                .is_err()
+        );
+        assert_eq!(settings, before);
     }
 
     #[test]

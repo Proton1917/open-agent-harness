@@ -9,7 +9,7 @@ use std::{
         unix::process::CommandExt,
     },
     process::{Child, Command, Stdio},
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -617,6 +617,101 @@ fn idle_terminal_notification_cancels_on_activity_and_rearms_after_next_turn() {
     );
     assert!(notification.contains("The agent is waiting for your input"));
 
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
+fn interactive_prompt_suggestion_cancels_stale_work_rearms_and_accepts() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for (delay, response) in [
+            (Duration::ZERO, text_stream("FIRST_TURN_DONE")),
+            (Duration::from_millis(1_500), text_stream("run the tests")),
+            (Duration::ZERO, text_stream("SECOND_TURN_DONE")),
+            (Duration::ZERO, text_stream("commit changes")),
+            (Duration::ZERO, text_stream("SUGGESTION_ACCEPTED")),
+            (Duration::ZERO, text_stream("push it")),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            captured.lock().unwrap().push(read_request(&mut stream));
+            thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+        }
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) =
+        spawn_terminal_with_args(&[&base_url], &["--prompt-suggestions"]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"first turn\r").unwrap();
+    let first = read_until(&mut terminal, "FIRST_TURN_DONE", Duration::from_secs(10));
+    if !first.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    let accepted_first_suggestion_request = Instant::now();
+    while requests.lock().unwrap().len() < 2 {
+        assert!(
+            accepted_first_suggestion_request.elapsed() < Duration::from_secs(3),
+            "prompt suggestion request did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    terminal.write_all(b"x").unwrap();
+    let typed = read_until(&mut terminal, "› x", Duration::from_secs(3));
+    assert!(!typed.contains("run the tests"));
+    let stale_window = read_available(&mut terminal, Duration::from_millis(1_700));
+    assert!(
+        !stale_window.contains("run the tests"),
+        "cancelled generation repopulated the composer: {stale_window:?}"
+    );
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+
+    terminal.write_all(b"prepare next\r").unwrap();
+    let second = read_until(&mut terminal, "SECOND_TURN_DONE", Duration::from_secs(10));
+    let suggestion = if second.contains("commit changes") {
+        second
+    } else {
+        read_until(&mut terminal, "commit changes", Duration::from_secs(5))
+    };
+    assert!(suggestion.contains("Enter send"));
+    assert!(suggestion.contains("Tab/→ edit"));
+    terminal.write_all(b"\r").unwrap();
+    let accepted = read_until(
+        &mut terminal,
+        "SUGGESTION_ACCEPTED",
+        Duration::from_secs(10),
+    );
+    assert!(accepted.contains("commit changes"));
+    if !accepted.contains("push it") {
+        let _ = read_until(&mut terminal, "push it", Duration::from_secs(5));
+    }
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[1].contains("\"tools\":[]"));
+    assert!(requests[3].contains("\"tools\":[]"));
+    assert!(requests[4].contains("commit changes"));
+    drop(requests);
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
         &mut terminal,

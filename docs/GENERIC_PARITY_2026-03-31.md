@@ -173,7 +173,9 @@ is accurate; “complete parity with the proprietary product” is not.
 - Stream-JSON uses separate bounded control/now/next/later lanes and supports
   queued-message cancellation, interruption receipts that preserve queued
   work, command lifecycle events, optional accepted-user replay
-  acknowledgements, and one opt-in tool-free prompt suggestion request.
+  acknowledgements, and one opt-in tool-free prompt suggestion request. The
+  same explicit option now drives an interactive empty-composer suggestion
+  without changing the transcript.
 
 ### MCP, web, prompt, context, and memory
 
@@ -234,9 +236,8 @@ is accurate; “complete parity with the proprietary product” is not.
   configuration mutation, arbitrary transcript injection/replay, or vendor
   callback families. Plugin lifecycle is a separate CLI operation for a later
   process, and accepted-user replay is a bounded delivery acknowledgement.
-- The interactive composer does not accept a concurrent one-off side query
-  while another model turn is active. Opt-in prompt suggestions run only after
-  a completed print-mode turn and are never auto-executed.
+- The interactive composer does not yet accept a concurrent one-off side query
+  while another model turn is active.
 - The main conversation supports both native scrollback and an optional
   `/tui fullscreen` virtual viewport with sticky-bottom/unseen state, resize,
   wheel/page scrolling, mouse word/line/drag selection, grapheme-aware keyboard
@@ -250,6 +251,10 @@ is accurate; “complete parity with the proprietary product” is not.
   Vim Insert/Normal/Visual operation, scoped persistent history, visible and
   removable clipboard images, draft-preserving model/transcript/todo modals,
   safe UI settings, theme presets and a trusted bounded status-line command.
+  Explicitly enabled prompt suggestions use one replaceable tool-free request;
+  the bounded single-line ghost appears only in an empty composer, Enter sends
+  it, Tab/Right accepts it for editing, and key/paste activity cancels both the
+  display and its generation. A generation check rejects late stale results.
   The theme picker covers the local snapshot's auto, dark/light, daltonized and
   ANSI variants, previews a bounded diff sample, toggles syntax highlighting
   with Ctrl-T, and rolls back on Escape;

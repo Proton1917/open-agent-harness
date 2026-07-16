@@ -302,7 +302,7 @@ async fn prompt_suggestion_is_tool_free_and_does_not_mutate_transcript() {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1]["tools"], json!([]));
-    assert!(requests[1].to_string().contains("Suggest one concise"));
+    assert!(requests[1].to_string().contains("Predict one concise"));
 }
 
 #[tokio::test]

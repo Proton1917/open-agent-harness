@@ -106,8 +106,8 @@ pub struct Cli {
     #[arg(long)]
     pub replay_user_messages: bool,
 
-    /// After each completed print-mode turn, make one tool-free model request and emit a
-    /// provider-neutral `prompt_suggestion` stream event.
+    /// After each completed turn, make one tool-free model request. Interactive mode displays
+    /// an accept-on-Enter composer suggestion; print mode emits a stream-json event.
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub prompt_suggestions: Option<bool>,
 

@@ -64,6 +64,14 @@ OSC content, and support explicit multiplexer passthrough. These close the
 `preventSleep.ts` and generic `notifier.ts` behaviors without importing account,
 analytics, or desktop-notification services.
 
+The prompt-suggestion frontend service is backed by `src/query.rs`, the
+single-slot generation state in `src/main.rs`, typed user UI settings, composer
+rendering in `src/terminal.rs`, and a delayed-response real-PTY regression.
+Interactive suggestions are explicitly enabled, tool-free, transcript-free,
+bounded to a short single line, replaceable, and generation-checked after
+cancellation. Enter sends the ghost prompt; Tab or Right accepts it for
+editing. Print-mode stream JSON remains an explicit protocol option.
+
 ## Current project-wide work still open
 
 - Expand the ledger to every top-level service/utility family with exact Rust

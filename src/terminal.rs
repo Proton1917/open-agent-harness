@@ -1738,6 +1738,10 @@ pub struct InputReadActions<'a> {
     pub terminal_notification_refresh: &'a mut dyn FnMut() -> Option<Vec<u8>>,
     /// Records any terminal interaction so a pending idle notification can be cancelled.
     pub user_activity: &'a mut dyn FnMut(),
+    /// Returns a newly completed tool-free next-prompt suggestion.
+    pub prompt_suggestion_refresh: &'a mut dyn FnMut() -> Option<String>,
+    /// Cancels or invalidates a pending suggestion after editable input.
+    pub prompt_suggestion_activity: &'a mut dyn FnMut(),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3430,6 +3434,8 @@ impl InputEditor {
             notice_refresh,
             terminal_notification_refresh,
             user_activity,
+            prompt_suggestion_refresh,
+            prompt_suggestion_activity,
         } = actions;
         let mut raw_guard = Some(RawModeGuard::enter()?);
         #[cfg(unix)]
@@ -3472,6 +3478,7 @@ impl InputEditor {
         let mut dismissed_file_suggestions_for: Option<(String, usize)> = None;
         let mut selected_argument_suggestion = 0usize;
         let mut dismissed_argument_suggestions_for: Option<(String, usize)> = None;
+        let mut live_prompt_suggestion: Option<String> = None;
         let mut needs_redraw = true;
 
         loop {
@@ -3545,6 +3552,12 @@ impl InputEditor {
             if let Some(sequence) = terminal_notification_refresh() {
                 out.write_all(&sequence)?;
                 out.flush()?;
+            }
+            if let Some(suggestion) = prompt_suggestion_refresh() {
+                if live_prompt_suggestion.as_ref() != Some(&suggestion) {
+                    live_prompt_suggestion = Some(suggestion);
+                    needs_redraw = true;
+                }
             }
             if pending_fullscreen_action
                 .as_ref()
@@ -3684,6 +3697,7 @@ impl InputEditor {
                     todos: show_todos.then_some(live_tasks.as_slice()),
                     task_count: live_task_count,
                     status_line: live_status_line.as_deref(),
+                    prompt_suggestion: live_prompt_suggestion.as_deref(),
                     theme,
                     vim_mode,
                     vim_selection,
@@ -3740,6 +3754,24 @@ impl InputEditor {
             }
             let event = event::read()?;
             user_activity();
+            let accepts_prompt_suggestion = matches!(
+                &event,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter | KeyCode::Tab | KeyCode::Right,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+            ) && buffer.is_empty()
+                && clipboard_images.is_empty()
+                && suggestions.is_empty()
+                && file_suggestions.is_empty()
+                && argument_suggestions.is_empty()
+                && live_prompt_suggestion.is_some();
+            if !accepts_prompt_suggestion && matches!(&event, Event::Key(_) | Event::Paste(_)) {
+                live_prompt_suggestion = None;
+                prompt_suggestion_activity();
+            }
             needs_redraw = true;
             if let Some(ui) = self.ui.as_ref().filter(|ui| ui.fullscreen_active()) {
                 match &event {
@@ -4638,6 +4670,24 @@ impl InputEditor {
                             }
                         }
                         KeyEvent {
+                            code: KeyCode::Tab | KeyCode::Right,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if buffer.is_empty()
+                            && clipboard_images.is_empty()
+                            && suggestions.is_empty()
+                            && file_suggestions.is_empty()
+                            && argument_suggestions.is_empty()
+                            && live_prompt_suggestion.is_some() =>
+                        {
+                            buffer = live_prompt_suggestion
+                                .take()
+                                .expect("visible prompt suggestion was checked");
+                            cursor_byte = buffer.len();
+                            prompt_suggestion_activity();
+                            hint = "Prompt suggestion accepted; Enter to send".to_owned();
+                        }
+                        KeyEvent {
                             code: KeyCode::Enter,
                             modifiers,
                             ..
@@ -4663,6 +4713,18 @@ impl InputEditor {
                             code: KeyCode::Enter,
                             ..
                         } => {
+                            if buffer.is_empty()
+                                && clipboard_images.is_empty()
+                                && suggestions.is_empty()
+                                && file_suggestions.is_empty()
+                                && argument_suggestions.is_empty()
+                            {
+                                if let Some(suggestion) = live_prompt_suggestion.take() {
+                                    buffer = suggestion;
+                                    cursor_byte = buffer.len();
+                                    prompt_suggestion_activity();
+                                }
+                            }
                             let execute_suggestion = if suggestions.is_empty() {
                                 false
                             } else {
@@ -5573,6 +5635,7 @@ struct InputRenderState<'a> {
     todos: Option<&'a [String]>,
     task_count: usize,
     status_line: Option<&'a str>,
+    prompt_suggestion: Option<&'a str>,
     theme: ThemePreset,
     vim_mode: Option<VimMode>,
     vim_selection: Option<(usize, usize, bool)>,
@@ -5667,6 +5730,7 @@ impl RenderedInput {
             todos,
             task_count,
             status_line,
+            prompt_suggestion,
             theme,
             vim_mode,
             vim_selection,
@@ -5702,6 +5766,12 @@ impl RenderedInput {
             _ => Color::DarkGrey,
         };
         let shell_mode = buffer.starts_with('!');
+        let show_prompt_suggestion = buffer.is_empty()
+            && prompt_suggestion.is_some()
+            && file_suggestions.is_empty()
+            && argument_suggestions.is_empty()
+            && suggestions.is_empty()
+            && todos.is_none();
         let suggestion_limit = if !file_suggestions.is_empty() {
             file_suggestions.len().min(6)
         } else if !argument_suggestions.is_empty() {
@@ -5767,7 +5837,23 @@ impl RenderedInput {
                 byte_start: row.byte_start,
                 byte_end: row.byte_end,
             });
-            queue_text_with_selection(out, visible, row.byte_start, vim_selection)?;
+            if show_prompt_suggestion && index == 0 && visible.is_empty() {
+                if color {
+                    queue!(out, SetForegroundColor(muted), SetAttribute(Attribute::Dim))?;
+                }
+                queue!(
+                    out,
+                    Print(visible_line(
+                        prompt_suggestion.expect("visible suggestion was checked"),
+                        available,
+                    ))
+                )?;
+                if color {
+                    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+                }
+            } else {
+                queue_text_with_selection(out, visible, row.byte_start, vim_selection)?;
+            }
             queue!(out, Print(RAW_LINE_END))?;
         }
         if color {
@@ -5791,6 +5877,8 @@ impl RenderedInput {
             } else {
                 format!("  {hint} · Shift+Tab mode · Shift+Enter/Ctrl+J newline")
             }
+        } else if show_prompt_suggestion {
+            "  Suggested next prompt · Enter send · Tab/→ edit · type dismiss".to_owned()
         } else if let Some(status_line) = status_line {
             format!("  {}", plain_status_line(status_line))
         } else if shell_mode {
@@ -7688,6 +7776,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -7703,6 +7792,73 @@ mod tests {
                 assert_eq!(frame.get(index.wrapping_sub(1)), Some(&b'\r'));
             }
         }
+    }
+
+    #[test]
+    fn prompt_suggestion_is_a_dim_empty_composer_placeholder() {
+        let mut frame = Vec::new();
+        let mut rendered = RenderedInput::default();
+        rendered
+            .draw(
+                &mut frame,
+                InputRenderState {
+                    buffer: "",
+                    cursor_byte: 0,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
+                    argument_hint: None,
+                    todos: None,
+                    task_count: 0,
+                    status_line: None,
+                    prompt_suggestion: Some("run the tests"),
+                    theme: ThemePreset::Dark,
+                    vim_mode: None,
+                    vim_selection: None,
+                    prompt_color: None,
+                },
+            )
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.contains("run the tests"));
+        assert!(text.contains("Enter send"));
+        assert!(text.contains("Tab/→ edit"));
+
+        let mut typed_frame = Vec::new();
+        RenderedInput::default()
+            .draw(
+                &mut typed_frame,
+                InputRenderState {
+                    buffer: "r",
+                    cursor_byte: 1,
+                    mode: PermissionMode::Default,
+                    hint: "",
+                    suggestions: &[],
+                    selected_suggestion: 0,
+                    file_suggestions: &[],
+                    selected_file_suggestion: 0,
+                    argument_suggestions: &[],
+                    selected_argument_suggestion: 0,
+                    argument_hint: None,
+                    todos: None,
+                    task_count: 0,
+                    status_line: None,
+                    prompt_suggestion: Some("run the tests"),
+                    theme: ThemePreset::Auto,
+                    vim_mode: None,
+                    vim_selection: None,
+                    prompt_color: None,
+                },
+            )
+            .unwrap();
+        let typed_text = String::from_utf8_lossy(&typed_frame);
+        assert!(!typed_text.contains("run the tests"));
+        assert!(!typed_text.contains("Enter send"));
     }
 
     #[test]
@@ -7802,6 +7958,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -7833,6 +7990,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -7873,6 +8031,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -7906,6 +8065,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -7932,6 +8092,7 @@ mod tests {
                     todos: None,
                     task_count: 0,
                     status_line: None,
+                    prompt_suggestion: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,

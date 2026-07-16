@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -47,7 +47,8 @@ use open_agent_harness::{
     prompt::{default_system_prompt, init_prompt},
     protocol::ReasoningEffort,
     query::{
-        QueryEngine, QueryEvent, QueryEventSink, QueryOptions, SideQuestionAnswer, TextDeltaSink,
+        PromptSuggestionRequest, QueryEngine, QueryEvent, QueryEventSink, QueryOptions,
+        SideQuestionAnswer, TextDeltaSink,
     },
     session::{SessionStateRoot, SessionStore, SessionSummary},
     sleep_inhibitor::SleepInhibitor,
@@ -821,10 +822,12 @@ async fn run(
             std::sync::mpsc::channel::<std::result::Result<SideQuestionAnswer, String>>();
         let side_question_active = Arc::new(AtomicBool::new(false));
         let side_question_usage = Arc::new(Mutex::new(SessionUsage::default()));
+        let prompt_suggestions = InteractivePromptSuggestions::new();
         let mut mcp_prompt_commands = Vec::new();
         let mut mcp_prompts_refreshed_at: Option<Instant> = None;
         loop {
             merge_background_usage(&mut engine.usage, &side_question_usage);
+            prompt_suggestions.merge_usage(&mut engine.usage);
             let mut clipboard_images = Vec::new();
             let input = match initial.take() {
                 Some(prompt) => prompt,
@@ -1100,6 +1103,8 @@ async fn run(
                                 })
                         };
                         let mut user_activity = || idle_notifications.record_user_activity();
+                        let mut prompt_suggestion_refresh = || prompt_suggestions.poll();
+                        let mut prompt_suggestion_activity = || prompt_suggestions.cancel();
                         let read = editor.read(
                                 initial_mode,
                                 mode_locked,
@@ -1122,9 +1127,12 @@ async fn run(
                                     notice_refresh: &mut notice_refresh,
                                     terminal_notification_refresh: &mut terminal_notification_refresh,
                                     user_activity: &mut user_activity,
+                                    prompt_suggestion_refresh: &mut prompt_suggestion_refresh,
+                                    prompt_suggestion_activity: &mut prompt_suggestion_activity,
                                 },
                             )?;
                         merge_background_usage(&mut engine.usage, &side_question_usage);
+                        prompt_suggestions.merge_usage(&mut engine.usage);
                         status_line_runner.cancel();
                         let Some(read) = read else {
                             break;
@@ -1143,6 +1151,7 @@ async fn run(
             if input.len() > MAX_USER_INPUT_BYTES {
                 bail!("prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
             }
+            prompt_suggestions.cancel();
             if input.trim().is_empty() && clipboard_images.is_empty() {
                 continue;
             }
@@ -1959,7 +1968,7 @@ async fn run(
                         }
                         println!("{}", serde_json::to_string_pretty(&ui_settings)?);
                         println!(
-                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, preferredNotifChannel, messageIdleNotifThresholdMs, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
+                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, promptSuggestionEnabled, preferredNotifChannel, messageIdleNotifThresholdMs, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
                         );
                         continue;
                     }
@@ -2730,6 +2739,14 @@ async fn run(
                     } else {
                         println!("\n{}\n", result.text);
                     }
+                    if cli
+                        .prompt_suggestions
+                        .unwrap_or(ui_settings.prompt_suggestion_enabled)
+                    {
+                        prompt_suggestions.schedule(engine.prepare_prompt_suggestion());
+                    } else {
+                        prompt_suggestions.cancel();
+                    }
                     schedule_auto_memory(&memory_extractor, &engine, cli.debug);
                 }
                 Ok(None) => continue,
@@ -3283,9 +3300,10 @@ fn validate_cli_modes(cli: &Cli) -> Result<()> {
         )
     }
     if cli.prompt_suggestions == Some(true)
-        && (!cli.print || cli.output_format != OutputFormat::StreamJson)
+        && cli.print
+        && cli.output_format != OutputFormat::StreamJson
     {
-        bail!("--prompt-suggestions 需要 --print --output-format stream-json")
+        bail!("print-mode --prompt-suggestions 需要 --output-format stream-json")
     }
     Ok(())
 }
@@ -5169,6 +5187,101 @@ fn fullscreen_session_header(engine: &QueryEngine, store: &SessionStore) -> Resu
     ))
 }
 
+type PromptSuggestionCompletion = std::result::Result<Option<String>, String>;
+
+/// Owns the one replaceable interactive prompt-suggestion request. A generation check prevents a
+/// request that completed during cancellation from repopulating the composer with stale text.
+struct InteractivePromptSuggestions {
+    generation: Arc<AtomicU64>,
+    active: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    completion: Arc<Mutex<Option<(u64, PromptSuggestionCompletion)>>>,
+    usage: Arc<Mutex<SessionUsage>>,
+}
+
+impl InteractivePromptSuggestions {
+    fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(Mutex::new(None)),
+            completion: Arc::new(Mutex::new(None)),
+            usage: Arc::new(Mutex::new(SessionUsage::default())),
+        }
+    }
+
+    fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(task) = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        self.completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+
+    fn schedule(&self, request: PromptSuggestionRequest) {
+        self.cancel();
+        let generation = self.generation.load(Ordering::Acquire);
+        let current_generation = Arc::clone(&self.generation);
+        let completion = Arc::clone(&self.completion);
+        let usage = Arc::clone(&self.usage);
+        let task = tokio::spawn(async move {
+            let result = match request.answer().await {
+                Ok(answer) => {
+                    if let Some(request_usage) = answer.usage.as_ref() {
+                        usage
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .add(request_usage);
+                    }
+                    Ok(answer.text)
+                }
+                Err(error) => Err(format!("{error:#}")),
+            };
+            if current_generation.load(Ordering::Acquire) == generation {
+                *completion
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((generation, result));
+            }
+        });
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task.abort_handle());
+    }
+
+    fn poll(&self) -> Option<String> {
+        let (generation, result) = self
+            .completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()?;
+        if generation != self.generation.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        result.ok().flatten()
+    }
+
+    fn merge_usage(&self, total: &mut SessionUsage) {
+        merge_background_usage(total, &self.usage);
+    }
+}
+
+impl Drop for InteractivePromptSuggestions {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 fn merge_background_usage(total: &mut SessionUsage, pending: &Mutex<SessionUsage>) {
     let mut pending = pending
         .lock()
@@ -6445,6 +6558,12 @@ fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> Sett
             label: "Syntax highlighting".to_owned(),
             description: "Highlight fenced code in Markdown responses".to_owned(),
             value: SettingValue::Boolean(settings.syntax_highlighting),
+        },
+        SettingItem {
+            key: "promptSuggestionEnabled".to_owned(),
+            label: "Prompt suggestions".to_owned(),
+            description: "Predict one tool-free next prompt after completed turns".to_owned(),
+            value: SettingValue::Boolean(settings.prompt_suggestion_enabled),
         },
     ];
     items.push(SettingItem {
