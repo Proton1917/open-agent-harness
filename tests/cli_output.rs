@@ -8,7 +8,7 @@ use std::{
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -108,6 +108,166 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
         response("settings-status")["response"]["response"]["effective"]["memoryEnabled"],
         false
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_json_side_question_runs_while_the_main_turn_is_active() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let (mut main_stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&read_request_body(&mut main_stream)).unwrap());
+        let main_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            let response = sse_response("MAIN_CONTROL_TURN_DONE");
+            write!(
+                main_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+
+        let (mut side_stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&read_request_body(&mut side_stream)).unwrap());
+        thread::sleep(Duration::from_millis(500));
+        let response = sse_response("SIDE_CONTROL_ANSWER");
+        write!(
+            side_stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+        main_worker.join().unwrap();
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args([
+            "--print",
+            "--bare",
+            "--no-session-persistence",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", format!("http://{address}"))
+        .env("HARNESS_MESSAGES_PATH", "/v1/messages")
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        BufReader::new(stdout)
+            .lines()
+            .map(|line| {
+                let line = line.unwrap();
+                let _ = stdout_tx.send(line.clone());
+                line
+            })
+            .collect::<Vec<_>>()
+    });
+    let user_id = uuid::Uuid::new_v4();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type":"user", "uuid":user_id,
+            "message":{"role":"user", "content":"main control objective"}
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "command_lifecycle"
+            && line["command_uuid"] == user_id.to_string()
+            && line["state"] == "started"
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type":"control_request", "request_id":"side-active",
+            "request":{
+                "subtype":"side_question",
+                "question":"what is the active objective?"
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type":"control_request", "request_id":"side-overlap",
+            "request":{
+                "subtype":"side_question",
+                "question":"must not start a second request"
+            }
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let overlap = wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "control_response" && line["response"]["request_id"] == "side-overlap"
+    });
+    assert_eq!(overlap["response"]["subtype"], "error");
+    assert!(
+        overlap["response"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("already running")
+    );
+    let side = wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "control_response" && line["response"]["request_id"] == "side-active"
+    });
+    assert_eq!(side["response"]["subtype"], "success");
+    assert_eq!(
+        side["response"]["response"]["response"],
+        "SIDE_CONTROL_ANSWER"
+    );
+    wait_for_stream_json(&stdout_rx, Duration::from_secs(10), |line| {
+        line["type"] == "result" && line["subtype"] == "success"
+    });
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let stdout = stdout_reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        stdout.join("\n"),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].to_string().contains("main control objective"));
+    assert!(
+        requests[1]
+            .to_string()
+            .contains("what is the active objective?")
+    );
+    assert_eq!(requests[1]["tools"], serde_json::json!([]));
 }
 
 #[cfg(unix)]

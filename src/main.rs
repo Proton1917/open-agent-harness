@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
@@ -11,6 +12,7 @@ use std::{
 const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_SYSTEM_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_QUEUED_INTERACTIVE_INPUTS: usize = 8;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -48,16 +50,17 @@ use open_agent_harness::{
     protocol::ReasoningEffort,
     query::{
         PromptSuggestionRequest, QueryEngine, QueryEvent, QueryEventSink, QueryOptions,
-        SideQuestionAnswer, TextDeltaSink,
+        SideQuestionAnswer, SideQuestionContext, TextDeltaSink, TurnResult,
     },
     session::{SessionStateRoot, SessionStore, SessionSummary},
     sleep_inhibitor::SleepInhibitor,
     statusline::{StatusLineOutcome, StatusLineRunner},
     structured_output::StructuredOutputTool,
     terminal::{
-        AsyncInputNotice, ConversationUi, FileSuggestion, InputEditor, InputReadActions,
-        InputReadContext, ModelPickerOutcome, SlashCommandSuggestion, TaskUiUpdate, TuiMode,
-        configure_ui_dialog, manage_permissions_dialog, open_file_in_external_editor, select_model,
+        ActiveTurnAction, ActiveTurnInput, AsyncInputNotice, ConversationUi, FileSuggestion,
+        InputEditor, InputReadActions, InputReadContext, ModelPickerOutcome,
+        SlashCommandSuggestion, TaskUiUpdate, TuiMode, configure_ui_dialog,
+        manage_permissions_dialog, open_file_in_external_editor, select_model,
         select_option_dialog, select_rewind_checkpoint, select_searchable_option, select_theme,
         show_tasks_dialog, view_transcript,
     },
@@ -186,6 +189,306 @@ impl TaskUiMonitor {
 impl Drop for TaskUiMonitor {
     fn drop(&mut self) {
         self.worker.abort();
+    }
+}
+
+fn poll_side_question_notice(
+    receiver: &std::sync::mpsc::Receiver<std::result::Result<SideQuestionAnswer, String>>,
+    usage: &Arc<Mutex<SessionUsage>>,
+    active: &Arc<AtomicBool>,
+) -> Option<AsyncInputNotice> {
+    match receiver.try_recv() {
+        Ok(Ok(answer)) => {
+            if let Some(answer_usage) = &answer.usage {
+                usage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .add(answer_usage);
+            }
+            active.store(false, Ordering::Release);
+            Some(AsyncInputNotice {
+                title: "BTW".to_owned(),
+                body: answer.text,
+                is_error: false,
+            })
+        }
+        Ok(Err(error)) => {
+            active.store(false, Ordering::Release);
+            Some(AsyncInputNotice {
+                title: "BTW".to_owned(),
+                body: error,
+                is_error: true,
+            })
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            active.store(false, Ordering::Release);
+            None
+        }
+    }
+}
+
+fn launch_side_question(
+    context: &SideQuestionContext,
+    question: &str,
+    sender: &std::sync::mpsc::Sender<std::result::Result<SideQuestionAnswer, String>>,
+    active: &Arc<AtomicBool>,
+) -> Result<()> {
+    if active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        bail!("A /btw question is already running; wait for its answer.")
+    }
+    let request = match context.prepare(question) {
+        Ok(request) => request,
+        Err(error) => {
+            active.store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
+    let sender = sender.clone();
+    let active = Arc::clone(active);
+    tokio::spawn(async move {
+        let answer = request.answer().await.map_err(|error| format!("{error:#}"));
+        if sender.send(answer).is_err() {
+            active.store(false, Ordering::Release);
+        }
+    });
+    Ok(())
+}
+
+fn active_btw_question(input: &str) -> Option<&str> {
+    let input = input.trim();
+    let command = input.get(..4)?;
+    if !command.eq_ignore_ascii_case("/btw") {
+        return None;
+    }
+    let suffix = &input[4..];
+    (suffix.is_empty() || suffix.starts_with(char::is_whitespace)).then(|| suffix.trim())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_active_terminal_turn(
+    engine: &mut QueryEngine,
+    content: Value,
+    ui: &ConversationUi,
+    side_question_sender: &std::sync::mpsc::Sender<std::result::Result<SideQuestionAnswer, String>>,
+    side_question_receiver: &std::sync::mpsc::Receiver<
+        std::result::Result<SideQuestionAnswer, String>,
+    >,
+    side_question_active: &Arc<AtomicBool>,
+    side_question_usage: &Arc<Mutex<SessionUsage>>,
+    queued_inputs: &mut VecDeque<String>,
+) -> Result<Option<TurnResult>> {
+    let side_context = engine.side_question_context(Some(&content))?;
+    let mut active_input = match ActiveTurnInput::begin(ui.clone()) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("Active-turn input unavailable: {error:#}");
+            return engine.run_turn_content_interruptible(content).await;
+        }
+    };
+    let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut cancel_sender = Some(cancel_sender);
+    let mut turn = Box::pin(engine.run_turn_content_cancellable(content, async move {
+        let _ = cancel_receiver.await;
+    }));
+    let mut terminal_error = None;
+    let turn_result = loop {
+        tokio::select! {
+            biased;
+            result = &mut turn => break result,
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                if let Some(notice) = poll_side_question_notice(
+                    side_question_receiver,
+                    side_question_usage,
+                    side_question_active,
+                ) {
+                    let display = format!(
+                        "## {}{}\n\n{}",
+                        notice.title,
+                        if notice.is_error { " failed" } else { "" },
+                        notice.body,
+                    );
+                    if let Err(error) = ui.response(&display) {
+                        terminal_error = Some(error.context("cannot render active /btw response"));
+                    } else if let Err(error) = active_input.set_hint(if notice.is_error {
+                        "BTW question failed · main turn still running"
+                    } else {
+                        "BTW answer received · main turn still running"
+                    }) {
+                        terminal_error = Some(error.context("cannot redraw active-turn input"));
+                    }
+                }
+
+                if terminal_error.is_none() {
+                    match active_input.poll() {
+                        Ok(Some(ActiveTurnAction::Interrupt)) => {
+                            if let Some(sender) = cancel_sender.take() {
+                                let _ = sender.send(());
+                            }
+                        }
+                        Ok(Some(ActiveTurnAction::Submit(input))) => {
+                            if let Some(question) = active_btw_question(&input) {
+                                let hint = if question.is_empty() {
+                                    Err(anyhow!("Usage: /btw <question>"))
+                                } else {
+                                    launch_side_question(
+                                        &side_context,
+                                        question,
+                                        side_question_sender,
+                                        side_question_active,
+                                    )
+                                };
+                                if let Err(error) = hint {
+                                    if let Err(render_error) = active_input.set_hint(format!("{error:#}")) {
+                                        terminal_error = Some(
+                                            render_error.context("cannot redraw /btw validation error"),
+                                        );
+                                    }
+                                } else if let Err(error) = active_input
+                                    .set_hint("BTW answering separately · main turn still running")
+                                {
+                                    terminal_error = Some(
+                                        error.context("cannot redraw active /btw status"),
+                                    );
+                                }
+                            } else if queued_inputs.len() >= MAX_QUEUED_INTERACTIVE_INPUTS {
+                                if let Err(error) = active_input.set_hint(format!(
+                                    "Queued input limit reached ({MAX_QUEUED_INTERACTIVE_INPUTS})"
+                                )) {
+                                    terminal_error = Some(
+                                        error.context("cannot redraw queue-limit status"),
+                                    );
+                                }
+                            } else {
+                                queued_inputs.push_back(input);
+                                if let Err(error) = active_input.set_hint(format!(
+                                    "Queued for the next turn ({}/{MAX_QUEUED_INTERACTIVE_INPUTS})",
+                                    queued_inputs.len(),
+                                )) {
+                                    terminal_error = Some(
+                                        error.context("cannot redraw queued-input status"),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            terminal_error = Some(error.context("active-turn terminal input failed"));
+                        }
+                    }
+                }
+
+                if terminal_error.is_some() {
+                    if let Some(sender) = cancel_sender.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        }
+    };
+    if let Err(error) = active_input.finish() {
+        eprintln!("Active-turn input cleanup failed: {error:#}");
+    }
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
+    turn_result
+}
+
+struct ControlSideQuestions {
+    active: Arc<AtomicBool>,
+    usage: Arc<Mutex<SessionUsage>>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl ControlSideQuestions {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(Mutex::new(SessionUsage::default())),
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn launch(
+        &mut self,
+        handle: &ControlHandle,
+        request_id: &str,
+        context: &SideQuestionContext,
+        question: &str,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        while self.tasks.try_join_next().is_some() {}
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return handle.respond_error(
+                request_id,
+                "A side_question request is already running; wait for its response.",
+            );
+        }
+        let request = match context.prepare(question) {
+            Ok(request) => request,
+            Err(error) => {
+                self.active.store(false, Ordering::Release);
+                return handle.respond_error(
+                    request_id,
+                    open_agent_harness::session::sanitize_transport_text(
+                        &format!("{error:#}"),
+                        &cwd,
+                    ),
+                );
+            }
+        };
+        let request_id = request_id.to_owned();
+        let handle = handle.clone();
+        let active = Arc::clone(&self.active);
+        let usage = Arc::clone(&self.usage);
+        self.tasks.spawn(async move {
+            match request.answer().await {
+                Ok(answer) => {
+                    if let Some(answer_usage) = &answer.usage {
+                        usage
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .add(answer_usage);
+                    }
+                    let _ = handle.respond_success(&request_id, json!({"response":answer.text}));
+                }
+                Err(error) => {
+                    let _ = handle.respond_error(
+                        &request_id,
+                        open_agent_harness::session::sanitize_transport_text(
+                            &format!("{error:#}"),
+                            &cwd,
+                        ),
+                    );
+                }
+            }
+            active.store(false, Ordering::Release);
+        });
+        Ok(())
+    }
+
+    fn merge_usage(&self, engine: &mut QueryEngine) {
+        merge_background_usage(&mut engine.usage, &self.usage);
+    }
+
+    async fn shutdown(&mut self) {
+        let drained = tokio::time::timeout(Duration::from_secs(60), async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            self.tasks.abort_all();
+            while self.tasks.join_next().await.is_some() {}
+        }
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -831,6 +1134,7 @@ async fn run(
             std::sync::mpsc::channel::<std::result::Result<SideQuestionAnswer, String>>();
         let side_question_active = Arc::new(AtomicBool::new(false));
         let side_question_usage = Arc::new(Mutex::new(SessionUsage::default()));
+        let mut queued_interactive_inputs = VecDeque::<String>::new();
         let prompt_suggestions = InteractivePromptSuggestions::new();
         let mut mcp_prompt_commands = Vec::new();
         let mut mcp_prompts_refreshed_at: Option<Instant> = None;
@@ -838,9 +1142,12 @@ async fn run(
             merge_background_usage(&mut engine.usage, &side_question_usage);
             prompt_suggestions.merge_usage(&mut engine.usage);
             let mut clipboard_images = Vec::new();
-            let input = match initial.take() {
-                Some(prompt) => prompt,
-                None => match command_context.take_scheduled_prompt()? {
+            let input = if let Some(prompt) = initial.take() {
+                prompt
+            } else if let Some(prompt) = queued_interactive_inputs.pop_front() {
+                prompt
+            } else {
+                match command_context.take_scheduled_prompt()? {
                     Some(prompt) => {
                         if !enhanced_terminal {
                             println!("[scheduled task ready]");
@@ -1067,34 +1374,12 @@ async fn run(
                         };
                         let notice_usage = Arc::clone(&side_question_usage);
                         let notice_active = Arc::clone(&side_question_active);
-                        let mut notice_refresh = || match side_question_rx.try_recv() {
-                            Ok(Ok(answer)) => {
-                                if let Some(usage) = &answer.usage {
-                                    notice_usage
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .add(usage);
-                                }
-                                notice_active.store(false, Ordering::Release);
-                                Some(AsyncInputNotice {
-                                    title: "BTW".to_owned(),
-                                    body: answer.text,
-                                    is_error: false,
-                                })
-                            }
-                            Ok(Err(error)) => {
-                                notice_active.store(false, Ordering::Release);
-                                Some(AsyncInputNotice {
-                                    title: "BTW".to_owned(),
-                                    body: error,
-                                    is_error: true,
-                                })
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                notice_active.store(false, Ordering::Release);
-                                None
-                            }
+                        let mut notice_refresh = || {
+                            poll_side_question_notice(
+                                &side_question_rx,
+                                &notice_usage,
+                                &notice_active,
+                            )
                         };
                         let notification_hooks = Arc::clone(&hooks);
                         let notification_cwd = command_context.cwd();
@@ -1155,7 +1440,7 @@ async fn run(
                         text
                     }
                     None => read_prompt()?,
-                },
+                }
             };
             if input.len() > MAX_USER_INPUT_BYTES {
                 bail!("prompt 超过 {MAX_USER_INPUT_BYTES} 字节限制")
@@ -1717,26 +2002,22 @@ async fn run(
                         }
                         continue;
                     }
-                    if side_question_active
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        eprintln!("A /btw question is already running; wait for its answer.");
-                        continue;
-                    }
-                    let request = match engine.prepare_side_question(&question) {
-                        Ok(request) => request,
+                    let context = match engine.side_question_context(None) {
+                        Ok(context) => context,
                         Err(error) => {
-                            side_question_active.store(false, Ordering::Release);
                             eprintln!("Side question unchanged: {error:#}");
                             continue;
                         }
                     };
-                    let sender = side_question_tx.clone();
-                    tokio::spawn(async move {
-                        let answer = request.answer().await.map_err(|error| format!("{error:#}"));
-                        let _ = sender.send(answer);
-                    });
+                    if let Err(error) = launch_side_question(
+                        &context,
+                        &question,
+                        &side_question_tx,
+                        &side_question_active,
+                    ) {
+                        eprintln!("Side question unchanged: {error:#}");
+                        continue;
+                    }
                     if enhanced_terminal {
                         ui.response("**BTW** question started in the background; keep typing.")?;
                     }
@@ -2724,7 +3005,21 @@ async fn run(
             };
             idle_notifications.record_user_activity();
             let sleep_guard = sleep_inhibitor.start_work();
-            let turn = engine.run_turn_content_interruptible(content).await;
+            let turn = if enhanced_terminal {
+                run_active_terminal_turn(
+                    &mut engine,
+                    content,
+                    &ui,
+                    &side_question_tx,
+                    &side_question_rx,
+                    &side_question_active,
+                    &side_question_usage,
+                    &mut queued_interactive_inputs,
+                )
+                .await
+            } else {
+                engine.run_turn_content_interruptible(content).await
+            };
             drop(sleep_guard);
             if enhanced_terminal {
                 idle_notifications.arm(
@@ -3409,6 +3704,7 @@ fn emit_stream_init(
                 "queue_priority_v1",
                 "replay_user_messages_v1",
                 "rewind_conversation_v1",
+                "side_question_v1",
                 "stop_task_v1"
             ],
         }),
@@ -3510,11 +3806,35 @@ async fn run_control_session(
     metadata: &SessionMetadata<'_>,
     memory_extractor: &AutoMemoryExtractor,
 ) -> Result<()> {
+    let mut side_questions = ControlSideQuestions::new();
+    let outcome = run_control_session_loop(
+        cli,
+        &mut session,
+        engine,
+        metadata,
+        memory_extractor,
+        &mut side_questions,
+    )
+    .await;
+    side_questions.shutdown().await;
+    side_questions.merge_usage(engine);
+    outcome
+}
+
+async fn run_control_session_loop(
+    cli: &Cli,
+    session: &mut ControlSession,
+    engine: &mut QueryEngine,
+    metadata: &SessionMetadata<'_>,
+    memory_extractor: &AutoMemoryExtractor,
+    side_questions: &mut ControlSideQuestions,
+) -> Result<()> {
     let handle = session.handle();
     let store = metadata.store;
     let command_context = metadata.command_context;
     let commands = metadata.commands;
     loop {
+        side_questions.merge_usage(engine);
         let message =
             match next_control_wake(session.recv(), command_context.wait_scheduled_prompt()).await?
             {
@@ -3535,6 +3855,8 @@ async fn run_control_session(
                         Value::String(prompt),
                         Uuid::new_v4(),
                         cancel_generation,
+                        session,
+                        side_questions,
                     )
                     .await?;
                     continue;
@@ -3617,13 +3939,33 @@ async fn run_control_session(
                     content,
                     uuid,
                     cancel_generation,
+                    session,
+                    side_questions,
                 )
                 .await?;
             }
             InboundMessage::ControlRequest {
                 request_id,
                 request,
-            } => handle_control_request(&handle, &request_id, &request, engine, metadata).await?,
+            } => {
+                if request.get("subtype").and_then(Value::as_str) == Some("side_question") {
+                    let question = request
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .context("side_question 需要 question")?;
+                    let context = engine.side_question_context(None)?;
+                    side_questions.launch(
+                        &handle,
+                        &request_id,
+                        &context,
+                        question,
+                        store.cwd().to_owned(),
+                    )?;
+                } else {
+                    handle_control_request(&handle, &request_id, &request, engine, metadata)
+                        .await?;
+                }
+            }
             InboundMessage::UpdateEnvironmentVariables { variables } => {
                 emit_json_line(
                     Some(&handle),
@@ -4085,16 +4427,44 @@ async fn execute_control_turn(
     content: Value,
     uuid: Uuid,
     cancel_generation: u64,
+    session: &mut ControlSession,
+    side_questions: &mut ControlSideQuestions,
 ) -> Result<()> {
     handle.command_lifecycle(uuid, "started")?;
-    let outcome = match engine
-        .run_turn_content_with_id_cancellable(
-            content,
-            uuid,
-            handle.cancellation_since(cancel_generation),
-        )
-        .await
-    {
+    let side_context = engine.side_question_context(Some(&content))?;
+    let mut turn = Box::pin(engine.run_turn_content_with_id_cancellable(
+        content,
+        uuid,
+        handle.cancellation_since(cancel_generation),
+    ));
+    let mut side_channel_open = true;
+    let turn_outcome = loop {
+        tokio::select! {
+            biased;
+            outcome = &mut turn => break outcome,
+            message = session.recv_side_question(), if side_channel_open => {
+                match message {
+                    Some(InboundMessage::ControlRequest { request_id, request }) => {
+                        let question = request
+                            .get("question")
+                            .and_then(Value::as_str)
+                            .context("side_question 需要 question")?;
+                        side_questions.launch(
+                            handle,
+                            &request_id,
+                            &side_context,
+                            question,
+                            store.cwd().to_owned(),
+                        )?;
+                    }
+                    Some(_) => unreachable!("only side_question requests use the immediate lane"),
+                    None => side_channel_open = false,
+                }
+            }
+        }
+    };
+    drop(turn);
+    let outcome = match turn_outcome {
         Ok(Some(result)) => {
             if let Err(error) = persist_turn(store, engine, &result)
                 .and_then(|_| print_result(cli, engine, store, &result, Some(handle)))

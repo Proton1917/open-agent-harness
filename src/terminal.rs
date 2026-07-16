@@ -158,7 +158,15 @@ struct OutputState {
     trusted_roots: Vec<PathBuf>,
     prompt_color: Option<String>,
     active_tools: HashMap<String, ActiveToolDisplay>,
+    active_turn_input: Option<ActiveTurnInputFrame>,
+    active_turn_input_inline_saved: bool,
+    active_turn_input_modal_depth: usize,
     last_fullscreen_frame: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurnInputFrame {
+    bytes: Vec<u8>,
 }
 
 struct ToolDisplay {
@@ -192,6 +200,9 @@ impl Default for OutputState {
             trusted_roots: Vec::new(),
             prompt_color: None,
             active_tools: HashMap::new(),
+            active_turn_input: None,
+            active_turn_input_inline_saved: false,
+            active_turn_input_modal_depth: 0,
             last_fullscreen_frame: None,
         }
     }
@@ -213,17 +224,59 @@ fn terminal_modal_slot() -> &'static Mutex<()> {
     MODAL.get_or_init(|| Mutex::new(()))
 }
 
+#[derive(Clone)]
+struct ActiveTurnInputHandle {
+    state: Weak<Mutex<OutputState>>,
+}
+
+fn active_turn_input_slot() -> &'static Mutex<Option<ActiveTurnInputHandle>> {
+    static ACTIVE: OnceLock<Mutex<Option<ActiveTurnInputHandle>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(None))
+}
+
 struct TerminalModalGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
+    active_turn_input: Option<ActiveTurnInputHandle>,
 }
 
 impl TerminalModalGuard {
     fn acquire() -> Self {
+        let guard = terminal_modal_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active_turn_input = active_turn_input_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handle) = &active_turn_input {
+            if let Some(state) = handle.state.upgrade() {
+                suspend_active_turn_input_for_modal(
+                    &mut state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+        }
         Self {
-            _guard: terminal_modal_slot()
+            _guard: guard,
+            active_turn_input,
+        }
+    }
+}
+
+impl Drop for TerminalModalGuard {
+    fn drop(&mut self) {
+        let Some(handle) = &self.active_turn_input else {
+            return;
+        };
+        let Some(state) = handle.state.upgrade() else {
+            return;
+        };
+        resume_active_turn_input_after_modal(
+            &mut state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        }
+        );
     }
 }
 
@@ -461,6 +514,51 @@ impl ConversationUi {
         let reserve = state.fullscreen_composer_reserve;
         state.fullscreen.set_composer_reserve(reserve);
         render_fullscreen_locked(&mut state, Some(composer))
+    }
+
+    fn set_active_turn_input(&self, buffer: &str, cursor_byte: usize, hint: &str) -> Result<()> {
+        let frame = ActiveTurnInputFrame {
+            bytes: render_active_turn_input_frame(buffer, cursor_byte, hint, self.color)?,
+        };
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_turn_input = Some(frame);
+        state.fullscreen_composer_reserve = 1;
+        state.fullscreen.set_composer_reserve(1);
+        if state.active_turn_input_modal_depth > 0 {
+            return Ok(());
+        }
+        if state.fullscreen_guard.is_some() {
+            return render_fullscreen_locked(&mut state, None);
+        }
+        let mut out = io::stdout().lock();
+        if state.active_turn_input_inline_saved {
+            draw_inline_active_turn_input(&mut out, &state)?;
+        } else {
+            resume_inline_active_turn_input(&mut out, &mut state)?;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    fn clear_active_turn_input(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fullscreen_guard.is_some() {
+            state.active_turn_input = None;
+            state.fullscreen_composer_reserve = 1;
+            state.fullscreen.set_composer_reserve(1);
+            return render_fullscreen_locked(&mut state, None);
+        }
+        let mut out = io::stdout().lock();
+        suspend_inline_active_turn_input(&mut out, &mut state)?;
+        state.active_turn_input = None;
+        out.flush()?;
+        Ok(())
     }
 
     fn fullscreen_scroll(&self, direction: FullscreenScroll) -> Result<()> {
@@ -778,6 +876,7 @@ impl ConversationUi {
             return;
         }
         let mut out = io::stdout().lock();
+        let _ = suspend_inline_active_turn_input(&mut out, &mut state);
         match event {
             QueryEvent::TurnStarted => {
                 clear_status(&mut out, &mut state);
@@ -839,7 +938,7 @@ impl ConversationUi {
                 if self.color {
                     let _ = queue!(out, ResetColor);
                 }
-                let _ = queue!(out, Print("\n"));
+                let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::ToolFinished {
                 name,
@@ -873,7 +972,7 @@ impl ConversationUi {
                 if self.color {
                     let _ = queue!(out, ResetColor);
                 }
-                let _ = queue!(out, Print("\n"));
+                let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::CompactStarted => {
                 clear_status(&mut out, &mut state);
@@ -895,13 +994,13 @@ impl ConversationUi {
             QueryEvent::TurnFinished => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
-                let _ = queue!(out, Print("\n"));
+                let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::TurnInterrupted => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
                 let _ = muted_line(&mut out, self.color, "  ■ Interrupted");
-                let _ = queue!(out, Print("\n"));
+                let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::TurnFailed { message } => {
                 clear_status(&mut out, &mut state);
@@ -911,14 +1010,15 @@ impl ConversationUi {
                 }
                 for (index, line) in bounded_error_lines(message).iter().enumerate() {
                     let prefix = if index == 0 { "  Error: " } else { "         " };
-                    let _ = queue!(out, Print(prefix), Print(line), Print("\n"));
+                    let _ = queue!(out, Print(prefix), Print(line), Print(RAW_LINE_END));
                 }
-                let _ = queue!(out, Print("\n"));
+                let _ = queue!(out, Print(RAW_LINE_END));
                 if self.color {
                     let _ = queue!(out, ResetColor);
                 }
             }
         }
+        let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
         drop(out);
         drop(state);
@@ -971,9 +1071,11 @@ impl ConversationUi {
             return;
         }
         let mut out = io::stdout().lock();
+        let _ = suspend_inline_active_turn_input(&mut out, &mut state);
         clear_status(&mut out, &mut state);
         let _ = styled_status(&mut out, self.color, label);
         state.status_open = true;
+        let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
     }
 
@@ -989,6 +1091,7 @@ impl ConversationUi {
             return;
         }
         let mut out = io::stdout().lock();
+        let _ = suspend_inline_active_turn_input(&mut out, &mut state);
         clear_status(&mut out, &mut state);
         let start = state.markdown_committed_lines.min(frame.stable.lines.len());
         if start < frame.stable.lines.len() {
@@ -1000,6 +1103,7 @@ impl ConversationUi {
             );
             state.markdown_committed_lines = frame.stable.lines.len();
         }
+        let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
     }
 
@@ -1020,6 +1124,7 @@ impl ConversationUi {
             return Ok(());
         }
         let mut out = io::stdout().lock();
+        suspend_inline_active_turn_input(&mut out, &mut state)?;
         clear_status(&mut out, &mut state);
         let stable_start = state.markdown_committed_lines.min(frame.stable.lines.len());
         if stable_start < frame.stable.lines.len() {
@@ -1042,7 +1147,8 @@ impl ConversationUi {
             )?;
         }
         close_assistant(&mut out, &mut state);
-        queue!(out, Print("\n"))?;
+        queue!(out, Print(RAW_LINE_END))?;
+        resume_inline_active_turn_input(&mut out, &mut state)?;
         out.flush()?;
         reset_markdown_stream(&mut state);
         Ok(())
@@ -1064,7 +1170,15 @@ fn render_fullscreen_locked(state: &mut OutputState, composer: Option<&[u8]>) ->
         frame.extend_from_slice(SYNC_OUTPUT_START);
     }
     frame.extend_from_slice(rendered.bytes.as_bytes());
-    if let Some(composer) = composer {
+    let active_composer = (state.active_turn_input_modal_depth == 0)
+        .then(|| {
+            state
+                .active_turn_input
+                .as_ref()
+                .map(|frame| frame.bytes.as_slice())
+        })
+        .flatten();
+    if let Some(composer) = composer.or(active_composer) {
         let composer_row = rendered
             .rows
             .saturating_sub(usize::from(state.fullscreen_composer_reserve))
@@ -1085,6 +1199,126 @@ fn render_fullscreen_locked(state: &mut OutputState, composer: Option<&[u8]>) ->
     out.flush()?;
     state.last_fullscreen_frame = Some(frame);
     Ok(())
+}
+
+fn render_active_turn_input_frame(
+    buffer: &str,
+    cursor_byte: usize,
+    hint: &str,
+    color: bool,
+) -> Result<Vec<u8>> {
+    let columns = terminal::size().map_or(80, |(columns, _)| usize::from(columns).max(1));
+    let prefix = if columns >= 2 { "› " } else { "›" };
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available = columns.saturating_sub(prefix_width);
+    let cursor_byte = cursor_byte.min(buffer.len());
+    let cursor_grapheme = buffer[..cursor_byte].graphemes(true).count();
+    let (visible, cursor_column, _) =
+        visible_around_cursor_window(buffer, cursor_grapheme, available);
+    let mut frame = Vec::with_capacity(columns.saturating_mul(4));
+    queue!(
+        frame,
+        cursor::MoveToColumn(0),
+        Clear(ClearType::CurrentLine)
+    )?;
+    if color {
+        queue!(frame, SetForegroundColor(Color::DarkGrey))?;
+    }
+    queue!(frame, Print(prefix))?;
+    if color {
+        queue!(frame, ResetColor)?;
+    }
+    if buffer.is_empty() {
+        if color {
+            queue!(frame, SetForegroundColor(Color::DarkGrey))?;
+        }
+        queue!(frame, Print(visible_line(hint, available)))?;
+        if color {
+            queue!(frame, ResetColor)?;
+        }
+    } else {
+        queue!(frame, Print(visible))?;
+    }
+    queue!(
+        frame,
+        cursor::MoveToColumn(
+            prefix_width
+                .saturating_add(cursor_column)
+                .min(columns.saturating_sub(1))
+                .min(usize::from(u16::MAX)) as u16
+        ),
+        cursor::Show
+    )?;
+    Ok(frame)
+}
+
+fn draw_inline_active_turn_input(out: &mut impl Write, state: &OutputState) -> io::Result<()> {
+    if state.active_turn_input_modal_depth > 0 {
+        return Ok(());
+    }
+    if let Some(frame) = &state.active_turn_input {
+        out.write_all(&frame.bytes)?;
+    }
+    Ok(())
+}
+
+fn suspend_inline_active_turn_input(
+    out: &mut impl Write,
+    state: &mut OutputState,
+) -> io::Result<()> {
+    if state.active_turn_input_inline_saved {
+        queue!(
+            out,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            cursor::RestorePosition
+        )?;
+        state.active_turn_input_inline_saved = false;
+    }
+    Ok(())
+}
+
+fn resume_inline_active_turn_input(
+    out: &mut impl Write,
+    state: &mut OutputState,
+) -> io::Result<()> {
+    if state.active_turn_input.is_none()
+        || state.active_turn_input_modal_depth > 0
+        || state.active_turn_input_inline_saved
+    {
+        return Ok(());
+    }
+    queue!(out, cursor::SavePosition, Print(RAW_LINE_END))?;
+    state.active_turn_input_inline_saved = true;
+    draw_inline_active_turn_input(out, state)
+}
+
+fn suspend_active_turn_input_for_modal(state: &mut OutputState) {
+    state.active_turn_input_modal_depth = state.active_turn_input_modal_depth.saturating_add(1);
+    if state.active_turn_input_modal_depth > 1 || state.active_turn_input.is_none() {
+        return;
+    }
+    if state.fullscreen_guard.is_some() {
+        let _ = render_fullscreen_locked(state, None);
+    } else {
+        let mut out = io::stdout().lock();
+        let _ = suspend_inline_active_turn_input(&mut out, state);
+        let _ = out.flush();
+    }
+}
+
+fn resume_active_turn_input_after_modal(state: &mut OutputState) {
+    state.active_turn_input_modal_depth = state.active_turn_input_modal_depth.saturating_sub(1);
+    if state.active_turn_input_modal_depth > 0 || state.active_turn_input.is_none() {
+        return;
+    }
+    if state.fullscreen_guard.is_some() {
+        let _ = render_fullscreen_locked(state, None);
+    } else {
+        let mut out = io::stdout().lock();
+        let _ = resume_inline_active_turn_input(&mut out, state);
+        let _ = out.flush();
+    }
 }
 
 fn finish_fullscreen_stream(state: &mut OutputState) {
@@ -1709,6 +1943,270 @@ pub struct PromptRead {
     pub text: String,
     pub permission_mode: PermissionMode,
     pub clipboard_images: Vec<ClipboardImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveTurnAction {
+    Submit(String),
+    Interrupt,
+}
+
+pub struct ActiveTurnInput {
+    ui: ConversationUi,
+    raw_guard: Option<RawModeGuard>,
+    buffer: String,
+    cursor_byte: usize,
+    hint: String,
+    fullscreen_wheel_epoch: Instant,
+    active: bool,
+}
+
+impl ActiveTurnInput {
+    pub fn begin(ui: ConversationUi) -> Result<Self> {
+        let raw_guard = RawModeGuard::enter()?;
+        let handle = ActiveTurnInputHandle {
+            state: Arc::downgrade(&ui.inner),
+        };
+        {
+            let mut slot = active_turn_input_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot
+                .as_ref()
+                .and_then(|active| active.state.upgrade())
+                .is_some()
+            {
+                anyhow::bail!("an active-turn terminal input is already registered")
+            }
+            *slot = Some(handle);
+        }
+        let mut input = Self {
+            ui,
+            raw_guard: Some(raw_guard),
+            buffer: String::new(),
+            cursor_byte: 0,
+            hint: "Agent working · /btw asks separately · Enter queues".to_owned(),
+            fullscreen_wheel_epoch: Instant::now(),
+            active: true,
+        };
+        if let Err(error) = input.redraw() {
+            let _ = input.finish();
+            return Err(error);
+        }
+        Ok(input)
+    }
+
+    pub fn poll(&mut self) -> Result<Option<ActiveTurnAction>> {
+        for _ in 0..32 {
+            if !event::poll(Duration::ZERO)? {
+                return Ok(None);
+            }
+            let event = event::read()?;
+            let mut changed = false;
+            match event {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.intersects(
+                        KeyModifiers::ALT
+                            | KeyModifiers::SHIFT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER,
+                    ) =>
+                {
+                    self.buffer.clear();
+                    self.cursor_byte = 0;
+                    self.hint = "Interrupting the active turn…".to_owned();
+                    self.redraw()?;
+                    return Ok(Some(ActiveTurnAction::Interrupt));
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('u'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.buffer.clear();
+                    self.cursor_byte = 0;
+                    self.hint = "Active-turn input cleared".to_owned();
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    let submitted = self.buffer.trim().to_owned();
+                    if submitted.is_empty() {
+                        self.hint = "Type /btw <question>, or a message to queue".to_owned();
+                        changed = true;
+                    } else {
+                        self.buffer.clear();
+                        self.cursor_byte = 0;
+                        self.hint = "Input accepted".to_owned();
+                        self.redraw()?;
+                        return Ok(Some(ActiveTurnAction::Submit(submitted)));
+                    }
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if self.cursor_byte > 0 => {
+                    let previous = previous_boundary(&self.buffer, self.cursor_byte);
+                    self.buffer.drain(previous..self.cursor_byte);
+                    self.cursor_byte = previous;
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Delete,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if self.cursor_byte < self.buffer.len() => {
+                    let next = next_boundary(&self.buffer, self.cursor_byte);
+                    self.buffer.drain(self.cursor_byte..next);
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Left,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.cursor_byte = previous_boundary(&self.buffer, self.cursor_byte);
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Right,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.cursor_byte = next_boundary(&self.buffer, self.cursor_byte);
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Home,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.cursor_byte = 0;
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::End,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.cursor_byte = self.buffer.len();
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.buffer.clear();
+                    self.cursor_byte = 0;
+                    self.hint = "Active-turn input cleared".to_owned();
+                    changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(character),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if !character.is_control()
+                    && !modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER,
+                    ) =>
+                {
+                    if self.buffer.len().saturating_add(character.len_utf8()) <= MAX_INPUT_BYTES {
+                        self.buffer.insert(self.cursor_byte, character);
+                        self.cursor_byte = self.cursor_byte.saturating_add(character.len_utf8());
+                        changed = true;
+                    } else {
+                        self.hint = "Active-turn input exceeds the 1 MiB limit".to_owned();
+                        changed = true;
+                    }
+                }
+                Event::Paste(pasted) => {
+                    let pasted = sanitize_paste(&pasted)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if self.buffer.len().saturating_add(pasted.len()) <= MAX_INPUT_BYTES {
+                        self.buffer.insert_str(self.cursor_byte, &pasted);
+                        self.cursor_byte = self.cursor_byte.saturating_add(pasted.len());
+                    } else {
+                        self.hint = "Active-turn paste exceeds the 1 MiB limit".to_owned();
+                    }
+                    changed = true;
+                }
+                Event::Resize(columns, rows) => {
+                    self.ui.resize_fullscreen(columns, rows)?;
+                    changed = true;
+                }
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                    self.ui.fullscreen_scroll(FullscreenScroll::WheelUp(
+                        self.fullscreen_wheel_epoch.elapsed(),
+                    ))?;
+                }
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                    self.ui.fullscreen_scroll(FullscreenScroll::WheelDown(
+                        self.fullscreen_wheel_epoch.elapsed(),
+                    ))?;
+                }
+                _ => {}
+            }
+            if changed {
+                self.redraw()?;
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn set_hint(&mut self, hint: impl Into<String>) -> Result<()> {
+        self.hint = hint.into();
+        self.redraw()
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let clear = self.ui.clear_active_turn_input();
+        let target = Arc::downgrade(&self.ui.inner);
+        let mut slot = active_turn_input_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|handle| Weak::ptr_eq(&handle.state, &target))
+        {
+            *slot = None;
+        }
+        drop(slot);
+        self.raw_guard.take();
+        clear
+    }
+
+    fn redraw(&mut self) -> Result<()> {
+        self.ui
+            .set_active_turn_input(&self.buffer, self.cursor_byte, &self.hint)
+    }
+}
+
+impl Drop for ActiveTurnInput {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 pub struct InputReadContext<'a> {
@@ -6376,9 +6874,20 @@ fn prompt_color_value(color: &str) -> Option<Color> {
     }
 }
 
-struct RawModeGuard {
+#[derive(Default)]
+struct RawModeState {
+    depth: usize,
     bracketed_paste: bool,
     keyboard_enhancement: bool,
+}
+
+fn raw_mode_state() -> &'static Mutex<RawModeState> {
+    static STATE: OnceLock<Mutex<RawModeState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(RawModeState::default()))
+}
+
+struct RawModeGuard {
+    active: bool,
 }
 
 #[cfg(unix)]
@@ -6465,6 +6974,12 @@ fn install_terminal_panic_restore() {
 }
 
 fn force_restore_terminal() {
+    let mut raw = raw_mode_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    raw.depth = 0;
+    raw.bracketed_paste = false;
+    raw.keyboard_enhancement = false;
     let mut out = io::stdout();
     let _ = execute!(out, PopKeyboardEnhancementFlags);
     let _ = out.write_all(b"\x1b[<u");
@@ -6512,34 +7027,53 @@ fn flush_terminal_input_buffer() {}
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         install_terminal_panic_restore();
-        terminal::enable_raw_mode()?;
-        let mut out = io::stdout();
-        let bracketed_paste = execute!(out, EnableBracketedPaste).is_ok();
-        let keyboard_enhancement = execute!(
-            out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        let mut state = raw_mode_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.depth == 0 {
+            terminal::enable_raw_mode()?;
+            let mut out = io::stdout();
+            state.bracketed_paste = execute!(out, EnableBracketedPaste).is_ok();
+            state.keyboard_enhancement = execute!(
+                out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
             )
-        )
-        .is_ok();
-        Ok(Self {
-            bracketed_paste,
-            keyboard_enhancement,
-        })
+            .is_ok();
+        }
+        state.depth = state.depth.saturating_add(1);
+        Ok(Self { active: true })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mut state = raw_mode_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.depth == 0 {
+            return;
+        }
+        state.depth -= 1;
+        if state.depth > 0 {
+            return;
+        }
         let mut out = io::stdout();
-        if self.keyboard_enhancement {
+        if state.keyboard_enhancement {
             let _ = execute!(out, PopKeyboardEnhancementFlags);
         }
-        if self.bracketed_paste {
+        if state.bracketed_paste {
             let _ = execute!(out, DisableBracketedPaste);
         }
+        state.keyboard_enhancement = false;
+        state.bracketed_paste = false;
         let _ = execute!(
             out,
             ResetColor,
@@ -6705,7 +7239,7 @@ fn write_rendered_markdown_line(
 
 fn close_assistant(out: &mut impl Write, state: &mut OutputState) {
     if state.assistant_open {
-        let _ = queue!(out, Print("\n"));
+        let _ = queue!(out, Print(RAW_LINE_END));
         state.assistant_open = false;
     }
 }
@@ -6725,7 +7259,7 @@ fn muted_line(out: &mut impl Write, color: bool, line: &str) -> io::Result<()> {
     if color {
         queue!(out, SetForegroundColor(Color::DarkGrey))?;
     }
-    queue!(out, Print(line), Print("\n"))?;
+    queue!(out, Print(line), Print(RAW_LINE_END))?;
     if color {
         queue!(out, ResetColor)?;
     }
@@ -6793,7 +7327,6 @@ fn visible_around_cursor(value: &str, cursor: usize, limit: usize) -> (String, u
     (visible, column)
 }
 
-#[cfg(test)]
 fn visible_around_cursor_window(
     value: &str,
     cursor: usize,

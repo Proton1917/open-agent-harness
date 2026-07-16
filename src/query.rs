@@ -38,7 +38,7 @@ const MAX_HOOK_FEEDBACK_BYTES: usize = 64 * 1024;
 const MAX_BACKGROUND_CONTEXT_BYTES: usize = 192 * 1024;
 const MAX_PROMPT_SUGGESTION_CHARS: usize = 99;
 const MAX_PROMPT_SUGGESTION_WORDS: usize = 12;
-const MAX_SIDE_QUESTION_BYTES: usize = 32 * 1024;
+pub const MAX_SIDE_QUESTION_BYTES: usize = 32 * 1024;
 const MAX_SIDE_ANSWER_BYTES: usize = 256 * 1024;
 const COMPACT_RETRY_MARKER: &str = "[earlier conversation truncated for compaction retry]";
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -152,6 +152,15 @@ pub struct SideQuestionRequest {
     messages: Vec<Message>,
 }
 
+#[derive(Clone)]
+pub struct SideQuestionContext {
+    client: ModelClient,
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<Message>,
+}
+
 pub struct PromptSuggestionRequest {
     client: ModelClient,
     model: String,
@@ -246,6 +255,30 @@ impl SideQuestionRequest {
         Ok(SideQuestionAnswer {
             text: answer,
             usage: result.response.usage,
+        })
+    }
+}
+
+impl SideQuestionContext {
+    pub fn prepare(&self, question: &str) -> Result<SideQuestionRequest> {
+        let question = question.trim();
+        if question.is_empty() {
+            bail!("Usage: /btw <question>")
+        }
+        if question.len() > MAX_SIDE_QUESTION_BYTES || question.contains('\0') {
+            bail!("/btw question exceeds the {MAX_SIDE_QUESTION_BYTES}-byte limit or contains NUL")
+        }
+
+        let mut messages = self.messages.clone();
+        messages.push(Message::user_text(format!(
+            "<side-question>\n{question}\n</side-question>\n\nAnswer this one question directly from the conversation context. This is a separate one-off response: do not call tools, claim to take actions, or alter the main task. If the context does not contain the answer, say so."
+        )));
+        Ok(SideQuestionRequest {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            system: self.system.clone(),
+            messages,
         })
     }
 }
@@ -1374,26 +1407,34 @@ impl QueryEngine {
     /// Answers a one-off side question against the current conversation without exposing tools or
     /// appending either the question or answer to the primary transcript. This is the provider-
     /// neutral `/btw` path used by the interactive terminal.
-    pub fn prepare_side_question(&self, question: &str) -> Result<SideQuestionRequest> {
-        let question = question.trim();
-        if question.is_empty() {
-            bail!("Usage: /btw <question>")
-        }
-        if question.len() > MAX_SIDE_QUESTION_BYTES || question.contains('\0') {
-            bail!("/btw question exceeds the {MAX_SIDE_QUESTION_BYTES}-byte limit or contains NUL")
-        }
-
+    pub fn side_question_context(
+        &self,
+        active_user_content: Option<&Value>,
+    ) -> Result<SideQuestionContext> {
         let mut messages = normalize_for_api(&self.messages);
-        messages.push(Message::user_text(format!(
-            "<side-question>\n{question}\n</side-question>\n\nAnswer this one question directly from the conversation context. This is a separate one-off response: do not call tools, claim to take actions, or alter the main task. If the context does not contain the answer, say so."
-        )));
-        Ok(SideQuestionRequest {
+        if let Some(content) = active_user_content {
+            if serde_json::to_vec(content)?.len() > MAX_USER_CONTENT_BYTES
+                || direct_user_text_bytes(content)? > MAX_USER_TEXT_BYTES
+            {
+                bail!("active /btw context exceeds the user-content limit")
+            }
+            validate_direct_user_content(content)?;
+            messages.push(Message {
+                role: Role::User,
+                content: content.clone(),
+            });
+        }
+        Ok(SideQuestionContext {
             client: self.client.clone(),
             model: self.model.clone(),
             max_tokens: self.max_tokens.min(4_096),
             system: self.effective_system_prompt(),
             messages,
         })
+    }
+
+    pub fn prepare_side_question(&self, question: &str) -> Result<SideQuestionRequest> {
+        self.side_question_context(None)?.prepare(question)
     }
 
     pub async fn answer_side_question(&mut self, question: &str) -> Result<String> {

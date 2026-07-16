@@ -85,12 +85,22 @@ sidecar, rejects stale concurrent memory, validates all update/delete
 operations, preserves newly observed sessions, and commits through the memory
 lock and atomic writer.
 
+The active side-question frontend path is backed by `src/query.rs`,
+`src/terminal.rs`, `src/control.rs`, and `src/main.rs`. The active user message
+is added to an immutable side context before the main future borrows the
+engine. TTY `/btw` then runs concurrently through a single bounded tool-free
+request while up to eight ordinary inputs queue for later turns. Coordinated
+inline/fullscreen composer ownership, modal suspension, and nested raw-mode
+guards prevent permission prompts from racing terminal input. Stream JSON uses
+its own four-slot immediate lane and returns a correlated `side_question`
+control response without waiting for the main turn. Real PTY and local mock
+server tests verify response ordering, empty tool registration, queue progress,
+and absence from the primary transcript.
+
 ## Current project-wide work still open
 
 - Expand the same exact-name inventory discipline to utility, hook, component,
   and other remaining source families.
-- Close or explicitly classify concurrent side-question behavior while a main
-  model turn is active.
 - Re-run the full required check set and the final repository/remote hygiene
   audit only after those broader layers have zero pending provider-neutral
   behavior.

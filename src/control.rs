@@ -19,12 +19,14 @@ use uuid::Uuid;
 use crate::{
     permissions::{PermissionDecision, PermissionPromptHandler, PermissionRequest},
     protocol::validate_direct_user_content,
+    query::MAX_SIDE_QUESTION_BYTES,
 };
 
 pub const MAX_CONTROL_LINE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PENDING_REQUESTS: usize = 64;
 const MAX_PENDING_LIFECYCLE_EVENTS: usize = 256;
 const CONTROL_INBOUND_CAPACITY: usize = 16;
+const SIDE_QUESTION_INBOUND_CAPACITY: usize = 4;
 const NOW_INBOUND_CAPACITY: usize = 16;
 const NEXT_INBOUND_CAPACITY: usize = 24;
 const LATER_INBOUND_CAPACITY: usize = 8;
@@ -132,6 +134,7 @@ struct InputLoopState {
 
 struct InboundSenders {
     control: mpsc::Sender<InboundMessage>,
+    side_question: mpsc::Sender<InboundMessage>,
     now: mpsc::Sender<InboundMessage>,
     next: mpsc::Sender<InboundMessage>,
     later: mpsc::Sender<InboundMessage>,
@@ -141,6 +144,11 @@ struct InboundSenders {
 impl InboundSenders {
     fn sender_for(&self, message: &InboundMessage) -> &mpsc::Sender<InboundMessage> {
         match message {
+            InboundMessage::ControlRequest { request, .. }
+                if request.get("subtype").and_then(Value::as_str) == Some("side_question") =>
+            {
+                &self.side_question
+            }
             InboundMessage::ControlRequest { .. }
             | InboundMessage::UpdateEnvironmentVariables { .. }
             | InboundMessage::ProtocolError { .. } => &self.control,
@@ -177,6 +185,7 @@ impl InboundSenders {
 
 struct InboundReceivers {
     control: mpsc::Receiver<InboundMessage>,
+    side_question: mpsc::Receiver<InboundMessage>,
     now: mpsc::Receiver<InboundMessage>,
     next: mpsc::Receiver<InboundMessage>,
     later: mpsc::Receiver<InboundMessage>,
@@ -185,6 +194,7 @@ struct InboundReceivers {
 
 fn inbound_channels() -> (InboundSenders, InboundReceivers) {
     let (control_tx, control) = mpsc::channel(CONTROL_INBOUND_CAPACITY);
+    let (side_question_tx, side_question) = mpsc::channel(SIDE_QUESTION_INBOUND_CAPACITY);
     let (now_tx, now) = mpsc::channel(NOW_INBOUND_CAPACITY);
     let (next_tx, next) = mpsc::channel(NEXT_INBOUND_CAPACITY);
     let (later_tx, later) = mpsc::channel(LATER_INBOUND_CAPACITY);
@@ -192,6 +202,7 @@ fn inbound_channels() -> (InboundSenders, InboundReceivers) {
     (
         InboundSenders {
             control: control_tx,
+            side_question: side_question_tx,
             now: now_tx,
             next: next_tx,
             later: later_tx,
@@ -199,6 +210,7 @@ fn inbound_channels() -> (InboundSenders, InboundReceivers) {
         },
         InboundReceivers {
             control,
+            side_question,
             now,
             next,
             later,
@@ -315,6 +327,8 @@ impl ControlSession {
         loop {
             let message = tokio::select! {
                 biased;
+                message = self.inbound.side_question.recv(),
+                    if !self.inbound.side_question.is_closed() || !self.inbound.side_question.is_empty() => message,
                 message = self.inbound.control.recv(),
                     if !self.inbound.control.is_closed() || !self.inbound.control.is_empty() => message,
                 message = self.inbound.now.recv(),
@@ -346,6 +360,10 @@ impl ControlSession {
             }
             return Some(message);
         }
+    }
+
+    pub async fn recv_side_question(&mut self) -> Option<InboundMessage> {
+        self.inbound.side_question.recv().await
     }
 }
 
@@ -1172,6 +1190,30 @@ fn validate_control_request(request: &Value) -> Result<()> {
         .context("control_request.request 缺少 subtype")?;
     match subtype {
         "initialize" => validate_initialize_request(request),
+        "side_question" => {
+            let object = request
+                .as_object()
+                .context("side_question request 必须是 object")?;
+            if object
+                .keys()
+                .any(|field| !matches!(field.as_str(), "subtype" | "question"))
+            {
+                bail!("side_question request 包含未知字段")
+            }
+            let question = request
+                .get("question")
+                .and_then(Value::as_str)
+                .context("side_question.question 必须是 string")?;
+            if question.trim().is_empty()
+                || question.len() > MAX_SIDE_QUESTION_BYTES
+                || question.contains('\0')
+            {
+                bail!(
+                    "side_question.question 长度必须为 1..={MAX_SIDE_QUESTION_BYTES} 字节且不得含 NUL"
+                )
+            }
+            Ok(())
+        }
         "seed_read_state" => {
             required_bounded_string(request, "path", 4096)?;
             let mtime = request
@@ -1629,6 +1671,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn side_question_uses_the_immediate_control_lane() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut input, reader) = UnixStream::pair().unwrap();
+        let mut session = ControlSession::with_io(reader, Vec::<u8>::new());
+        writeln!(
+            input,
+            "{}",
+            json!({
+                "type":"control_request", "request_id":"ordinary",
+                "request":{"subtype":"get_settings"}
+            })
+        )
+        .unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({
+                "type":"control_request", "request_id":"side",
+                "request":{"subtype":"side_question", "question":"what is running?"}
+            })
+        )
+        .unwrap();
+        input.flush().unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert!(matches!(
+            session.recv_side_question().await,
+            Some(InboundMessage::ControlRequest { request_id, .. }) if request_id == "side"
+        ));
+        assert!(matches!(
+            session.recv().await,
+            Some(InboundMessage::ControlRequest { request_id, .. }) if request_id == "ordinary"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn queued_messages_start_on_the_latest_cancellation_generation() {
         use std::os::unix::net::UnixStream;
 
@@ -2030,6 +2110,7 @@ mod tests {
             json!({"subtype":"mcp_set_servers", "servers":{}}),
             json!({"subtype":"mcp_toggle", "serverName":"filesystem", "enabled":false}),
             json!({"subtype":"reload_plugins"}),
+            json!({"subtype":"side_question", "question":"what is running?"}),
         ] {
             assert!(
                 parse_inbound(json!({
@@ -2057,6 +2138,13 @@ mod tests {
             parse_inbound(json!({
                 "type":"control_request", "request_id":"bad-toggle",
                 "request":{"subtype":"mcp_toggle", "serverName":"filesystem", "enabled":"yes"}
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_inbound(json!({
+                "type":"control_request", "request_id":"bad-side",
+                "request":{"subtype":"side_question", "question":"", "extra":true}
             }))
             .is_err()
         );

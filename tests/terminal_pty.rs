@@ -427,21 +427,13 @@ fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
 
     terminal.write_all(b"/config\r").unwrap();
-    let settings = read_until(
-        &mut terminal,
-        "Syntax highlighting",
-        Duration::from_secs(3),
-    );
+    let settings = read_until(&mut terminal, "Syntax highlighting", Duration::from_secs(3));
     assert!(settings.contains("Syntax highlighting"));
     terminal.write_all(b"\x1b").unwrap();
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
 
     terminal.write_all(b"/tasks\r").unwrap();
-    let tasks = read_until(
-        &mut terminal,
-        "No background tasks",
-        Duration::from_secs(3),
-    );
+    let tasks = read_until(&mut terminal, "No background tasks", Duration::from_secs(3));
     assert!(tasks.contains("No background tasks"));
     terminal.write_all(b"\x1b").unwrap();
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
@@ -550,6 +542,271 @@ fn direct_shell_mode_uses_the_tool_path_and_returns_output_to_the_model() {
         &mut terminal,
         "Press Ctrl-C again to exit",
         Duration::from_secs(3),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
+fn active_turn_btw_answers_without_interrupting_or_mutating_the_main_queue() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let (mut main_stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(read_request(&mut main_stream));
+        let main_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            let response = text_stream("MAIN_TURN_DONE");
+            write!(
+                main_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+
+        let (mut side_stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(read_request(&mut side_stream));
+        let response = text_stream("SIDE_QUESTION_ANSWER");
+        write!(
+            side_stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+
+        let (mut queued_stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(read_request(&mut queued_stream));
+        let response = text_stream("QUEUED_TURN_DONE");
+        write!(
+            queued_stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+        main_worker.join().unwrap();
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"main objective\r").unwrap();
+    let active = read_until(
+        &mut terminal,
+        "/btw asks separately",
+        Duration::from_secs(5),
+    );
+    assert_no_bare_line_feeds(active.as_bytes());
+    terminal
+        .write_all(b"/btw what is the active objective?\r")
+        .unwrap();
+    let side_started = read_until(
+        &mut terminal,
+        "BTW answering separately",
+        Duration::from_secs(3),
+    );
+    assert!(side_started.contains("main turn still running"));
+
+    terminal.write_all(b"queued follow-up\r").unwrap();
+    let queued = read_until(
+        &mut terminal,
+        "Queued for the next turn",
+        Duration::from_secs(3),
+    );
+    assert!(queued.contains("1/8"));
+
+    let mut side_answer = format!("{side_started}{queued}");
+    if !side_answer.contains("SIDE_QUESTION_ANSWER") {
+        side_answer.push_str(&read_until(
+            &mut terminal,
+            "SIDE_QUESTION_ANSWER",
+            Duration::from_secs(5),
+        ));
+    }
+    assert!(side_answer.contains("BTW"));
+    let side_position = side_answer.find("SIDE_QUESTION_ANSWER").unwrap();
+    if let Some(main_position) = side_answer.find("MAIN_TURN_DONE") {
+        assert!(
+            side_position < main_position,
+            "the delayed main request completed before the independent side answer"
+        );
+    }
+    let queued_answer = read_until(&mut terminal, "QUEUED_TURN_DONE", Duration::from_secs(10));
+    assert!(queued_answer.contains("MAIN_TURN_DONE"));
+
+    if !queued_answer.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("main objective"));
+    assert!(requests[1].contains("what is the active objective?"));
+    assert!(requests[1].contains("\"tools\":[]"));
+    assert!(requests[2].contains("queued follow-up"));
+    assert!(!requests[2].contains("SIDE_QUESTION_ANSWER"));
+    assert!(!requests[2].contains("what is the active objective?"));
+}
+
+#[test]
+fn active_turn_composer_ctrl_c_interrupts_and_returns_to_idle_input() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        thread::sleep(Duration::from_millis(500));
+        let response = text_stream("MUST_NOT_COMMIT");
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        );
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal.write_all(b"cancel this active turn\r").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "/btw asks separately",
+        Duration::from_secs(5),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    let interrupted = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    assert!(interrupted.contains("Interrupted"));
+    assert!(!interrupted.contains("MUST_NOT_COMMIT"));
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
+fn fullscreen_active_turn_keeps_btw_composer_live() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut main_stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut main_stream);
+        let main_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(1));
+            let response = text_stream("FULLSCREEN_MAIN_DONE");
+            write!(
+                main_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+        let (mut side_stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut side_stream);
+        assert!(request.contains("fullscreen objective"));
+        assert!(request.contains("answer in fullscreen"));
+        let response = text_stream("FULLSCREEN_SIDE_ANSWER");
+        write!(
+            side_stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+        main_worker.join().unwrap();
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    terminal.write_all(b"/tui fullscreen\r").unwrap();
+    let entered = read_until(
+        &mut terminal,
+        "TUI mode: fullscreen",
+        Duration::from_secs(3),
+    );
+    if !entered.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+    terminal.write_all(b"fullscreen objective").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "fullscreen objective",
+        Duration::from_secs(3),
+    );
+    terminal.write_all(b"\r").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "/btw asks separately",
+        Duration::from_secs(5),
+    );
+    terminal.write_all(b"/btw answer in fullscreen").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "/btw answer in fullscreen",
+        Duration::from_secs(3),
+    );
+    terminal.write_all(b"\r").unwrap();
+    let mut output = read_until(
+        &mut terminal,
+        "FULLSCREEN_SIDE_ANSWER",
+        Duration::from_secs(5),
+    );
+    if !output.contains("FULLSCREEN_MAIN_DONE") {
+        output.push_str(&read_until(
+            &mut terminal,
+            "FULLSCREEN_MAIN_DONE",
+            Duration::from_secs(5),
+        ));
+    }
+    assert!(output.contains("BTW"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"/tui default\r").unwrap();
+    let _ = read_until(&mut terminal, "TUI mode: default", Duration::from_secs(3));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
     assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
@@ -694,11 +951,19 @@ fn interactive_prompt_suggestion_cancels_stale_work_rearms_and_accepts() {
 
     terminal.write_all(b"prepare next\r").unwrap();
     let second = read_until(&mut terminal, "SECOND_TURN_DONE", Duration::from_secs(10));
-    let suggestion = if second.contains("commit changes") {
+    let mut suggestion = if second.contains("commit changes") {
         second
     } else {
         read_until(&mut terminal, "commit changes", Duration::from_secs(5))
     };
+    if !suggestion.contains("Enter send") {
+        suggestion.push_str(&read_until(
+            &mut terminal,
+            "Enter send",
+            Duration::from_secs(3),
+        ));
+    }
+    assert!(suggestion.contains("commit changes"));
     assert!(suggestion.contains("Enter send"));
     assert!(suggestion.contains("Tab/→ edit"));
     terminal.write_all(b"\r").unwrap();

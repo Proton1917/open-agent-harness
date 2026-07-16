@@ -381,6 +381,77 @@ async fn side_question_is_tool_free_contextual_and_does_not_mutate_transcript() 
     assert!(encoded.contains("do not call tools"));
 }
 
+#[tokio::test]
+async fn side_question_rejects_an_untrusted_tool_call_without_transcript_mutation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let response = tool_use_stream();
+        let (mut stream, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&read_http_body(&mut stream)).unwrap());
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: vec![open_agent_harness::types::Message::user_text(
+                "stable transcript".to_owned(),
+            )],
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    let transcript = engine.messages.clone();
+    let error = engine
+        .answer_side_question("try to use a tool")
+        .await
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(format!("{error:#}").contains("attempted to call a tool"));
+    assert_eq!(engine.messages, transcript);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["tools"], json!([]));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn post_tool_batch_runs_once_before_the_next_model_request() {

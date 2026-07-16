@@ -173,12 +173,15 @@ is accurate; “complete parity with the proprietary product” is not.
   already connected MCP tool. MCP hook input interpolation, time, output,
   concurrency, and async lifetime are all bounded. Root and scoped hooks share
   one async capacity, task registry, observer sequence, and finalization state.
-- Stream-JSON uses separate bounded control/now/next/later lanes and supports
+- Stream-JSON uses separate bounded control/side-question/now/next/later lanes and supports
   queued-message cancellation, interruption receipts that preserve queued
   work, command lifecycle events, optional accepted-user replay
-  acknowledgements, and one opt-in tool-free prompt suggestion request. The
-  same explicit option now drives an interactive empty-composer suggestion
-  without changing the transcript.
+  acknowledgements, active-turn tool-free side questions, and one opt-in
+  tool-free prompt suggestion request. The side-question lane is consumed
+  while the main model future remains active; its response and usage are
+  bounded and it cannot mutate the main transcript. The same explicit prompt
+  option drives an interactive empty-composer suggestion without changing the
+  transcript.
 
 ### MCP, web, prompt, context, and memory
 
@@ -265,6 +268,10 @@ is accurate; “complete parity with the proprietary product” is not.
   The theme picker covers the local snapshot's auto, dark/light, daltonized and
   ANSI variants, previews a bounded diff sample, toggles syntax highlighting
   with Ctrl-T, and rolls back on Escape;
+  while a main model turn is active, a coordinated one-line raw-mode composer
+  accepts immediate `/btw` questions or queues up to eight ordinary inputs.
+  Exact modal suspension and nested raw-mode ownership prevent permission
+  prompts from racing the active composer;
   status-line commands refresh asynchronously on relevant state changes and at
   the configured idle interval. Custom theme editing remains outside the
   declared integration surface.

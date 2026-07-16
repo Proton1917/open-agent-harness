@@ -72,8 +72,12 @@ The frontend comparison is grounded principally in these source files:
   is preserved as the parent; a failed multi-surface fork is removed only after
   exact ownership checks.
 - `/btw` runs a tool-free contextual side question without blocking or mutating
-  the main transcript. `/copy` and `/export` expose bounded public answer text
-  without private reasoning or silent overwrite.
+  the main transcript. During an active model turn, a bounded raw-mode composer
+  keeps `/btw` immediate and queues at most eight ordinary follow-up inputs;
+  its side snapshot includes the active user message. The same operation uses
+  a dedicated bounded stream-JSON control lane, so it does not wait behind the
+  main turn. `/copy` and `/export` expose bounded public answer text without
+  private reasoning or silent overwrite.
 - Ctrl-T and `/tasks` include background agents as first-class actionable rows.
   Their bounded detail is driven by exact child model/tool/retry/compaction
   events, updates on the existing 250 ms UI snapshot cadence, and uses the same

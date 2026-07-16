@@ -47,7 +47,7 @@ command	backfill-sessions	excluded	-	-	Vendor storage migration command is not p
 command	branch	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Forks the local conversation with explicit parent metadata.
 command	break-cache	excluded	-	-	Internal cache fault-injection command is outside production scope.
 command	bridge	excluded	-	-	Vendor IDE or remote bridge and identity channel are outside scope.
-command	btw	implemented	src/main.rs;src/query.rs	src/main.rs;tests/query_loop.rs	Tool-free contextual side question without transcript mutation.
+command	btw	implemented	src/main.rs;src/query.rs;src/control.rs;src/terminal.rs	tests/query_loop.rs;tests/terminal_pty.rs;tests/cli_output.rs	Immediate active-turn TTY and stream-JSON side question; tool-free and transcript-free.
 command	bughunter	excluded	-	-	Bundled product prompt package; equivalent workflows belong in user Skills.
 command	chrome	excluded	-	-	Browser extension and account bridge are outside this coding harness.
 command	clear	implemented	src/main.rs;src/session.rs	src/main.rs;tests/cli_output.rs	Archives the current local session before creating a new one.
