@@ -13,6 +13,7 @@ pub mod cron;
 pub mod file_history;
 pub mod fullscreen;
 pub mod hooks;
+pub mod image_processing;
 pub mod input_history;
 pub mod interactions;
 pub mod keybindings;

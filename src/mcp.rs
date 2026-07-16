@@ -38,6 +38,7 @@ use url::Url;
 
 use crate::{
     config::Settings,
+    image_processing::{ProcessedImage, normalize_image},
     mcp_oauth::{OAuthCredentialProvider, RawOAuthConfig},
     mcp_websocket::{WebSocketMcpConfig, WebSocketMcpRpc},
     process::{SecretEnvScrubber, resolve_trusted_executable, spawn_managed},
@@ -3599,7 +3600,18 @@ async fn map_tool_call_result_with_handles(
         .lock()
         .await
         .insert_resource_links(server, links)?;
-    map_tool_call_result_inner(result, Some(&handles))
+    map_tool_call_result_off_thread(result, Some(handles)).await
+}
+
+async fn map_tool_call_result_off_thread(
+    result: Value,
+    resource_link_handles: Option<Vec<String>>,
+) -> Result<ToolOutput> {
+    tokio::task::spawn_blocking(move || {
+        map_tool_call_result_inner(result, resource_link_handles.as_deref())
+    })
+    .await
+    .context("MCP tool result 映射任务异常终止")?
 }
 
 fn collect_resource_link_uris(result: &Value) -> Result<Vec<String>> {
@@ -3746,11 +3758,15 @@ fn map_tool_content_block(
         "image" => {
             let media_type = required_content_string(object, "mimeType", index)?;
             let data = required_content_string(object, "data", index)?;
-            let raw_len = validate_tool_media(media_type, data, media_bytes, "image")?;
-            preview.push_summary(&format!("[MCP image: {media_type}, {raw_len} bytes]"));
+            let image = normalize_tool_image(media_type, data, media_bytes, "image")?;
+            preview.push_summary(&image_media_summary("image", &image));
             model_blocks.push(json!({
                 "type":"image",
-                "source":{"type":"base64", "media_type":media_type, "data":data}
+                "source":{
+                    "type":"base64",
+                    "media_type":image.media_type,
+                    "data":BASE64.encode(&image.bytes)
+                }
             }));
         }
         "resource" => {
@@ -3833,8 +3849,8 @@ fn map_embedded_resource(
                     format!("MCP tools/call content[{index}].resource blob 缺少 mimeType string")
                 })?;
             if is_native_media_type(media_type) {
-                let raw_len = validate_tool_media(media_type, blob, media_bytes, "resource")?;
                 if media_type == "application/pdf" {
+                    let raw_len = validate_tool_media(media_type, blob, media_bytes, "resource")?;
                     preview.push_summary(&format!("[MCP PDF resource: {raw_len} bytes]"));
                     model_blocks.push(json!({
                         "type":"document",
@@ -3842,12 +3858,15 @@ fn map_embedded_resource(
                         "source":{"type":"base64", "media_type":media_type, "data":blob}
                     }));
                 } else {
-                    preview.push_summary(&format!(
-                        "[MCP image resource: {media_type}, {raw_len} bytes]"
-                    ));
+                    let image = normalize_tool_image(media_type, blob, media_bytes, "resource")?;
+                    preview.push_summary(&image_media_summary("image resource", &image));
                     model_blocks.push(json!({
                         "type":"image",
-                        "source":{"type":"base64", "media_type":media_type, "data":blob}
+                        "source":{
+                            "type":"base64",
+                            "media_type":image.media_type,
+                            "data":BASE64.encode(&image.bytes)
+                        }
                     }));
                 }
             } else {
@@ -3944,6 +3963,50 @@ fn map_resource_link(
     Ok(())
 }
 
+fn normalize_tool_image(
+    media_type: &str,
+    encoded: &str,
+    total_bytes: &mut usize,
+    source: &str,
+) -> Result<ProcessedImage> {
+    validate_mime_type(media_type)?;
+    if !matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
+        bail!("MCP {source} image MIME {media_type:?} 不受支持")
+    }
+    let bytes = decode_canonical_media(encoded, source)?;
+    if detect_tool_media_type(&bytes) != Some(media_type) {
+        bail!("MCP {source} 内容签名与声明的 MIME {media_type:?} 不一致")
+    }
+    let image = normalize_image(bytes).with_context(|| format!("MCP {source} 图片无法归一化"))?;
+    add_media_bytes(total_bytes, image.bytes.len())?;
+    Ok(image)
+}
+
+fn image_media_summary(label: &str, image: &ProcessedImage) -> String {
+    if image.changed() {
+        format!(
+            "[MCP {label}: {}, {} bytes, {}x{} -> {}, {} bytes, {}x{}]",
+            image.original_media_type,
+            image.original_bytes,
+            image.original_width,
+            image.original_height,
+            image.media_type,
+            image.bytes.len(),
+            image.display_width,
+            image.display_height
+        )
+    } else {
+        format!(
+            "[MCP {label}: {}, {} bytes]",
+            image.media_type,
+            image.bytes.len()
+        )
+    }
+}
+
 fn validate_tool_media(
     media_type: &str,
     encoded: &str,
@@ -4010,6 +4073,12 @@ fn validate_mime_type(media_type: &str) -> Result<()> {
 }
 
 fn decode_bounded_media(encoded: &str, total_bytes: &mut usize, source: &str) -> Result<Vec<u8>> {
+    let bytes = decode_canonical_media(encoded, source)?;
+    add_media_bytes(total_bytes, bytes.len())?;
+    Ok(bytes)
+}
+
+fn decode_canonical_media(encoded: &str, source: &str) -> Result<Vec<u8>> {
     if encoded.is_empty() || encoded.len() > MAX_TOOL_MEDIA_BASE64_BYTES {
         bail!("MCP {source} base64 为空或超过 {MAX_TOOL_MEDIA_BASE64_BYTES} 字节限制")
     }
@@ -4022,14 +4091,18 @@ fn decode_bounded_media(encoded: &str, total_bytes: &mut usize, source: &str) ->
     if bytes.is_empty() {
         bail!("MCP {source} 解码后为空")
     }
+    Ok(bytes)
+}
+
+fn add_media_bytes(total_bytes: &mut usize, bytes: usize) -> Result<()> {
     let updated_total = total_bytes
-        .checked_add(bytes.len())
+        .checked_add(bytes)
         .context("MCP media 大小累计溢出")?;
     if updated_total > MAX_TOOL_MEDIA_RAW_BYTES {
-        bail!("MCP media 解码后累计超过 {MAX_TOOL_MEDIA_RAW_BYTES} 字节限制")
+        bail!("MCP media 累计超过 {MAX_TOOL_MEDIA_RAW_BYTES} 字节限制")
     }
     *total_bytes = updated_total;
-    Ok(bytes)
+    Ok(())
 }
 
 fn is_native_media_type(media_type: &str) -> bool {
@@ -5135,7 +5208,7 @@ impl McpHookInvoker for McpManager {
                 remaining,
             )
             .await?;
-        let output = map_tool_call_result_inner(result, None)?;
+        let output = map_tool_call_result_off_thread(result, None).await?;
         Ok(McpHookResult {
             output: output.content,
             is_error: output.is_error,
@@ -5703,16 +5776,29 @@ fn sanitize_external_binary_payload(mut value: Value, media_bytes: &mut usize) -
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::TcpListener,
         thread,
     };
+
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 
     use super::*;
     use crate::{
         permissions::{PermissionManager, PermissionMode},
         tools::{ToolContext, ToolRegistry},
     };
+
+    fn image_fixture(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            Rgba([(x % 251) as u8, (y % 239) as u8, 127, 255])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, format)
+            .unwrap();
+        output.into_inner()
+    }
 
     fn wait_test_context(path: &Path) -> ToolContext {
         ToolContext::new(
@@ -6798,7 +6884,8 @@ done
 
     #[test]
     fn tool_call_maps_text_image_and_structured_content_without_base64_preview() {
-        let image = BASE64.encode(b"\x89PNG\r\n\x1a\n");
+        let image_bytes = image_fixture(ImageFormat::Png, 2, 1);
+        let image = BASE64.encode(&image_bytes);
         let output = map_tool_call_result(json!({
             "content": [
                 {"type":"text", "text":"plain result"},
@@ -6811,7 +6898,10 @@ done
         .unwrap();
         assert!(!output.is_error);
         assert!(output.content.contains("plain result"));
-        assert!(output.content.contains("MCP image: image/png, 8 bytes"));
+        assert!(output.content.contains(&format!(
+            "MCP image: image/png, {} bytes",
+            image_bytes.len()
+        )));
         assert!(output.content.contains("MCP structured content"));
         assert!(!output.content.contains(&image));
         assert!(!output.content.contains("\"count\""));
@@ -6834,8 +6924,34 @@ done
     }
 
     #[test]
+    fn tool_call_decodes_and_normalizes_oversized_images_before_transport() {
+        let original = image_fixture(ImageFormat::Png, 2_400, 2);
+        let output = map_tool_call_result(json!({
+            "content": [{
+                "type":"image",
+                "mimeType":"image/png",
+                "data":BASE64.encode(&original)
+            }]
+        }))
+        .unwrap();
+        assert!(output.content.contains("2400x2 ->"));
+        assert!(!output.content.contains(&BASE64.encode(&original)));
+
+        let blocks = output.model_content.unwrap();
+        let encoded = blocks[0]["source"]["data"].as_str().unwrap();
+        let normalized = BASE64.decode(encoded).unwrap();
+        let decoded = image::load_from_memory(&normalized).unwrap();
+        assert!(decoded.width() <= crate::image_processing::MAX_IMAGE_WIDTH);
+        assert!(decoded.height() <= crate::image_processing::MAX_IMAGE_HEIGHT);
+        assert_eq!(
+            blocks[0]["source"]["media_type"],
+            crate::image_processing::detect_supported_image_type(&normalized).unwrap()
+        );
+    }
+
+    #[test]
     fn tool_call_maps_embedded_text_image_and_pdf_resources() {
-        let image = BASE64.encode(b"GIF89a");
+        let image = BASE64.encode(image_fixture(ImageFormat::Gif, 2, 1));
         let pdf = BASE64.encode(b"%PDF-1.7\n");
         let output = map_tool_call_result(json!({
             "content": [
@@ -7084,11 +7200,23 @@ done
 
         let wrong_signature = map_tool_call_result(json!({
             "content": [{
-                "type":"image", "mimeType":"image/png", "data":BASE64.encode(b"GIF89a")
+                "type":"image",
+                "mimeType":"image/png",
+                "data":BASE64.encode(image_fixture(ImageFormat::Gif, 1, 1))
             }]
         }))
         .unwrap_err();
         assert!(wrong_signature.to_string().contains("内容签名"));
+
+        let malformed_image = map_tool_call_result(json!({
+            "content": [{
+                "type":"image",
+                "mimeType":"image/png",
+                "data":BASE64.encode(b"\x89PNG\r\n\x1a\nnot-an-image")
+            }]
+        }))
+        .unwrap_err();
+        assert!(malformed_image.to_string().contains("无法归一化"));
     }
 
     #[test]

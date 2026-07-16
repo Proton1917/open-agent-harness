@@ -9,6 +9,7 @@ use crate::{
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     file_history::{CheckpointBoundary, DiffStats, RewindReport},
     hooks::{HookRunner, blocking_feedback},
+    image_processing::normalize_user_content_images,
     messages::normalize_for_api,
     permissions::PermissionMode,
     prompt::{permission_mode_section, registered_tools_section},
@@ -29,7 +30,8 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 128;
 const MAX_TOOL_USE_ID_BYTES: usize = 256;
 const MAX_TOOL_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_CONTENT_BLOCKS: usize = 8_192;
-const MAX_USER_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_USER_CONTENT_BYTES: usize = 20 * 1024 * 1024;
+const MAX_USER_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_COMPACT_SIZE_RETRIES: usize = 3;
 const MAX_STOP_FEEDBACK_ROUNDS: usize = 3;
 const MAX_HOOK_FEEDBACK_BYTES: usize = 64 * 1024;
@@ -313,6 +315,13 @@ impl QueryEngine {
     {
         if serde_json::to_vec(&content)?.len() > MAX_USER_CONTENT_BYTES {
             bail!("用户消息超过 {MAX_USER_CONTENT_BYTES} 字节限制")
+        }
+        if direct_user_text_bytes(&content)? > MAX_USER_TEXT_BYTES {
+            bail!("用户消息文本超过 {MAX_USER_TEXT_BYTES} 字节限制")
+        }
+        let content = normalize_user_content_images(content).await?;
+        if serde_json::to_vec(&content)?.len() > MAX_USER_CONTENT_BYTES {
+            bail!("归一化后的用户消息超过 {MAX_USER_CONTENT_BYTES} 字节限制")
         }
         validate_direct_user_content(&content)?;
         self.emit(QueryEvent::TurnStarted);
@@ -1576,6 +1585,26 @@ impl QueryEngine {
             }
             self.registry.shutdown().await;
         }
+    }
+}
+
+fn direct_user_text_bytes(content: &Value) -> Result<usize> {
+    match content {
+        Value::String(text) => Ok(text.len()),
+        Value::Array(blocks) => blocks.iter().try_fold(0usize, |total, block| {
+            let text_bytes = if block.get("type").and_then(Value::as_str) == Some("text") {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+            } else {
+                0
+            };
+            total
+                .checked_add(text_bytes)
+                .context("用户消息文本大小溢出")
+        }),
+        _ => Ok(0),
     }
 }
 

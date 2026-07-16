@@ -7,13 +7,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::image_processing::{
+    MAX_IMAGE_INPUT_BYTES, detect_supported_image_type, normalize_image,
+};
+
 use super::{MAX_EDITABLE_FILE_BYTES, Tool, ToolContext, ToolOutput, object_schema, parse_input};
 
 const MAX_SIZE: u64 = MAX_EDITABLE_FILE_BYTES as u64;
 const MAX_APPROX_TOKENS: usize = 25_000;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_SCAN_BYTES: usize = 16 * 1024 * 1024;
-const MAX_IMAGE_RAW_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PDF_RAW_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PDF_PAGES_PER_READ: usize = 20;
 const MAX_NOTEBOOK_CELLS: usize = 256;
@@ -246,32 +249,38 @@ async fn read_binary_bounded(
 }
 
 async fn read_image(context: &ToolContext, path: &Path, metadata_len: u64) -> Result<ToolOutput> {
-    let bytes = read_binary_bounded(path, metadata_len, MAX_IMAGE_RAW_BYTES, "图片").await?;
-    let media_type = detect_image_media_type(&bytes)
-        .context("图片内容不是受支持的 PNG、JPEG、GIF 或 WebP；不会仅凭扩展名发送二进制内容")?;
+    let bytes = read_binary_bounded(path, metadata_len, MAX_IMAGE_INPUT_BYTES, "图片").await?;
+    let processed = tokio::task::spawn_blocking(move || normalize_image(bytes))
+        .await
+        .context("图片处理任务异常终止")??;
     let display = context.display_path(path);
-    let preview = format!("Read image {display} ({} bytes, {media_type})", bytes.len());
+    let preview = if processed.changed() {
+        format!(
+            "Read image {display} ({} bytes, {}x{} → {} bytes, {}x{}, {})",
+            processed.original_bytes,
+            processed.original_width,
+            processed.original_height,
+            processed.bytes.len(),
+            processed.display_width,
+            processed.display_height,
+            processed.media_type
+        )
+    } else {
+        format!(
+            "Read image {display} ({} bytes, {}x{}, {})",
+            processed.bytes.len(),
+            processed.display_width,
+            processed.display_height,
+            processed.media_type
+        )
+    };
     let content = json!([
         {"type":"text", "text":preview},
         {"type":"image", "source":{
-            "type":"base64", "media_type":media_type, "data":BASE64.encode(bytes)
+            "type":"base64", "media_type":processed.media_type, "data":BASE64.encode(processed.bytes)
         }}
     ]);
     Ok(ToolOutput::success_with_model_content(preview, content))
-}
-
-fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 struct PdfPayload {
@@ -497,7 +506,7 @@ impl NotebookRenderer {
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .context("notebook 可视化包含无效 base64")?;
-        if detect_image_media_type(&decoded) != Some(media_type) {
+        if detect_supported_image_type(&decoded) != Some(media_type) {
             bail!("notebook 可视化的 MIME 类型与文件内容不一致: {media_type}")
         }
         self.media_raw_bytes = self
@@ -731,8 +740,9 @@ fn block_device(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, io::Cursor};
 
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use lopdf::{Document, Object, dictionary};
     use tempfile::TempDir;
 
@@ -749,6 +759,17 @@ mod tests {
                 Vec::new(),
             ),
         )
+    }
+
+    fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            Rgba([(x % 255) as u8, (y % 255) as u8, 127, 255])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
     }
 
     fn minimal_pdf(page_count: usize) -> Vec<u8> {
@@ -785,8 +806,8 @@ mod tests {
     async fn image_read_returns_model_facing_base64_without_polluting_preview() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pixel.png");
-        let bytes = b"\x89PNG\r\n\x1a\nfixture";
-        fs::write(&path, bytes).unwrap();
+        let bytes = png_fixture(2, 1);
+        fs::write(&path, &bytes).unwrap();
 
         let output = ReadTool
             .execute(&test_context(&temp), json!({"file_path":"pixel.png"}))
@@ -794,11 +815,30 @@ mod tests {
             .unwrap();
 
         assert!(!output.is_error);
-        assert!(!output.content.contains(&BASE64.encode(bytes)));
+        assert!(!output.content.contains(&BASE64.encode(&bytes)));
         let blocks = output.model_content.unwrap();
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
         assert_eq!(blocks[1]["source"]["data"], BASE64.encode(bytes));
+    }
+
+    #[tokio::test]
+    async fn image_read_resizes_dimensions_before_model_transport() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wide.png");
+        fs::write(&path, png_fixture(2_400, 2)).unwrap();
+
+        let output = ReadTool
+            .execute(&test_context(&temp), json!({"file_path":"wide.png"}))
+            .await
+            .unwrap();
+        assert!(output.content.contains("2400x2 →"));
+        let blocks = output.model_content.unwrap();
+        let encoded = blocks[1]["source"]["data"].as_str().unwrap();
+        let decoded = BASE64.decode(encoded).unwrap();
+        let image = image::load_from_memory(&decoded).unwrap();
+        assert!(image.width() <= crate::image_processing::MAX_IMAGE_WIDTH);
+        assert!(image.height() <= crate::image_processing::MAX_IMAGE_HEIGHT);
     }
 
     #[tokio::test]
@@ -813,7 +853,7 @@ mod tests {
 
         let oversized = temp.path().join("large.png");
         let file = fs::File::create(&oversized).unwrap();
-        file.set_len((MAX_IMAGE_RAW_BYTES + 1) as u64).unwrap();
+        file.set_len((MAX_IMAGE_INPUT_BYTES + 1) as u64).unwrap();
         let error = ReadTool
             .execute(&test_context(&temp), json!({"file_path":"large.png"}))
             .await

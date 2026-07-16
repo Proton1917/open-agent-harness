@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -25,6 +26,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    image_processing::{ProcessedImage, normalize_image},
     permissions::static_shell_pipeline,
     process::{ProcessTreeGuard, spawn_managed},
 };
@@ -654,6 +656,18 @@ async fn execute_bash(
     let retain_long_output = capture_policy == ForegroundCapturePolicy::RetainLongOutput;
     let (mut preview, preview_truncated, size) =
         read_output_preview_with_retention(&output_path, MAX_OUTPUT_BYTES, retain_long_output)?;
+    let shell_image = if status
+        .as_ref()
+        .is_some_and(std::process::ExitStatus::success)
+        && !capture_was_truncated
+    {
+        normalize_shell_image_output(&output_path).await?
+    } else {
+        None
+    };
+    if let Some(image) = &shell_image {
+        preview = shell_image_summary(image);
+    }
     append_sandbox_warning(&mut preview, sandbox_warning.as_deref());
     if status
         .as_ref()
@@ -666,7 +680,8 @@ async fn execute_bash(
     if let Some((path, _)) = &cwd_marker {
         let _ = std::fs::remove_file(path);
     }
-    let keep_output = retain_long_output && (preview_truncated || capture_was_truncated);
+    let keep_output =
+        shell_image.is_none() && retain_long_output && (preview_truncated || capture_was_truncated);
     if keep_output {
         output_guard.keep();
         if !preview.is_empty() {
@@ -702,10 +717,103 @@ async fn execute_bash(
         preview.push_str(&format!("Exit code {}", status.code().unwrap_or(-1)));
         return Ok(ToolOutput::error(preview));
     }
+    if let Some(image) = shell_image {
+        let model_content = json!([
+            {"type":"text", "text":preview},
+            {"type":"image", "source":{
+                "type":"base64",
+                "media_type":image.media_type,
+                "data":BASE64.encode(image.bytes)
+            }}
+        ]);
+        return Ok(ToolOutput::success_with_model_content(
+            preview,
+            model_content,
+        ));
+    }
     if preview.is_empty() {
         preview = "Command completed successfully with no output".into();
     }
     Ok(ToolOutput::success(preview))
+}
+
+async fn normalize_shell_image_output(path: &Path) -> Result<Option<ProcessedImage>> {
+    let mut file = File::open(path).context("无法打开 shell image capture")?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_CAPTURE_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("无法读取 shell image capture")?;
+    if bytes.len() as u64 > MAX_CAPTURE_FILE_BYTES {
+        return Ok(None);
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    let text = text.trim();
+    if text
+        .get(.."data:image/".len())
+        .is_none_or(|prefix| !prefix.eq_ignore_ascii_case("data:image/"))
+    {
+        return Ok(None);
+    }
+    let (header, encoded) = text
+        .split_once(',')
+        .context("shell image data URI 缺少逗号分隔符")?;
+    let header = header.to_ascii_lowercase();
+    let declared = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .context("shell image data URI 必须使用 base64 编码且不得带额外参数")?;
+    let declared = match declared {
+        "image/jpg" => "image/jpeg",
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => declared,
+        _ => bail!("shell image data URI 声明了不支持的 MIME {declared:?}"),
+    };
+    if encoded.is_empty() {
+        bail!("shell image data URI 的 base64 payload 为空")
+    }
+    let decoded = BASE64
+        .decode(encoded)
+        .context("shell image data URI 包含无效 base64")?;
+    if BASE64.encode(&decoded) != encoded {
+        bail!("shell image data URI 不是规范的 RFC 4648 base64")
+    }
+    let image = tokio::task::spawn_blocking(move || normalize_image(decoded))
+        .await
+        .context("shell image 处理任务异常终止")?
+        .context("shell image 无法归一化")?;
+    if image.original_media_type != declared {
+        bail!(
+            "shell image 内容签名 {} 与声明的 MIME {declared:?} 不一致",
+            image.original_media_type
+        )
+    }
+    Ok(Some(image))
+}
+
+fn shell_image_summary(image: &ProcessedImage) -> String {
+    if image.changed() {
+        format!(
+            "Shell image normalized: {} bytes, {}x{} {} -> {} bytes, {}x{} {}",
+            image.original_bytes,
+            image.original_width,
+            image.original_height,
+            image.original_media_type,
+            image.bytes.len(),
+            image.display_width,
+            image.display_height,
+            image.media_type
+        )
+    } else {
+        format!(
+            "Shell image: {} bytes, {}x{} {}",
+            image.bytes.len(),
+            image.display_width,
+            image.display_height,
+            image.media_type
+        )
+    }
 }
 
 async fn spawn_background(
@@ -1357,6 +1465,10 @@ fn read_output_preview_with_retention(
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+
     use super::*;
     use crate::{
         permissions::{PermissionManager, PermissionMode},
@@ -1388,6 +1500,52 @@ mod tests {
             .and_then(|line| line.strip_prefix("Command running in background with ID: "))
             .expect("background task id")
             .to_owned()
+    }
+
+    fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            Rgba([(x % 251) as u8, (y % 239) as u8, 127, 255])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    #[tokio::test]
+    async fn shell_data_uri_images_are_normalized_without_base64_preview_leakage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = test_context(workspace.path());
+        let original = png_fixture(2_400, 2);
+        let encoded = BASE64.encode(&original);
+        let command = format!("printf '%s' 'data:image/png;base64,{encoded}'");
+        let output = BashTool
+            .execute(&context, json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("2400x2"));
+        assert!(!output.content.contains(&encoded));
+        let blocks = output.model_content.unwrap();
+        let transported = blocks[1]["source"]["data"].as_str().unwrap();
+        let decoded = BASE64.decode(transported).unwrap();
+        let image = image::load_from_memory(&decoded).unwrap();
+        assert!(image.width() <= crate::image_processing::MAX_IMAGE_WIDTH);
+        assert!(image.height() <= crate::image_processing::MAX_IMAGE_HEIGHT);
+        assert_eq!(
+            blocks[1]["source"]["media_type"],
+            crate::image_processing::detect_supported_image_type(&decoded).unwrap()
+        );
+
+        let malformed = BashTool
+            .execute(
+                &context,
+                json!({"command":"printf '%s' 'data:image/png;base64,bm90LWltYWdl'"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{malformed:#}").contains("无法归一化"));
     }
 
     fn context_with_mode(workspace: &Path, mode: PermissionMode, deny: Vec<String>) -> ToolContext {

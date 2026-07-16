@@ -34,6 +34,7 @@ use open_agent_harness::{
     control::{ControlHandle, ControlSession, InboundMessage},
     file_history::{CheckpointInfo, CheckpointStatus, FileHistory, RewindReport},
     hooks::{HookExecutionEvent, HookObserver, HookRunner},
+    image_processing::normalize_image,
     input_history::{HistoryContext, HistoryQuery, HistoryScope, InputHistoryStore},
     interactions::UserInteractionHandler,
     keybindings::KeybindingManager,
@@ -5442,6 +5443,13 @@ async fn expand_input_with_clipboard_images(
     clipboard_images: Vec<ClipboardImage>,
 ) -> Result<Value> {
     let content = expand_explicit_file_mentions(engine, input).await?;
+    append_clipboard_images(content, clipboard_images).await
+}
+
+async fn append_clipboard_images(
+    content: Value,
+    clipboard_images: Vec<ClipboardImage>,
+) -> Result<Value> {
     if clipboard_images.is_empty() {
         return Ok(content);
     }
@@ -5458,13 +5466,24 @@ async fn expand_input_with_clipboard_images(
                 .checked_add(serde_json::to_vec(block)?.len())
                 .ok_or_else(|| anyhow!("附加媒体大小溢出"))
         })?;
-    for image in clipboard_images {
+    for (index, image) in clipboard_images.into_iter().enumerate() {
+        let expected_media_type = image.media_type;
+        let expected_dimensions = (image.width, image.height);
+        let processed = tokio::task::spawn_blocking(move || normalize_image(image.bytes))
+            .await
+            .with_context(|| format!("剪贴板图片 {} 处理任务异常终止", index + 1))?
+            .with_context(|| format!("剪贴板图片 {} 无法归一化", index + 1))?;
+        if processed.original_media_type != expected_media_type
+            || (processed.original_width, processed.original_height) != expected_dimensions
+        {
+            bail!("剪贴板图片 {} 的已验证元数据与解码结果不一致", index + 1)
+        }
         let block = json!({
             "type":"image",
             "source":{
                 "type":"base64",
-                "media_type":image.media_type,
-                "data":BASE64_STANDARD.encode(image.bytes)
+                "media_type":processed.media_type,
+                "data":BASE64_STANDARD.encode(processed.bytes)
             }
         });
         media_bytes = media_bytes
@@ -7200,7 +7219,64 @@ fn bounded_single_line(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+
     use super::*;
+
+    fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            Rgba([(x % 251) as u8, (y % 239) as u8, 127, 255])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    #[tokio::test]
+    async fn clipboard_images_are_decoded_and_normalized_before_transport() {
+        let source = png_fixture(2_400, 2);
+        let content = append_clipboard_images(
+            Value::String("inspect this image".to_owned()),
+            vec![ClipboardImage {
+                bytes: source,
+                media_type: "image/png",
+                width: 2_400,
+                height: 2,
+            }],
+        )
+        .await
+        .unwrap();
+        let blocks = content.as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            json!({"type":"text", "text":"inspect this image"})
+        );
+        let encoded = blocks[1]["source"]["data"].as_str().unwrap();
+        let decoded = BASE64_STANDARD.decode(encoded).unwrap();
+        let image = image::load_from_memory(&decoded).unwrap();
+        assert!(image.width() <= open_agent_harness::image_processing::MAX_IMAGE_WIDTH);
+        assert!(image.height() <= open_agent_harness::image_processing::MAX_IMAGE_HEIGHT);
+        assert_eq!(
+            blocks[1]["source"]["media_type"],
+            open_agent_harness::image_processing::detect_supported_image_type(&decoded).unwrap()
+        );
+
+        let malformed = append_clipboard_images(
+            Value::String("bad".to_owned()),
+            vec![ClipboardImage {
+                bytes: b"\x89PNG\r\n\x1a\nnot-an-image".to_vec(),
+                media_type: "image/png",
+                width: 1,
+                height: 1,
+            }],
+        )
+        .await;
+        assert!(malformed.is_err());
+    }
 
     #[test]
     fn resume_selector_accepts_uuid_or_unique_exact_title() {

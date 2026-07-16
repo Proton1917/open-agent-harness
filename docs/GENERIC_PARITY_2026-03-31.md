@@ -185,6 +185,13 @@ is accurate; “complete parity with the proprietary product” is not.
   userinfo, query strings, and fragments are not reflected into model context.
   Images and PDFs become model media blocks; audio and other opaque binary data
   expose bounded metadata rather than raw bytes.
+- Every model-bound PNG/JPEG/GIF/WebP path uses one bounded Rust normalizer:
+  `Read` and explicit file mentions, clipboard attachments, exact shell data
+  URIs, MCP image blocks/resources, and direct SDK/stream user blocks. It
+  performs a real decode, verifies declared MIME against content, never
+  enlarges a smaller image, constrains dimensions to 2000x2000, targets 3.75
+  MiB raw output with progressive format-preserving/lossy fallback, and rejects
+  corrupt or still-oversized images without leaking base64 into previews.
 - HTTP/WebSocket MCP authentication can use explicitly trusted bearer tokens
   sourced from an environment variable, private file, or bounded command
   without placing the token in a URL. OAuth supports protected-resource and

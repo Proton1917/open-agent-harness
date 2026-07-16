@@ -21,7 +21,7 @@ use crate::{
     protocol::validate_direct_user_content,
 };
 
-pub const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
+pub const MAX_CONTROL_LINE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PENDING_REQUESTS: usize = 64;
 const MAX_PENDING_LIFECYCLE_EVENTS: usize = 256;
 const CONTROL_INBOUND_CAPACITY: usize = 16;
