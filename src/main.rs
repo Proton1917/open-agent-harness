@@ -496,6 +496,9 @@ async fn run(
                 &active_cwd,
             )
             .await?;
+        if !session_start.watch_paths.is_empty() {
+            tool_context.replace_hook_watch_paths(&session_start.watch_paths)?;
+        }
         if !session_start.additional_context.is_empty() {
             system.push_str("\n\n<session-start-hook-context>\n");
             system.push_str(&session_start.additional_context.join("\n"));

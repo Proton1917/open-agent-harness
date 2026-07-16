@@ -643,6 +643,7 @@ impl QueryEngine {
     }
 
     async fn run_turn_inner(&mut self, mut content: Value) -> Result<TurnResult> {
+        let external_file_context = self.tool_context.poll_external_file_changes().await?;
         self.tool_context
             .refresh_workspace_context_if_stale()
             .await?;
@@ -696,6 +697,15 @@ impl QueryEngine {
                     ),
                 );
             }
+        }
+        if !external_file_context.is_empty() {
+            content = append_user_context(
+                content,
+                format!(
+                    "<external-file-change-hook-context>\n{}\n</external-file-change-hook-context>",
+                    external_file_context.join("\n")
+                ),
+            );
         }
         // Skill modifiers live only in this invocation's stack frame. A
         // success, error, or cancellation drops the narrowed registry/model
@@ -806,9 +816,19 @@ impl QueryEngine {
         self.messages.push(pending);
 
         for round in 0..self.max_tool_rounds {
+            let external_file_context = self.tool_context.poll_external_file_changes().await?;
             self.tool_context
                 .refresh_workspace_context_if_stale()
                 .await?;
+            if !external_file_context.is_empty() {
+                self.messages.push(Message {
+                    role: Role::User,
+                    content: Value::String(format!(
+                        "<external-file-change-hook-context>\n{}\n</external-file-change-hook-context>",
+                        external_file_context.join("\n")
+                    )),
+                });
+            }
             if !compacted
                 && self.compact_config.auto_enabled
                 && round > 0

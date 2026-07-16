@@ -159,7 +159,10 @@ is accurate; “complete parity with the proprietary product” is not.
   boundaries. Root `Stop` feedback is bounded and may request another round;
   `StopFailure` cannot replace the original failure.
 - File mutations match `FileChanged` rules by normalized workspace path and
-  report `add` versus `change`. Project Skill hot refresh emits a blockable
+  report `add` versus `change`. A bounded request-boundary watcher also detects
+  external `add`/`change`/`unlink`, registers absolute hook-returned
+  `watchPaths`, and reloads externally changed instructions or Skills before
+  the next model request. Project Skill hot refresh emits a blockable
   `ConfigChange(source=skills)` before replacing the in-process catalog; hook
   failure leaves the prior catalog active and marks the turn for file rollback.
 - Hooks additionally support one post-batch boundary, user prompt expansion,
@@ -278,9 +281,12 @@ is accurate; “complete parity with the proprietary product” is not.
   Trusted user settings and installed plugin manifests remain startup
   snapshots; plugin lifecycle changes are deliberately applied by a later
   process rather than mutating executable/network authority in place.
-- `FileChanged` currently observes harness file-tool commits. It does not run a
-  general background filesystem watcher, and hook-returned dynamic
-  `watchPaths` are not registered.
+- External file changes are observed at bounded model-request boundaries, not
+  by an unbounded resident OS watcher. Multiple writes between two boundaries
+  may therefore coalesce into one visible state transition. The baseline and
+  every changed watch set use `ignoreInitial` semantics; scans do not follow
+  symlinks, have path/depth/entry/hash/event limits, and suppress only a
+  harness file-tool change whose acknowledged fingerprint still matches.
 - Explicit `TaskStop` is intentionally immediate; a stopped OS process cannot
   be recreated by later turn rollback. New-task rollback, notification cursors,
   and unretained capture cleanup remain transactional.

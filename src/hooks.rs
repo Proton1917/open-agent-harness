@@ -40,6 +40,8 @@ const MAX_MATCHED_COMMANDS_PER_EVENT: usize = 64;
 const MAX_ASYNC_HOOKS: usize = 32;
 const MAX_HOOK_CONDITION_BYTES: usize = 1024;
 const MAX_HOOK_STATUS_BYTES: usize = 8 * 1024;
+const MAX_HOOK_WATCH_PATHS: usize = 128;
+const MAX_HOOK_WATCH_PATH_BYTES: usize = 16 * 1024;
 const MAX_MCP_SERVER_BYTES: usize = 128;
 const MAX_MCP_TOOL_BYTES: usize = 1024;
 const MAX_MCP_INPUT_DEPTH: usize = 32;
@@ -115,6 +117,7 @@ pub fn blocking_feedback(error: &anyhow::Error) -> Option<String> {
 #[derive(Clone)]
 pub struct HookRunner {
     events: Arc<HashMap<String, Vec<HookRule>>>,
+    file_watch_patterns: Arc<Vec<String>>,
     additional: Vec<Arc<HookRunner>>,
     async_slots: Arc<Semaphore>,
     mcp_invoker: Option<Arc<dyn McpHookInvoker>>,
@@ -152,6 +155,7 @@ impl Default for HookRunner {
     fn default() -> Self {
         Self {
             events: Arc::new(HashMap::new()),
+            file_watch_patterns: Arc::new(Vec::new()),
             additional: Vec::new(),
             async_slots: Arc::new(Semaphore::new(MAX_ASYNC_HOOKS)),
             mcp_invoker: None,
@@ -267,6 +271,7 @@ pub struct HookOutcome {
     pub updated_input: Option<Value>,
     pub updated_output: Option<String>,
     pub additional_context: Vec<String>,
+    pub watch_paths: Vec<String>,
 }
 
 struct CommandResult {
@@ -304,6 +309,7 @@ impl HookRunner {
             bail!("hooks 总规则数超过 {MAX_RULES} 项限制")
         }
         let mut parsed = HashMap::new();
+        let mut file_watch_patterns = Vec::new();
         for (event, rules) in events {
             if !SUPPORTED_EVENTS.contains(&event.as_str()) {
                 bail!("不支持的 hook event: {event}")
@@ -315,6 +321,26 @@ impl HookRunner {
             for rule in rules {
                 let raw: RawHookRule = serde_json::from_value(rule.clone())
                     .with_context(|| format!("hooks.{event} rule 无效"))?;
+                if event == "FileChanged" {
+                    for pattern in raw
+                        .matcher
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|pattern| !pattern.is_empty())
+                    {
+                        if pattern.len() > MAX_HOOK_WATCH_PATH_BYTES || pattern.contains('\0') {
+                            bail!("FileChanged matcher 路径过长或包含 NUL")
+                        }
+                        if !file_watch_patterns.iter().any(|value| value == pattern) {
+                            if file_watch_patterns.len() >= MAX_HOOK_WATCH_PATHS {
+                                bail!(
+                                    "FileChanged watch matcher 超过 {MAX_HOOK_WATCH_PATHS} 项限制"
+                                )
+                            }
+                            file_watch_patterns.push(pattern.to_owned());
+                        }
+                    }
+                }
                 if raw.hooks.is_empty() || raw.hooks.len() > MAX_COMMANDS_PER_RULE {
                     bail!("hooks.{event} 每条规则必须有 1..={MAX_COMMANDS_PER_RULE} 个命令")
                 }
@@ -330,6 +356,7 @@ impl HookRunner {
         }
         Ok(Self {
             events: Arc::new(parsed),
+            file_watch_patterns: Arc::new(file_watch_patterns),
             additional: Vec::new(),
             async_slots: Arc::new(Semaphore::new(MAX_ASYNC_HOOKS)),
             mcp_invoker: None,
@@ -465,6 +492,19 @@ impl HookRunner {
             || self.additional.iter().any(|runner| runner.has_event(event))
     }
 
+    pub(crate) fn file_watch_patterns(&self) -> Result<Vec<String>> {
+        let mut patterns = self.file_watch_patterns.as_ref().clone();
+        for runner in &self.additional {
+            patterns.extend(runner.file_watch_patterns()?);
+            if patterns.len() > MAX_HOOK_WATCH_PATHS {
+                bail!("scoped FileChanged watch matcher 超过 {MAX_HOOK_WATCH_PATHS} 项限制")
+            }
+        }
+        patterns.sort();
+        patterns.dedup();
+        Ok(patterns)
+    }
+
     pub async fn run(
         &self,
         event: &str,
@@ -524,6 +564,12 @@ impl HookRunner {
             outcome
                 .additional_context
                 .extend(incoming.additional_context);
+            outcome.watch_paths.extend(incoming.watch_paths);
+            outcome.watch_paths.sort();
+            outcome.watch_paths.dedup();
+            if outcome.watch_paths.len() > MAX_HOOK_WATCH_PATHS {
+                bail!("hook watchPaths 合并后超过 {MAX_HOOK_WATCH_PATHS} 项限制")
+            }
             validate_outcome_size(&outcome)?;
         }
         Ok(outcome)
@@ -838,9 +884,11 @@ fn validate_outcome_size(outcome: &HookOutcome) -> Result<()> {
         .iter()
         .map(String::len)
         .sum::<usize>();
+    let watch_path_bytes = outcome.watch_paths.iter().map(String::len).sum::<usize>();
     if input_bytes
         .saturating_add(output_bytes)
         .saturating_add(context_bytes)
+        .saturating_add(watch_path_bytes)
         > MAX_HOOK_COMBINED_OUTPUT_BYTES
     {
         bail!("hook combined output 超过 {MAX_HOOK_COMBINED_OUTPUT_BYTES} 字节限制")
@@ -1538,6 +1586,29 @@ fn merge_hook_response(event: &str, value: Value, outcome: &mut HookOutcome) -> 
             outcome.additional_context.push(context.to_owned());
         }
     }
+    for paths in [
+        object.get("watchPaths"),
+        specific.and_then(|specific| specific.get("watchPaths")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let paths = paths
+            .as_array()
+            .context("hook watchPaths 必须是 string array")?;
+        for path in paths {
+            let path = path.as_str().context("hook watchPaths 只能包含 string")?;
+            if path.is_empty() || path.len() > MAX_HOOK_WATCH_PATH_BYTES || path.contains('\0') {
+                bail!("hook watch path 为空、过长或包含 NUL")
+            }
+            if !outcome.watch_paths.iter().any(|existing| existing == path) {
+                if outcome.watch_paths.len() >= MAX_HOOK_WATCH_PATHS {
+                    bail!("hook watchPaths 超过 {MAX_HOOK_WATCH_PATHS} 项限制")
+                }
+                outcome.watch_paths.push(path.to_owned());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1879,6 +1950,65 @@ mod tests {
             ..HookOutcome::default()
         };
         assert!(validate_outcome_size(&outcome).is_err());
+    }
+
+    #[test]
+    fn file_changed_matchers_are_exposed_as_bounded_watch_patterns() {
+        let settings = Settings {
+            raw: json!({"hooks":{"FileChanged":[{
+                "matcher":".env | config/*.json | .env",
+                "hooks":[{"type":"command","command":"true"}]
+            }]}}),
+        };
+        let root = HookRunner::from_settings(&settings).unwrap();
+        assert_eq!(
+            root.file_watch_patterns().unwrap(),
+            vec![".env".to_owned(), "config/*.json".to_owned()]
+        );
+
+        let scoped = root
+            .with_scoped_hooks(&json!({"FileChanged":[{
+                "matcher":"nested/**/settings.toml",
+                "hooks":[{"type":"command","command":"true"}]
+            }]}))
+            .unwrap();
+        assert_eq!(
+            scoped.file_watch_patterns().unwrap(),
+            vec![
+                ".env".to_owned(),
+                "config/*.json".to_owned(),
+                "nested/**/settings.toml".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_watch_paths_parse_deduplicate_and_reject_invalid_shapes() {
+        let mut outcome = HookOutcome::default();
+        merge_hook_response(
+            "SessionStart",
+            json!({
+                "watchPaths":["/tmp/one"],
+                "hookSpecificOutput":{"watchPaths":["/tmp/two", "/tmp/one"]}
+            }),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.watch_paths,
+            vec!["/tmp/one".to_owned(), "/tmp/two".to_owned()]
+        );
+
+        for invalid in [
+            json!({"watchPaths":"/tmp/not-an-array"}),
+            json!({"watchPaths":[1]}),
+            json!({"watchPaths":[""]}),
+            json!({"watchPaths":["x".repeat(MAX_HOOK_WATCH_PATH_BYTES + 1)]}),
+        ] {
+            assert!(
+                merge_hook_response("FileChanged", invalid, &mut HookOutcome::default()).is_err()
+            );
+        }
     }
 
     #[test]

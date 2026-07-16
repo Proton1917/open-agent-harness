@@ -17,20 +17,24 @@ mod workflow;
 mod write;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock, RwLock, Weak,
+        Arc, Mutex as StdMutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use globset::Glob;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{process::Child, sync::Mutex};
+use walkdir::WalkDir;
 
 use crate::agents::{
     AgentLimits, AgentRuntime, AgentToolPolicy,
@@ -163,6 +167,65 @@ const MAX_BACKGROUND_NOTIFICATION_BYTES: usize = 8 * 1024;
 const MAX_BACKGROUND_NOTIFICATION_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_CONTEXT_CHANGE_ENTRIES: usize = 256;
 const MAX_WORKSPACE_CONTEXT_CHANGED_PATHS: usize = 64;
+const MAX_EXTERNAL_WATCH_SPECS: usize = 512;
+const MAX_EXTERNAL_WATCH_ENTRIES: usize = 8 * 1024;
+const MAX_EXTERNAL_WATCH_DEPTH: usize = 32;
+const MAX_EXTERNAL_WATCH_EVENTS: usize = 256;
+const MAX_EXTERNAL_WATCH_PATH_BYTES: usize = 16 * 1024;
+const MAX_EXTERNAL_WATCH_PATH_TOTAL_BYTES: usize = 256 * 1024;
+const MAX_EXTERNAL_WATCH_DYNAMIC_PATHS: usize = 128;
+const MAX_EXTERNAL_WATCH_HASH_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_EXTERNAL_WATCH_HASH_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_EXTERNAL_WATCH_CONTEXTS: usize = 64;
+const MAX_EXTERNAL_WATCH_CONTEXT_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ExternalWatchSpec {
+    Exact(PathBuf),
+    Tree(PathBuf),
+    Glob { root: PathBuf, pattern: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalWatchFingerprint {
+    kind: u8,
+    length: u64,
+    modified_ns: Option<u128>,
+    digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalWatchEventKind {
+    Add,
+    Change,
+    Unlink,
+}
+
+impl ExternalWatchEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Change => "change",
+            Self::Unlink => "unlink",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalWatchEvent {
+    path: PathBuf,
+    kind: ExternalWatchEventKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExternalFileWatchState {
+    initialized: bool,
+    specs: Vec<ExternalWatchSpec>,
+    entries: BTreeMap<PathBuf, ExternalWatchFingerprint>,
+    dynamic_paths: Vec<String>,
+    dynamic_generation: u64,
+    acknowledged: BTreeMap<PathBuf, Option<ExternalWatchFingerprint>>,
+}
 
 #[derive(Debug)]
 pub struct BackgroundTask {
@@ -294,6 +357,7 @@ pub struct ToolContext {
     workspace_context_changes: Arc<WorkspaceContextChanges>,
     workspace_context_parent_changes: Option<Arc<WorkspaceContextChanges>>,
     workspace_context_seen_generation: Arc<AtomicU64>,
+    external_file_watch: Arc<StdMutex<ExternalFileWatchState>>,
     interaction_handler: Arc<RwLock<Option<UserInteractionHandler>>>,
     sandbox_runtime: Arc<RwLock<SandboxRuntime>>,
     file_history: Arc<RwLock<Option<FileHistory>>>,
@@ -511,6 +575,7 @@ impl ToolContext {
             workspace_context_changes: Arc::new(WorkspaceContextChanges::default()),
             workspace_context_parent_changes: None,
             workspace_context_seen_generation: Arc::new(AtomicU64::new(0)),
+            external_file_watch: Arc::new(StdMutex::new(ExternalFileWatchState::default())),
             interaction_handler: Arc::new(RwLock::new(None)),
             sandbox_runtime: Arc::new(RwLock::new(SandboxRuntime::default())),
             file_history: Arc::new(RwLock::new(None)),
@@ -2411,6 +2476,230 @@ impl ToolContext {
         Arc::clone(&self.hooks)
     }
 
+    /// Replaces the dynamic FileChanged watch list returned by a trusted hook.
+    /// Static FileChanged matchers remain active and are resolved against the
+    /// current cwd on every poll, matching the source watcher's restart model.
+    #[doc(hidden)]
+    pub fn replace_hook_watch_paths(&self, paths: &[String]) -> Result<()> {
+        let paths = validate_external_dynamic_watch_paths(paths)?;
+        let mut state = self
+            .external_file_watch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.dynamic_paths != paths {
+            state.dynamic_paths = paths;
+            state.dynamic_generation = state.dynamic_generation.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Polls the bounded external watch set at a model-request boundary. The
+    /// first scan and every changed watch set are baselines (`ignoreInitial`);
+    /// later scans produce add/change/unlink events without a resident thread.
+    pub(crate) async fn poll_external_file_changes(&self) -> Result<Vec<String>> {
+        if self.bare {
+            return Ok(Vec::new());
+        }
+        let (dynamic_paths, dynamic_generation) = {
+            let state = self
+                .external_file_watch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.dynamic_paths.clone(), state.dynamic_generation)
+        };
+        let (specs, hook_specs) = self.external_watch_specs(&dynamic_paths)?;
+        let scan_specs = specs.clone();
+        let entries = tokio::task::spawn_blocking(move || scan_external_watch_specs(&scan_specs))
+            .await
+            .context("external file watcher worker 失败")??;
+        let events = {
+            let mut state = self
+                .external_file_watch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.dynamic_generation != dynamic_generation {
+                return Ok(Vec::new());
+            }
+            reconcile_external_watch_state(&mut state, specs, entries)?
+        };
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cwd = self.cwd();
+        let mut contexts = Vec::new();
+        let mut context_bytes = 0usize;
+        let mut changed_paths = Vec::with_capacity(events.len());
+        for event in events {
+            let display = self.display_path(&event.path);
+            let event_name = event.kind.as_str();
+            changed_paths.push(event.path.clone());
+            if !external_watch_specs_cover_path(&hook_specs, &event.path) {
+                continue;
+            }
+            match self
+                .hooks()
+                .run_file_changed(
+                    "external",
+                    &display,
+                    json!({
+                        "source":"watcher",
+                        "file_path":display,
+                        "event":event_name,
+                    }),
+                    &cwd,
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    for message in outcome.additional_context {
+                        push_bounded_external_watch_context(
+                            &mut contexts,
+                            &mut context_bytes,
+                            format!("{event_name} {display}: {message}"),
+                        );
+                    }
+                    if !outcome.watch_paths.is_empty() {
+                        if let Err(error) = self.replace_hook_watch_paths(&outcome.watch_paths) {
+                            push_bounded_external_watch_context(
+                                &mut contexts,
+                                &mut context_bytes,
+                                format!(
+                                    "FileChanged hook returned invalid watchPaths for {display}: {error:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(error) => push_bounded_external_watch_context(
+                    &mut contexts,
+                    &mut context_bytes,
+                    format!("FileChanged hook failed for {display}: {error:#}"),
+                ),
+            }
+        }
+        self.workspace_context_changes.publish(changed_paths);
+        Ok(contexts)
+    }
+
+    async fn acknowledge_external_file_changes(&self, paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() > MAX_EXTERNAL_WATCH_EVENTS {
+            bail!("acknowledged file changes 超过 {MAX_EXTERNAL_WATCH_EVENTS} 项限制")
+        }
+        let paths = paths.to_vec();
+        let acknowledged = tokio::task::spawn_blocking(move || {
+            let mut remaining_hash_bytes = MAX_EXTERNAL_WATCH_HASH_TOTAL_BYTES;
+            let mut acknowledged = BTreeMap::new();
+            for path in paths {
+                let mut identities = vec![normalize_lexical_path(&path)];
+                if let Ok(canonical) = canonicalize_for_scope(&path) {
+                    if !identities.contains(&canonical) {
+                        identities.push(canonical);
+                    }
+                }
+                for identity in identities {
+                    let fingerprint =
+                        external_watch_fingerprint(&identity, &mut remaining_hash_bytes)?;
+                    acknowledged.insert(identity, fingerprint);
+                }
+            }
+            Ok::<_, anyhow::Error>(acknowledged)
+        })
+        .await
+        .context("file watcher acknowledgement worker 失败")??;
+        let mut state = self
+            .external_file_watch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (path, fingerprint) in acknowledged {
+            state.acknowledged.insert(path, fingerprint);
+        }
+        while state.acknowledged.len() > MAX_EXTERNAL_WATCH_EVENTS.saturating_mul(2) {
+            let Some(path) = state.acknowledged.keys().next().cloned() else {
+                break;
+            };
+            state.acknowledged.remove(&path);
+        }
+        Ok(())
+    }
+
+    fn external_watch_specs(
+        &self,
+        dynamic_paths: &[String],
+    ) -> Result<(Vec<ExternalWatchSpec>, Vec<ExternalWatchSpec>)> {
+        let mut hook_specs = BTreeSet::new();
+        let cwd = self.cwd();
+
+        for pattern in self.hooks().file_watch_patterns()? {
+            hook_specs.insert(external_watch_spec_from_pattern(&pattern, &cwd, false)?);
+        }
+        for path in dynamic_paths {
+            hook_specs.insert(external_watch_spec_from_pattern(path, &cwd, true)?);
+        }
+        let mut specs = hook_specs.clone();
+
+        if let Some(home) = dirs::home_dir() {
+            specs.insert(ExternalWatchSpec::Exact(
+                home.join(".open-agent-harness/AGENTS.md"),
+            ));
+            specs.insert(ExternalWatchSpec::Tree(
+                home.join(".open-agent-harness/skills"),
+            ));
+        }
+        for scope in [self.workspace_context_launch_cwd.clone(), cwd.clone()] {
+            for directory in scope.ancestors() {
+                specs.insert(ExternalWatchSpec::Exact(directory.join("AGENTS.md")));
+                specs.insert(ExternalWatchSpec::Tree(
+                    directory.join(".open-agent-harness/skills"),
+                ));
+            }
+        }
+        for root in self.trusted_roots() {
+            specs.insert(ExternalWatchSpec::Exact(root.join("AGENTS.md")));
+            specs.insert(ExternalWatchSpec::Tree(
+                root.join(".open-agent-harness/skills"),
+            ));
+        }
+        for path in self
+            .current_instruction_paths
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            specs.insert(ExternalWatchSpec::Exact(path.clone()));
+        }
+        for path in self
+            .nested_instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+        {
+            specs.insert(ExternalWatchSpec::Exact(path.clone()));
+        }
+        for (_, skill) in self
+            .skills
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            if let Some(root) = skill.path.parent().and_then(Path::parent) {
+                specs.insert(ExternalWatchSpec::Tree(root.to_path_buf()));
+            } else {
+                specs.insert(ExternalWatchSpec::Exact(skill.path.clone()));
+            }
+        }
+        if specs.len() > MAX_EXTERNAL_WATCH_SPECS {
+            bail!("external watch spec 超过 {MAX_EXTERNAL_WATCH_SPECS} 项限制")
+        }
+        Ok((
+            specs.into_iter().collect(),
+            hook_specs.into_iter().collect(),
+        ))
+    }
+
     pub(crate) fn agent_limits(&self) -> AgentLimits {
         self.agent_limits
     }
@@ -2542,6 +2831,12 @@ impl ToolContext {
             workspace_context_changes: Arc::new(WorkspaceContextChanges::default()),
             workspace_context_parent_changes: Some(Arc::clone(&self.workspace_context_changes)),
             workspace_context_seen_generation: Arc::new(AtomicU64::new(0)),
+            external_file_watch: Arc::new(StdMutex::new(
+                self.external_file_watch
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
             interaction_handler: Arc::clone(&self.interaction_handler),
             sandbox_runtime: Arc::clone(&self.sandbox_runtime),
             file_history: Arc::new(RwLock::new(
@@ -2782,7 +3077,7 @@ impl ToolContext {
             self.reload_workspace_context().await?;
             return Err(error).context("shell cwd 上下文刷新失败，已恢复原 cwd");
         }
-        if let Err(error) = self
+        let cwd_outcome = match self
             .hooks()
             .run(
                 "CwdChanged",
@@ -2796,15 +3091,24 @@ impl ToolContext {
             )
             .await
         {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.switch_workspace(previous_cwd, previous_root).await?;
+                self.reload_workspace_context().await?;
+                return Err(error).context("CwdChanged hook 拒绝 shell cwd 更新，已恢复原 cwd");
+            }
+        };
+        if let Err(error) = validate_external_dynamic_watch_paths(&cwd_outcome.watch_paths) {
             self.switch_workspace(previous_cwd, previous_root).await?;
             self.reload_workspace_context().await?;
-            return Err(error).context("CwdChanged hook 拒绝 shell cwd 更新，已恢复原 cwd");
+            return Err(error).context("CwdChanged hook watchPaths 无效，已恢复原 cwd");
         }
         if let Err(error) = self.record_current_cwd_transition() {
             self.switch_workspace(previous_cwd, previous_root).await?;
             self.reload_workspace_context().await?;
             return Err(error).context("shell cwd 持久化失败，已恢复原 cwd");
         }
+        self.replace_hook_watch_paths(&cwd_outcome.watch_paths)?;
         Ok(true)
     }
 
@@ -4134,6 +4438,7 @@ impl ToolRegistry {
         let mut hot_refresh_candidate = None;
         let mut relevant_context_mutation = false;
         let mut service_changed_paths = Vec::new();
+        let mut pending_hook_watch_paths = None;
         if inspect_context_change {
             let paths = tool
                 .path_fields()
@@ -4173,11 +4478,30 @@ impl ToolRegistry {
                             )
                             .await
                         {
-                            Ok(outcome) if !outcome.additional_context.is_empty() => {
-                                output.append_context(
-                                    "FileChanged hook context",
-                                    &outcome.additional_context.join("\n"),
-                                );
+                            Ok(outcome) => {
+                                if !outcome.additional_context.is_empty() {
+                                    output.append_context(
+                                        "FileChanged hook context",
+                                        &outcome.additional_context.join("\n"),
+                                    );
+                                }
+                                if !outcome.watch_paths.is_empty() {
+                                    match validate_external_dynamic_watch_paths(
+                                        &outcome.watch_paths,
+                                    ) {
+                                        Ok(_) => {
+                                            pending_hook_watch_paths = Some(outcome.watch_paths);
+                                        }
+                                        Err(error) => {
+                                            output.is_error = true;
+                                            output.append_context(
+                                                "FileChanged hook failed",
+                                                &format!("hook watchPaths 无效: {error:#}"),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             Err(error) => {
                                 output.is_error = true;
@@ -4187,7 +4511,6 @@ impl ToolRegistry {
                                 );
                                 break;
                             }
-                            _ => {}
                         }
                     }
                     let changed_paths = paths.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
@@ -4249,6 +4572,17 @@ impl ToolRegistry {
             output.rollback_turn = true;
         }
         if !output.is_error {
+            if let Some(paths) = pending_hook_watch_paths {
+                if let Err(error) = context.replace_hook_watch_paths(&paths) {
+                    output.is_error = true;
+                    output.append_context(
+                        "FileChanged watch registration failed",
+                        &format!("{error:#}"),
+                    );
+                }
+            }
+        }
+        if !output.is_error {
             if let Some(candidate) = hot_refresh_candidate {
                 context.commit_workspace_hot_refresh(candidate);
             }
@@ -4276,6 +4610,15 @@ impl ToolRegistry {
                             format!("{error:#}"),
                         ),
                     }
+                }
+                if let Err(error) = context
+                    .acknowledge_external_file_changes(&service_changed_paths)
+                    .await
+                {
+                    output.append_context(
+                        "FileChanged watcher acknowledgement failed",
+                        &format!("{error:#}"),
+                    );
                 }
             }
         }
@@ -5032,6 +5375,434 @@ fn push_permission_path_candidate(candidates: &mut Vec<String>, path: &Path) {
     if !candidates.contains(&rendered) {
         candidates.push(rendered);
     }
+}
+
+fn validate_external_dynamic_watch_paths(paths: &[String]) -> Result<Vec<String>> {
+    if paths.len() > MAX_EXTERNAL_WATCH_DYNAMIC_PATHS {
+        bail!("hook watchPaths 超过 {MAX_EXTERNAL_WATCH_DYNAMIC_PATHS} 项限制")
+    }
+    let mut total_bytes = 0usize;
+    let mut normalized = Vec::new();
+    for path in paths {
+        if path.is_empty() || path.len() > MAX_EXTERNAL_WATCH_PATH_BYTES || path.contains('\0') {
+            bail!("hook watchPath 为空、过长或包含 NUL")
+        }
+        total_bytes = total_bytes
+            .checked_add(path.len())
+            .context("hook watchPaths 总长度溢出")?;
+        if total_bytes > MAX_EXTERNAL_WATCH_PATH_TOTAL_BYTES {
+            bail!("hook watchPaths 总长度超过 {MAX_EXTERNAL_WATCH_PATH_TOTAL_BYTES} 字节限制")
+        }
+        if !Path::new(path).is_absolute() {
+            bail!("hook watchPath 必须是绝对路径: {path}")
+        }
+        reject_windows_network_or_device_path(path)?;
+        if !normalized.contains(path) {
+            normalized.push(path.clone());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn external_watch_spec_from_pattern(
+    pattern: &str,
+    cwd: &Path,
+    require_absolute: bool,
+) -> Result<ExternalWatchSpec> {
+    if pattern.is_empty() || pattern.len() > MAX_EXTERNAL_WATCH_PATH_BYTES || pattern.contains('\0')
+    {
+        bail!("external watch pattern 为空、过长或包含 NUL")
+    }
+    if require_absolute && !Path::new(pattern).is_absolute() {
+        bail!("hook watchPath 必须是绝对路径: {pattern}")
+    }
+    reject_windows_network_or_device_path(pattern)?;
+    let joined = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        cwd.join(pattern)
+    };
+    let joined = normalize_lexical_path(&joined);
+    reject_windows_network_or_device_resolved_path(&joined)?;
+    if !external_pattern_has_glob(pattern) {
+        return Ok(ExternalWatchSpec::Exact(joined));
+    }
+
+    let rendered = normalize_path_for_display(joined.to_string_lossy().into_owned());
+    Glob::new(&rendered).with_context(|| format!("无效 external watch glob: {pattern}"))?;
+    let mut root = PathBuf::new();
+    for component in joined.components() {
+        if external_pattern_has_glob(&component.as_os_str().to_string_lossy()) {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    if root.as_os_str().is_empty() {
+        root = cwd.to_path_buf();
+    }
+    Ok(ExternalWatchSpec::Glob {
+        root,
+        pattern: rendered,
+    })
+}
+
+fn external_pattern_has_glob(value: &str) -> bool {
+    value.contains(['*', '?', '[', '{'])
+}
+
+fn scan_external_watch_specs(
+    specs: &[ExternalWatchSpec],
+) -> Result<BTreeMap<PathBuf, ExternalWatchFingerprint>> {
+    let mut entries = BTreeMap::new();
+    let mut visited_entries = 0usize;
+    let mut remaining_hash_bytes = MAX_EXTERNAL_WATCH_HASH_TOTAL_BYTES;
+    for spec in specs {
+        match spec {
+            ExternalWatchSpec::Exact(path) => scan_external_watch_path(
+                path,
+                None,
+                &mut entries,
+                &mut visited_entries,
+                &mut remaining_hash_bytes,
+            )?,
+            ExternalWatchSpec::Tree(path) => scan_external_watch_tree(
+                path,
+                None,
+                &mut entries,
+                &mut visited_entries,
+                &mut remaining_hash_bytes,
+            )?,
+            ExternalWatchSpec::Glob { root, pattern } => {
+                let matcher = Glob::new(pattern)
+                    .with_context(|| format!("无效 external watch glob: {pattern}"))?
+                    .compile_matcher();
+                scan_external_watch_tree(
+                    root,
+                    Some(&matcher),
+                    &mut entries,
+                    &mut visited_entries,
+                    &mut remaining_hash_bytes,
+                )?;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn external_watch_specs_cover_path(specs: &[ExternalWatchSpec], path: &Path) -> bool {
+    specs.iter().any(|spec| match spec {
+        ExternalWatchSpec::Exact(watched) | ExternalWatchSpec::Tree(watched) => {
+            path.starts_with(watched)
+        }
+        ExternalWatchSpec::Glob { pattern, .. } => Glob::new(pattern)
+            .ok()
+            .is_some_and(|glob| external_watch_matcher_matches(&glob.compile_matcher(), path)),
+    })
+}
+
+fn scan_external_watch_path(
+    path: &Path,
+    matcher: Option<&globset::GlobMatcher>,
+    entries: &mut BTreeMap<PathBuf, ExternalWatchFingerprint>,
+    visited_entries: &mut usize,
+    remaining_hash_bytes: &mut u64,
+) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法检查 external watch path {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return scan_external_watch_tree(
+            path,
+            matcher,
+            entries,
+            visited_entries,
+            remaining_hash_bytes,
+        );
+    }
+    *visited_entries = visited_entries.saturating_add(1);
+    if *visited_entries > MAX_EXTERNAL_WATCH_ENTRIES {
+        bail!("external watch 扫描超过 {MAX_EXTERNAL_WATCH_ENTRIES} 个 entry 限制")
+    }
+    if matcher.is_none_or(|matcher| external_watch_matcher_matches(matcher, path)) {
+        if let Some(fingerprint) = external_watch_fingerprint(path, remaining_hash_bytes)? {
+            entries.insert(path.to_path_buf(), fingerprint);
+        }
+    }
+    Ok(())
+}
+
+fn scan_external_watch_tree(
+    root: &Path,
+    matcher: Option<&globset::GlobMatcher>,
+    entries: &mut BTreeMap<PathBuf, ExternalWatchFingerprint>,
+    visited_entries: &mut usize,
+    remaining_hash_bytes: &mut u64,
+) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法检查 external watch root {}", root.display()));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return scan_external_watch_path(
+            root,
+            matcher,
+            entries,
+            visited_entries,
+            remaining_hash_bytes,
+        );
+    }
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(MAX_EXTERNAL_WATCH_DEPTH)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error.io_error().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    )
+                }) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("external watch 遍历失败: {}", root.display()));
+            }
+        };
+        *visited_entries = visited_entries.saturating_add(1);
+        if *visited_entries > MAX_EXTERNAL_WATCH_ENTRIES {
+            bail!("external watch 扫描超过 {MAX_EXTERNAL_WATCH_ENTRIES} 个 entry 限制")
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if matcher.is_some_and(|matcher| !external_watch_matcher_matches(matcher, path)) {
+            continue;
+        }
+        if let Some(fingerprint) = external_watch_fingerprint(path, remaining_hash_bytes)? {
+            entries.insert(path.to_path_buf(), fingerprint);
+        }
+    }
+    Ok(())
+}
+
+fn external_watch_matcher_matches(matcher: &globset::GlobMatcher, path: &Path) -> bool {
+    let rendered = normalize_path_for_display(path.to_string_lossy().into_owned());
+    matcher.is_match(rendered)
+}
+
+fn external_watch_fingerprint(
+    path: &Path,
+    remaining_hash_bytes: &mut u64,
+) -> Result<Option<ExternalWatchFingerprint>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法 fingerprint watch path {}", path.display()));
+        }
+    };
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    if metadata.file_type().is_symlink() {
+        let digest = std::fs::read_link(path).ok().map(|target| {
+            let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
+            <[u8; 32]>::from(digest)
+        });
+        return Ok(Some(ExternalWatchFingerprint {
+            kind: 2,
+            length: metadata.len(),
+            modified_ns,
+            digest,
+        }));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let digest = hash_external_regular_file(path, &metadata, remaining_hash_bytes)?;
+    Ok(Some(ExternalWatchFingerprint {
+        kind: 1,
+        length: metadata.len(),
+        modified_ns,
+        digest,
+    }))
+}
+
+fn hash_external_regular_file(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    remaining_hash_bytes: &mut u64,
+) -> Result<Option<[u8; 32]>> {
+    let length = expected.len();
+    if length > MAX_EXTERNAL_WATCH_HASH_FILE_BYTES || length > *remaining_hash_bytes {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if external_watch_open_error_is_ignored(&error) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法读取 external watch file {}", path.display()));
+        }
+    };
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.len() != expected.len()
+        || opened.modified().ok() != expected.modified().ok()
+    {
+        return Ok(None);
+    }
+    *remaining_hash_bytes = remaining_hash_bytes.saturating_sub(length);
+    let mut bytes = Vec::with_capacity(length as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(length.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Ok(None);
+    }
+    let after = file.metadata()?;
+    if after.len() != opened.len() || after.modified().ok() != opened.modified().ok() {
+        return Ok(None);
+    }
+    Ok(Some(<[u8; 32]>::from(Sha256::digest(bytes))))
+}
+
+fn external_watch_open_error_is_ignored(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn reconcile_external_watch_state(
+    state: &mut ExternalFileWatchState,
+    specs: Vec<ExternalWatchSpec>,
+    entries: BTreeMap<PathBuf, ExternalWatchFingerprint>,
+) -> Result<Vec<ExternalWatchEvent>> {
+    if !state.initialized || state.specs != specs {
+        state.initialized = true;
+        state.specs = specs;
+        state.entries = entries;
+        state.acknowledged.clear();
+        return Ok(Vec::new());
+    }
+    let acknowledged = std::mem::take(&mut state.acknowledged);
+    let mut paths = state
+        .entries
+        .keys()
+        .chain(entries.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut events = Vec::new();
+    for path in std::mem::take(&mut paths) {
+        let previous = state.entries.get(&path);
+        let current = entries.get(&path);
+        if previous == current {
+            continue;
+        }
+        if acknowledged
+            .get(&path)
+            .is_some_and(|expected| expected.as_ref() == current)
+        {
+            continue;
+        }
+        let kind = match (previous, current) {
+            (None, Some(_)) => ExternalWatchEventKind::Add,
+            (Some(_), None) => ExternalWatchEventKind::Unlink,
+            (Some(_), Some(_)) => ExternalWatchEventKind::Change,
+            (None, None) => continue,
+        };
+        events.push(ExternalWatchEvent { path, kind });
+    }
+    state.entries = entries;
+    if events.len() > MAX_EXTERNAL_WATCH_EVENTS {
+        bail!("external watch 单次变化超过 {MAX_EXTERNAL_WATCH_EVENTS} 项限制")
+    }
+    Ok(events)
+}
+
+fn push_bounded_external_watch_context(
+    contexts: &mut Vec<String>,
+    bytes: &mut usize,
+    mut message: String,
+) {
+    if contexts.len() >= MAX_EXTERNAL_WATCH_CONTEXTS || *bytes >= MAX_EXTERNAL_WATCH_CONTEXT_BYTES {
+        return;
+    }
+    let remaining = MAX_EXTERNAL_WATCH_CONTEXT_BYTES.saturating_sub(*bytes);
+    if message.len() > remaining {
+        let mut end = remaining;
+        while !message.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        message.truncate(end);
+    }
+    *bytes = bytes.saturating_add(message.len());
+    contexts.push(message);
 }
 
 pub(crate) fn reject_windows_network_or_device_path(value: &str) -> Result<()> {
@@ -6219,6 +6990,302 @@ mod tests {
                 .workspace_system_context()
                 .contains("skill-to-delete")
         );
+    }
+
+    #[tokio::test]
+    async fn external_watcher_add_change_unlink_refreshes_workspace_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        let duplicate = context.poll_external_file_changes().await.unwrap();
+        assert!(duplicate.is_empty(), "duplicate contexts: {duplicate:?}");
+        let baseline = context.workspace_context_changes.generation();
+
+        std::fs::write(&agents, "alpha-rule").unwrap();
+        assert!(
+            context
+                .poll_external_file_changes()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(context.workspace_context_changes.generation(), baseline + 1);
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(context.workspace_system_context().contains("alpha-rule"));
+
+        std::fs::write(&agents, "bravo-rule").unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(context.workspace_system_context().contains("bravo-rule"));
+        assert!(!context.workspace_system_context().contains("alpha-rule"));
+
+        std::fs::remove_file(&agents).unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(!context.workspace_system_context().contains("bravo-rule"));
+    }
+
+    #[tokio::test]
+    async fn external_skill_changes_reload_the_catalog_before_the_next_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join(".open-agent-harness/skills/live/SKILL.md");
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.reload_workspace_context().await.unwrap();
+        context.poll_external_file_changes().await.unwrap();
+
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: live\ndescription: before\n---\nworkflow-before",
+        )
+        .unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert_eq!(context.skill("live").unwrap().description, "before");
+
+        std::fs::write(
+            &skill,
+            "---\nname: live\ndescription: after\n---\nworkflow-after-",
+        )
+        .unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert_eq!(context.skill("live").unwrap().description, "after");
+
+        std::fs::remove_file(&skill).unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(context.skill("live").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_watcher_runs_file_changed_hook_once_per_observed_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("watched.txt");
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"FileChanged":[{
+                    "matcher":"watched.txt",
+                    "hooks":[{"type":"command","command":"printf '%s' '{\"additionalContext\":\"external-change-observed\"}'"}]
+                }]}}),
+            })
+            .unwrap(),
+        ));
+        context.poll_external_file_changes().await.unwrap();
+
+        std::fs::write(&watched, "first").unwrap();
+        let contexts = context.poll_external_file_changes().await.unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].contains("external-change-observed"));
+        let duplicate = context.poll_external_file_changes().await.unwrap();
+        assert!(duplicate.is_empty(), "duplicate contexts: {duplicate:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automatic_context_watch_does_not_widen_file_changed_matcher_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"FileChanged":[{
+                    "matcher":"*",
+                    "hooks":[{"type":"command","command":"printf '%s' '{\"additionalContext\":\"unexpected-auto-hook\"}'"}]
+                }]}}),
+            })
+            .unwrap(),
+        ));
+        context
+            .add_trusted_roots(&[additional.path().to_path_buf()])
+            .unwrap();
+        context.reload_workspace_context().await.unwrap();
+        context.poll_external_file_changes().await.unwrap();
+
+        std::fs::write(additional.path().join("AGENTS.md"), "new-context-rule").unwrap();
+        let contexts = context.poll_external_file_changes().await.unwrap();
+        assert!(
+            contexts.is_empty(),
+            "automatic watch leaked into hook: {contexts:?}"
+        );
+        assert!(context.refresh_workspace_context_if_stale().await.unwrap());
+        assert!(
+            context
+                .workspace_system_context()
+                .contains("new-context-rule")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_tool_commit_is_acknowledged_without_a_second_watcher_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("watched.txt");
+        let mut context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context.set_hooks(Arc::new(
+            crate::hooks::HookRunner::from_settings(&crate::config::Settings {
+                raw: json!({"hooks":{"FileChanged":[{
+                    "matcher":"watched.txt",
+                    "hooks":[{"type":"command","command":"printf '%s' '{\"additionalContext\":\"single-file-change-hook\"}'"}]
+                }]}}),
+            })
+            .unwrap(),
+        ));
+        context.poll_external_file_changes().await.unwrap();
+
+        let output = ToolRegistry::default()
+            .execute(
+                &context,
+                "Write",
+                json!({"file_path":&watched, "content":"created-by-tool"}),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("single-file-change-hook"));
+        let duplicate = context.poll_external_file_changes().await.unwrap();
+        assert!(duplicate.is_empty(), "duplicate contexts: {duplicate:?}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_watch_paths_rebaseline_and_tool_acknowledgement_suppresses_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("dynamic.env");
+        std::fs::write(&watched, "before").unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert!(
+            context
+                .replace_hook_watch_paths(&["relative.env".to_owned()])
+                .is_err()
+        );
+        context
+            .replace_hook_watch_paths(&[watched.display().to_string()])
+            .unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        let baseline = context.workspace_context_changes.generation();
+
+        std::fs::write(&watched, "direct").unwrap();
+        context
+            .acknowledge_external_file_changes(std::slice::from_ref(&watched))
+            .await
+            .unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert_eq!(context.workspace_context_changes.generation(), baseline);
+
+        std::fs::write(&watched, "extern").unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert_eq!(context.workspace_context_changes.generation(), baseline + 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_watcher_never_follows_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("watched-link");
+        let target = temp.path().join("target.txt");
+        std::fs::write(&target, "before").unwrap();
+        symlink(&target, &watched).unwrap();
+        let context = ToolContext::new(
+            temp.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        context
+            .replace_hook_watch_paths(&[watched.display().to_string()])
+            .unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        let baseline = context.workspace_context_changes.generation();
+
+        std::fs::write(&target, "after-").unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert_eq!(context.workspace_context_changes.generation(), baseline);
+
+        let second = temp.path().join("second.txt");
+        std::fs::write(&second, "second").unwrap();
+        std::fs::remove_file(&watched).unwrap();
+        symlink(&second, &watched).unwrap();
+        context.poll_external_file_changes().await.unwrap();
+        assert_eq!(context.workspace_context_changes.generation(), baseline + 1);
+    }
+
+    #[test]
+    fn external_watcher_event_fanout_is_bounded() {
+        let specs = vec![ExternalWatchSpec::Exact(PathBuf::from("/tmp/watched"))];
+        let mut state = ExternalFileWatchState {
+            initialized: true,
+            specs: specs.clone(),
+            ..ExternalFileWatchState::default()
+        };
+        let entries = (0..=MAX_EXTERNAL_WATCH_EVENTS)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/tmp/watched/{index}")),
+                    ExternalWatchFingerprint {
+                        kind: 1,
+                        length: 1,
+                        modified_ns: Some(index as u128),
+                        digest: None,
+                    },
+                )
+            })
+            .collect();
+        assert!(reconcile_external_watch_state(&mut state, specs, entries).is_err());
     }
 
     #[cfg(unix)]

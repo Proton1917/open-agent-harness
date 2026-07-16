@@ -147,6 +147,96 @@ async fn query_engine_round_trips_tool_use_and_result() {
 }
 
 #[tokio::test]
+async fn external_instruction_change_is_loaded_before_the_next_model_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let response = text_stream();
+            let (mut stream, _) = listener.accept().unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&read_http_body(&mut stream)).unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+    });
+
+    let temp = tempdir().unwrap();
+    let agents = temp.path().join("AGENTS.md");
+    std::fs::write(&agents, "external-context-before").unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    context.reload_workspace_context().await.unwrap();
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            system: "system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+
+    engine.run_turn("first".into()).await.unwrap();
+    std::fs::write(&agents, "external-context-after-").unwrap();
+    engine.run_turn("second".into()).await.unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]["system"]
+            .as_str()
+            .unwrap()
+            .contains("external-context-before")
+    );
+    assert!(
+        requests[1]["system"]
+            .as_str()
+            .unwrap()
+            .contains("external-context-after-")
+    );
+    assert!(
+        !requests[1]["system"]
+            .as_str()
+            .unwrap()
+            .contains("external-context-before")
+    );
+}
+
+#[tokio::test]
 async fn prompt_suggestion_is_tool_free_and_does_not_mutate_transcript() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
