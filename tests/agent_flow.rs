@@ -13,7 +13,7 @@ use open_agent_harness::{
     permissions::{PermissionManager, PermissionMode},
     protocol::ApiFormat,
     query::{QueryEngine, QueryOptions},
-    tools::{ToolContext, ToolRegistry},
+    tools::{TaskUiItemKind, TaskUiStatus, ToolContext, ToolRegistry},
 };
 use serde_json::Value;
 use serde_json::json;
@@ -193,6 +193,24 @@ async fn background_agent_is_available_through_task_output_alias() {
         .lines()
         .find_map(|line| line.strip_prefix("agent_id="))
         .unwrap();
+    let snapshot = tools_context.task_ui_snapshot().await.unwrap();
+    let agent_item = snapshot
+        .items
+        .iter()
+        .find(|item| item.id == agent_id)
+        .expect("background agent must be visible in the task UI snapshot");
+    assert_eq!(agent_item.kind, TaskUiItemKind::AgentTask);
+    assert_eq!(agent_item.title, "background test");
+    assert!(matches!(
+        agent_item.status,
+        TaskUiStatus::InProgress | TaskUiStatus::Completed
+    ));
+    assert!(
+        agent_item
+            .detail
+            .as_ref()
+            .is_some_and(|detail| !detail.is_empty())
+    );
     let output = registry
         .execute(
             &tools_context,

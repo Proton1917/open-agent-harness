@@ -125,6 +125,42 @@ command	upgrade	excluded	-	-	Vendor distribution updater is outside the open run
 command	usage	equivalent	src/main.rs;src/types.rs	src/main.rs;src/types.rs	Cost, context, and stats expose local token/activity data without hosted billing.
 command	vim	implemented	src/main.rs;src/vim.rs	src/vim.rs;tests/vim_interactions_pty.rs	Live standard/Vim editor mode transition.
 command	voice	excluded	-	-	Voice capture, account speech services, and microphone authority are outside scope.
+service	AgentSummary	equivalent	src/agents.rs;src/tools/work_items.rs	src/agents.rs;tests/agent_flow.rs	Bounded exact subagent query/tool/retry events drive live task progress without periodic extra model calls.
+service	MagicDocs	excluded	-	-	Internal-only documentation workflow gated to vendor employee identity.
+service	PromptSuggestion	implemented	src/query.rs;src/main.rs;src/terminal.rs;src/ui_settings.rs	tests/query_loop.rs;tests/terminal_pty.rs	Explicit tool-free print and interactive suggestions with cancellation and stale-generation rejection.
+service	SessionMemory	equivalent	src/auto_memory.rs	src/auto_memory.rs	Private bounded workspace memory provides indexed cross-session context instead of vendor session-memory files.
+service	analytics	excluded	-	-	Telemetry and remote experimentation are outside scope.
+service	api	equivalent	src/api.rs;src/protocol.rs	tests/protocol_compat.rs;tests/protocol_fail_closed.rs	Provider-neutral Messages, Chat Completions, and Responses adapters replace the vendor client.
+service	autoDream	equivalent	src/auto_memory.rs;src/config.rs	src/auto_memory.rs	Explicit local consolidation uses five unique sessions, a 24-hour gate, bounded tool operations, stale-state rejection, and atomic private writes.
+service	awaySummary	excluded	-	-	The source behavior is a build-gated and remote-default-off experimental focus card, not an active external CLI surface.
+service	claudeAiLimits	excluded	-	-	Vendor subscription, overage, billing, and hosted quota state are outside scope.
+service	claudeAiLimitsHook	excluded	-	-	React hook for vendor account limits has no provider-neutral runtime state.
+service	compact	implemented	src/compact.rs	src/compact.rs;tests/compact_flow.rs	Bounded manual, automatic, and provider-size-rejection compaction.
+service	diagnosticTracking	equivalent	src/lsp.rs	src/lsp.rs	Versioned workspace-confined LSP diagnostics replace IDE-specific RPC tracking.
+service	extractMemories	implemented	src/auto_memory.rs	src/auto_memory.rs;tests/cli_output.rs	Opt-in bounded tool-constrained extraction rejects secrets and commits atomically.
+service	internalLogging	excluded	-	-	Employee Kubernetes/container telemetry is outside scope.
+service	lsp	implemented	src/lsp.rs	src/lsp.rs	Configured LSP lifecycle, synchronization, diagnostics, bounds, and process cleanup.
+service	mcp	implemented	src/mcp.rs	src/mcp.rs	Bounded stdio, HTTP/SSE, WebSocket, OAuth, discovery, tools, resources, prompts, and elicitation.
+service	mcpServerApproval	equivalent	src/mcp.rs;src/config.rs;src/main.rs	src/mcp.rs;src/config.rs	Project settings cannot introduce executable MCP servers; trusted definitions remain explicitly enableable and reconnectable.
+service	mockRateLimits	excluded	-	-	Internal vendor billing-limit test fixture service is outside runtime scope.
+service	notifier	equivalent	src/terminal_notifications.rs	src/terminal_notifications.rs;tests/terminal_pty.rs	Typed sanitized terminal notifications replace account and desktop notification channels.
+service	oauth	excluded	-	-	This source directory implements vendor account login; open MCP OAuth is covered by the mcp service.
+service	plugins	implemented	src/plugins.rs;src/plugin_manager.rs	src/plugins.rs;tests/plugin_lifecycle.rs	Trusted manifest contributions and transactional local lifecycle with private authenticated state.
+service	policyLimits	excluded	-	-	Hosted organization policy and entitlement limits are outside scope.
+service	preventSleep	equivalent	src/sleep_inhibitor.rs	src/sleep_inhibitor.rs	macOS active-work prevention is self-expiring, wait-aware, restartable, and inert elsewhere.
+service	rateLimitMessages	excluded	-	-	Vendor subscription and overage wording has no provider-neutral meaning.
+service	rateLimitMocking	excluded	-	-	Internal vendor quota mock facade is test-only and outside scope.
+service	remoteManagedSettings	excluded	-	-	Hosted account-managed settings sync would violate local trusted-settings authority.
+service	settingsSync	excluded	-	-	Cloud account settings synchronization is outside the local harness.
+service	teamMemorySync	excluded	-	-	Hosted organization and repository memory synchronization requires vendor identity and remote services.
+service	tips	equivalent	src/main.rs;src/terminal.rs	src/main.rs;tests/terminal_pty.rs	Original contextual command, mode, completion, and recovery hints replace bundled usage-ranked product copy.
+service	tokenEstimation	equivalent	src/tokens.rs	src/tokens.rs	Local bounded rough estimation replaces provider-specific count-token endpoints.
+service	toolUseSummary	equivalent	src/query.rs;src/terminal.rs	src/query.rs;src/terminal.rs	Schema-aware exact bounded tool summaries drive terminal progress without a separate mobile model request.
+service	tools	implemented	src/tools/mod.rs	src/tools/mod.rs;tests/tool_parity.rs	Strict schema registration, permission ordering, execution, transactions, and bounded results.
+service	vcr	excluded	-	-	Vendor SDK fixture recording is test infrastructure rather than harness behavior.
+service	voice	excluded	-	-	Voice capture, account speech services, and microphone authority are outside scope.
+service	voiceKeyterms	excluded	-	-	Hosted speech keyterm extraction is outside scope.
+service	voiceStreamSTT	excluded	-	-	Hosted streaming speech-to-text and microphone authority are outside scope.
 native	audio-capture.node	excluded	-	-	Voice capture and microphone authority are outside scope.
 native	computer-use-input.node	excluded	-	-	Desktop input injection is outside the coding-harness authority boundary.
 native	computer-use-swift.node	excluded	-	-	Platform desktop automation and capture are outside scope.

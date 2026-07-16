@@ -35,6 +35,7 @@ pub struct ModelOption {
 pub struct AutoMemorySettings {
     pub enabled: bool,
     pub auto_extract: bool,
+    pub auto_consolidate: bool,
     pub path: Option<PathBuf>,
 }
 
@@ -335,10 +336,12 @@ impl Settings {
             return Ok(AutoMemorySettings::default());
         };
         let memory = memory.as_object().context("memory 必须是 object")?;
-        if let Some(key) = memory
-            .keys()
-            .find(|key| !matches!(key.as_str(), "enabled" | "autoExtract" | "path"))
-        {
+        if let Some(key) = memory.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "enabled" | "autoExtract" | "autoConsolidate" | "path"
+            )
+        }) {
             anyhow::bail!("memory 包含未知字段 {key}")
         }
         let enabled = memory
@@ -351,8 +354,17 @@ impl Settings {
             .map(|value| value.as_bool().context("memory.autoExtract 必须是 boolean"))
             .transpose()?
             .unwrap_or(false);
-        if auto_extract && !enabled {
-            anyhow::bail!("memory.autoExtract=true 要求 memory.enabled=true")
+        let auto_consolidate = memory
+            .get("autoConsolidate")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("memory.autoConsolidate 必须是 boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if (auto_extract || auto_consolidate) && !enabled {
+            anyhow::bail!("memory.autoExtract/autoConsolidate=true 要求 memory.enabled=true")
         }
         let path = memory
             .get("path")
@@ -370,6 +382,7 @@ impl Settings {
         Ok(AutoMemorySettings {
             enabled,
             auto_extract,
+            auto_consolidate,
             path,
         })
     }
@@ -807,7 +820,7 @@ mod tests {
         let settings = Settings {
             raw: serde_json::json!({
                 "plugins":{"directories":[&plugin_one, &plugin_two]},
-                "memory":{"enabled":true, "autoExtract":true, "path":"memory-root"},
+                "memory":{"enabled":true, "autoExtract":true, "autoConsolidate":true, "path":"memory-root"},
                 "outputStyle":"runtime:brief"
             }),
         };
@@ -821,6 +834,7 @@ mod tests {
             AutoMemorySettings {
                 enabled: true,
                 auto_extract: true,
+                auto_consolidate: true,
                 path: Some(PathBuf::from("memory-root"))
             }
         );
@@ -840,6 +854,10 @@ mod tests {
             raw: serde_json::json!({"memory":{"enabled":true,"autoExtract":"yes"}}),
         };
         assert!(invalid_extraction.auto_memory_settings().is_err());
+        let consolidation_without_memory = Settings {
+            raw: serde_json::json!({"memory":{"autoConsolidate":true}}),
+        };
+        assert!(consolidation_without_memory.auto_memory_settings().is_err());
         for raw in [
             serde_json::json!({"outputStyle":false}),
             serde_json::json!({"outputStyle":""}),

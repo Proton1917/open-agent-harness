@@ -2,15 +2,15 @@
 
 ## Purpose
 
-`MIGRATION_COVERAGE.tsv` is the machine-checked ledger for the complete tool
-and command directories in `reference/source-snapshot` and every native module
-in the separately checksummed backend archive. It prevents an added, removed,
-or renamed source tool/command/native module from disappearing behind a prose
-parity claim.
+`MIGRATION_COVERAGE.tsv` is the machine-checked ledger for the complete tool,
+command, and top-level service directories in `reference/source-snapshot` and
+every native module in the separately checksummed backend archive. It prevents
+an added, removed, or renamed source tool/command/service/native module from
+disappearing behind a prose parity claim.
 
 This is one coverage layer, not a declaration that the whole migration is
-finished. `--strict` means that this tool/command/native subset has no
-`pending` row. Service, hook, frontend, and utility-family closure remains
+finished. `--strict` means that this tool/command/service/native subset has no
+`pending` row. Hook, frontend, component, and utility-family closure remains
 governed by its own evidence and must be added to this ledger before
 project-wide completion can be claimed.
 
@@ -72,10 +72,23 @@ bounded to a short single line, replaceable, and generation-checked after
 cancellation. Enter sends the ghost prompt; Tab or Right accepts it for
 editing. Print-mode stream JSON remains an explicit protocol option.
 
+All 36 top-level source services are now exact-name inventory rows. Generic
+runtime services map to Rust implementations or deliberately different open
+equivalents; account, subscription, telemetry, hosted synchronization,
+internal test fixtures, and voice authority are explicitly excluded. The two
+remaining generic service gaps were closed without importing vendor identity:
+background-agent progress is driven by exact bounded child query/tool events
+and is visible/actionable in the unified task UI, while explicit
+`memory.autoConsolidate=true` runs a five-unique-session, 24-hour-gated,
+tool-constrained consolidation pass. Consolidation uses a private bounded
+sidecar, rejects stale concurrent memory, validates all update/delete
+operations, preserves newly observed sessions, and commits through the memory
+lock and atomic writer.
+
 ## Current project-wide work still open
 
-- Expand the ledger to every top-level service/utility family with exact Rust
-  and test evidence.
+- Expand the same exact-name inventory discipline to utility, hook, component,
+  and other remaining source families.
 - Close or explicitly classify concurrent side-question behavior while a main
   model turn is active.
 - Re-run the full required check set and the final repository/remote hygiene

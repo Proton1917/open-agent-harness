@@ -32,6 +32,7 @@ pub enum TaskUiItemKind {
     PersistentTask,
     Todo,
     BackgroundTask,
+    AgentTask,
     WorkflowTask,
     MonitorTask,
     CronJob,
@@ -106,6 +107,10 @@ pub(super) async fn task_ui_snapshot(context: &ToolContext) -> Result<TaskUiSnap
     background_ids.sort();
     workflow_ids.sort();
     monitor_ids.sort();
+    let agent_states = match context.agent_runtime() {
+        Ok(runtime) => runtime.task_ui_states(&context.async_owner()).await,
+        Err(_) => Vec::new(),
+    };
 
     let (cron_jobs, wakeup) = if context.agent_depth() == 0 {
         let cron = context.cron_service();
@@ -144,6 +149,19 @@ pub(super) async fn task_ui_snapshot(context: &ToolContext) -> Result<TaskUiSnap
             "Background task",
             None,
             TaskUiStatus::Tracked,
+        )
+    });
+    snapshot.extend_limited(agent_states.iter(), |agent| {
+        bounded_ui_item(
+            TaskUiItemKind::AgentTask,
+            &agent.id,
+            &agent.description,
+            Some(&agent.progress),
+            if agent.completed {
+                TaskUiStatus::Completed
+            } else {
+                TaskUiStatus::InProgress
+            },
         )
     });
     snapshot.extend_limited(workflow_ids.iter(), |id| {

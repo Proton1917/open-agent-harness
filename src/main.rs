@@ -144,12 +144,21 @@ impl TaskUiMonitor {
                             TaskUiItemKind::PersistentTask => "task",
                             TaskUiItemKind::Todo => "todo",
                             TaskUiItemKind::BackgroundTask => "background",
+                            TaskUiItemKind::AgentTask => "agent",
                             TaskUiItemKind::WorkflowTask => "workflow",
                             TaskUiItemKind::MonitorTask => "monitor",
                             TaskUiItemKind::CronJob => "cron",
                             TaskUiItemKind::DynamicWakeup => "wakeup",
                         };
-                        format!("  {marker} {kind} {} · {}", item.id, item.title)
+                        let progress = if item.kind == TaskUiItemKind::AgentTask {
+                            item.detail
+                                .as_deref()
+                                .map(|detail| format!(" · {detail}"))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        format!("  {marker} {kind} {} · {}{progress}", item.id, item.title)
                     })
                     .collect::<Vec<_>>();
                 if snapshot.truncated {
@@ -709,7 +718,7 @@ async fn run(
             persist_turn(&store, &engine, &result)?;
             print_result(&cli, &engine, &store, &result, control_handle.as_ref())?;
             emit_prompt_suggestion(&cli, &mut engine, &store, control_handle.as_ref()).await?;
-            schedule_auto_memory(&memory_extractor, &engine, cli.debug);
+            schedule_auto_memory(&memory_extractor, &engine, store.id, cli.debug);
             drain_print_scheduled_prompts(
                 &cli,
                 &mut engine,
@@ -2747,7 +2756,12 @@ async fn run(
                     } else {
                         prompt_suggestions.cancel();
                     }
-                    schedule_auto_memory(&memory_extractor, &engine, cli.debug);
+                    schedule_auto_memory(
+                        &memory_extractor,
+                        &engine,
+                        active_store.id,
+                        cli.debug,
+                    );
                 }
                 Ok(None) => continue,
                 Err(error) if !enhanced_terminal => eprintln!("Error: {error:#}"),
@@ -2869,7 +2883,7 @@ async fn drain_print_scheduled_prompts(
         persist_turn(store, engine, &result)?;
         print_result(cli, engine, store, &result, control)?;
         emit_prompt_suggestion(cli, engine, store, control).await?;
-        schedule_auto_memory(memory_extractor, engine, cli.debug);
+        schedule_auto_memory(memory_extractor, engine, store.id, cli.debug);
     }
     // The process-wide ready queue is itself bounded. Do not probe it by
     // popping an extra item here: doing so would acknowledge a prompt that was
@@ -2877,8 +2891,13 @@ async fn drain_print_scheduled_prompts(
     Ok(())
 }
 
-fn schedule_auto_memory(extractor: &AutoMemoryExtractor, engine: &QueryEngine, debug: bool) {
-    if let Err(error) = extractor.schedule(&engine.model, &engine.messages) {
+fn schedule_auto_memory(
+    extractor: &AutoMemoryExtractor,
+    engine: &QueryEngine,
+    session_id: Uuid,
+    debug: bool,
+) {
+    if let Err(error) = extractor.schedule(&engine.model, &engine.messages, session_id) {
         if debug {
             eprintln!("[debug] auto-memory scheduling failed: {error:#}");
         }
@@ -2983,6 +3002,9 @@ fn render_memory_notice(memory: &AutoMemory) -> String {
         .to_owned();
     if memory.auto_extract_enabled() {
         notice.push_str(" Trusted settings also enable one bounded, tool-constrained extraction pass after each completed root turn. That pass may save durable non-secret facts, cannot delete entries or execute runtime tools, and does not alter this conversation.");
+    }
+    if memory.auto_consolidate_enabled() {
+        notice.push_str(" Trusted settings also enable bounded background consolidation after at least five distinct sessions and 24 hours. Consolidation treats memory as untrusted data, may only submit validated update/delete operations, and is rejected if memory changes concurrently.");
     }
     notice
 }
@@ -4082,7 +4104,7 @@ async fn execute_control_turn(
             }
             handle.command_lifecycle(uuid, "completed")?;
             emit_prompt_suggestion(cli, engine, store, Some(handle)).await?;
-            schedule_auto_memory(memory_extractor, engine, cli.debug);
+            schedule_auto_memory(memory_extractor, engine, store.id, cli.debug);
             return Ok(());
         }
         Ok(None) => {
@@ -6649,6 +6671,7 @@ fn task_dialog_items(items: Vec<TaskUiItem>) -> Vec<TaskDialogItem> {
             let actionable = matches!(
                 item.kind,
                 TaskUiItemKind::BackgroundTask
+                    | TaskUiItemKind::AgentTask
                     | TaskUiItemKind::WorkflowTask
                     | TaskUiItemKind::MonitorTask
             );
@@ -6658,9 +6681,9 @@ fn task_dialog_items(items: Vec<TaskUiItem>) -> Vec<TaskDialogItem> {
                 detail: item.detail.unwrap_or_default(),
                 category: match item.kind {
                     TaskUiItemKind::BackgroundTask => TaskCategory::Shell,
-                    TaskUiItemKind::WorkflowTask | TaskUiItemKind::MonitorTask => {
-                        TaskCategory::Agent
-                    }
+                    TaskUiItemKind::AgentTask
+                    | TaskUiItemKind::WorkflowTask
+                    | TaskUiItemKind::MonitorTask => TaskCategory::Agent,
                     _ => TaskCategory::Other,
                 },
                 state: match item.status {

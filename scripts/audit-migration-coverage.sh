@@ -28,7 +28,7 @@ trap 'rm -rf "$tmp"' EXIT
 awk -F '\t' '
   /^#/ || NF == 0 { next }
   NF != 6 { printf "invalid_manifest_line=%d fields=%d\n", NR, NF > "/dev/stderr"; bad=1 }
-  $1 !~ /^(tool|command|native)$/ { printf "invalid_manifest_kind=%s line=%d\n", $1, NR > "/dev/stderr"; bad=1 }
+  $1 !~ /^(tool|command|service|native)$/ { printf "invalid_manifest_kind=%s line=%d\n", $1, NR > "/dev/stderr"; bad=1 }
   $3 !~ /^(implemented|equivalent|excluded|pending)$/ { printf "invalid_manifest_status=%s line=%d\n", $3, NR > "/dev/stderr"; bad=1 }
   seen[$1 SUBSEP $2]++ > 0 { printf "duplicate_manifest_source=%s:%s\n", $1, $2 > "/dev/stderr"; bad=1 }
   END { exit bad }
@@ -63,6 +63,22 @@ if [[ -d "$commands" ]]; then
   echo 'source_command_inventory_complete=true'
 else
   echo 'source_command_inventory=reference_not_present'
+fi
+
+awk -F '\t' '$1 == "service" { print $2 }' "$manifest" | sort -u > "$tmp/expected-services"
+services="$root/reference/source-snapshot/src/services"
+if [[ -d "$services" ]]; then
+  find "$services" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) -exec basename {} \; \
+    | sed 's/\.tsx$//; s/\.ts$//' \
+    | sort -u > "$tmp/actual-services"
+  if ! comm -3 "$tmp/expected-services" "$tmp/actual-services" > "$tmp/service-diff" \
+    || [[ -s "$tmp/service-diff" ]]; then
+    sed 's/^/service_manifest_mismatch=/' "$tmp/service-diff" >&2
+    exit 1
+  fi
+  echo 'source_service_inventory_complete=true'
+else
+  echo 'source_service_inventory=reference_not_present'
 fi
 
 awk -F '\t' '$1 == "native" { print $2 }' "$manifest" | sort -u > "$tmp/expected-native"
@@ -107,10 +123,10 @@ done
 
 pending="$(awk -F '\t' '$3 == "pending" { count++ } END { print count + 0 }' "$manifest")"
 if $strict && (( pending != 0 )); then
-  echo 'migration_tool_command_native_strict_complete=false' >&2
+  echo 'migration_tool_command_service_native_strict_complete=false' >&2
   exit 1
 fi
 echo 'migration_manifest_evidence_present=true'
 if $strict; then
-  echo 'migration_tool_command_native_strict_complete=true'
+  echo 'migration_tool_command_service_native_strict_complete=true'
 fi

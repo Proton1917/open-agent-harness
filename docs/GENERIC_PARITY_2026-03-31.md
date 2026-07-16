@@ -94,9 +94,12 @@ is accurate; “complete parity with the proprietary product” is not.
   than introducing a privileged terminal escape hatch.
 - Ctrl-O opens a bounded alternate-screen transcript with keyboard scrolling,
   search, match navigation, resize repaint, and explicit native-scrollback
-  dump. Ctrl-T and `/tasks` include persistent work items, background work, and
-  cron; selected background output and stop actions are exposed by ID. A ready
-  scheduled prompt can wake an idle composer without discarding its draft.
+  dump. Ctrl-T and `/tasks` include persistent work items, background work,
+  background agents, and cron; selected output and stop actions are exposed by
+  ID. Agent rows derive bounded live progress from exact child query, tool,
+  retry, compaction, and completion events rather than periodic extra model
+  calls. A ready scheduled prompt can wake an idle composer without discarding
+  its draft.
 - Every built-in slash command advertised by stream-JSON is dispatched locally
   and returns a structured `command_result`; `/clear`, `/status`, or `/rewind`
   can no longer be routed to the model by accident.
@@ -219,7 +222,11 @@ is accurate; “complete parity with the proprietary product” is not.
   best-effort extraction after completed root turns. Overlapping schedules are
   coalesced so only the latest pending turn is extracted. Conversation and
   existing memory are treated as untrusted data; likely secrets are rejected
-  and accepted entries are committed atomically.
+  and accepted entries are committed atomically. A separate explicit
+  `autoConsolidate` option waits for five unique sessions and 24 hours, then
+  accepts only a bounded tool response with validated updates/deletions.
+  Concurrent memory changes reject the result; newly observed sessions survive
+  the consolidation through a private bounded sidecar.
 - Configured LSP clients synchronize successful `Edit`, `Write`, and
   `NotebookEdit` mutations through `didOpen`/`didChange`/`didSave` without an
   explicit LSP query. Version-checked, workspace-confined diagnostics are
@@ -286,9 +293,9 @@ is accurate; “complete parity with the proprietary product” is not.
   complete exact JSON before authorization. `/permissions` now provides
   Recent/Allow/Ask/Deny/Workspace tabs, search and typed add/remove actions;
   only user rules persist, while the primary workspace remains immutable.
-  `/tasks` uses a bounded live snapshot for its list/detail dialog and routes
-  stop/output through the existing tool boundary. These dialogs deliberately
-  keep original wording and layout.
+  `/tasks` uses a bounded live snapshot for its list/detail dialog, includes
+  exact background-agent progress, and routes stop/output through the existing
+  tool boundary. These dialogs use original Rust wording and layout.
 - `RunWorkflow` intentionally accepts a strict declarative command DAG, not
   arbitrary JavaScript, downloaded workflow code, or cross-process resume.
 - `ConfigChange` covers the accepted project-Skill hot-refresh boundary only.
@@ -314,7 +321,9 @@ is accurate; “complete parity with the proprietary product” is not.
   through a private `.MEMORY.lock`, in addition to private atomic replacement.
   A crash-stale lock fails closed and requires explicit removal after verifying
   that no writer remains; unrelated external writers do not participate in this
-  protocol.
+  protocol. Consolidation releases the lock during its model request and then
+  compares the complete entry snapshot before applying, so another writer wins
+  safely instead of being overwritten.
 - The file-history transaction journal coordinates one harness process.
   Independent OS processes editing the same workspace do not share rollback
   ordering; ordinary freshness checks and atomic writes still apply.

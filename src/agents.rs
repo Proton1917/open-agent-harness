@@ -25,7 +25,7 @@ use crate::{
     api::ModelClient,
     config::Settings,
     protocol::ReasoningEffort,
-    query::{QueryEngine, QueryOptions},
+    query::{QueryEngine, QueryEvent, QueryEventSink, QueryOptions},
     tools::{
         AsyncOwner, Tool, ToolContext, ToolOutput, ToolRegistry, atomic_write_private,
         ensure_private_directory, object_schema, workspace_key,
@@ -63,6 +63,7 @@ const MAX_CUSTOM_AGENT_TURNS: usize = 64;
 const MIN_AGENT_TIMEOUT_MS: u64 = 1_000;
 const MAX_AGENT_TIMEOUT_MS: u64 = 3_600_000;
 const AGENT_CANCEL_GRACE: Duration = Duration::from_secs(5);
+const MAX_AGENT_PROGRESS_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentLimits {
@@ -399,7 +400,16 @@ struct BackgroundAgent {
     cancel: Option<oneshot::Sender<()>>,
     result: watch::Receiver<Option<Arc<ToolOutput>>>,
     handle: JoinHandle<()>,
+    progress: Arc<StdMutex<String>>,
     _reservation: Arc<ActiveAgentReservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentTaskUiState {
+    pub id: String,
+    pub description: String,
+    pub progress: String,
+    pub completed: bool,
 }
 
 struct ActiveAgentReservation {
@@ -489,6 +499,7 @@ struct AgentRunRequest {
     agent_worktree: Option<AgentWorktree>,
     history_workspace: PathBuf,
     persist_history: bool,
+    progress: Option<Arc<StdMutex<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -807,6 +818,7 @@ impl AgentRuntime {
                     return Err(error);
                 }
             };
+            let progress = Arc::new(StdMutex::new("Starting agent".to_owned()));
             let request = AgentRunRequest {
                 id,
                 history_owner: history_owner.clone(),
@@ -822,6 +834,7 @@ impl AgentRuntime {
                 agent_worktree: agent_worktree.take(),
                 history_workspace,
                 persist_history,
+                progress: Some(Arc::clone(&progress)),
             };
             let (cancel, cancel_rx) = oneshot::channel();
             let (result_tx, result) = watch::channel(None);
@@ -870,6 +883,7 @@ impl AgentRuntime {
                     cancel: Some(cancel),
                     result,
                     handle,
+                    progress,
                     _reservation: reservation,
                 },
             );
@@ -907,6 +921,7 @@ impl AgentRuntime {
             agent_worktree: agent_worktree.take(),
             history_workspace,
             persist_history,
+            progress: None,
         };
         // Keep foreground execution in the caller's future. Dropping a cancelled
         // root turn then drops the whole agent stack before file rollback; no
@@ -1118,6 +1133,26 @@ impl AgentRuntime {
         self.histories.lock().await.values.contains_key(&id)
     }
 
+    pub(crate) async fn task_ui_states(&self, owner: &AsyncOwner) -> Vec<AgentTaskUiState> {
+        let jobs = self.jobs.lock().await;
+        let mut states = jobs
+            .iter()
+            .filter(|(_, job)| owner.can_manage(&job.owner))
+            .map(|(id, job)| AgentTaskUiState {
+                id: id.to_string(),
+                description: job.description.clone(),
+                progress: job
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                completed: job.result.borrow().is_some() || job.handle.is_finished(),
+            })
+            .collect::<Vec<_>>();
+        states.sort_by(|left, right| left.id.cmp(&right.id));
+        states
+    }
+
     #[cfg(test)]
     fn set_history_storage_root(&self, root: PathBuf) {
         *self
@@ -1326,6 +1361,7 @@ impl AgentRuntime {
             agent_worktree: _,
             history_workspace,
             persist_history,
+            progress,
         } = request;
         let file_transaction_context = context.clone();
         let custom_agent_name = custom_agent.as_ref().map(|agent| agent.name.clone());
@@ -1376,6 +1412,9 @@ impl AgentRuntime {
                 compact_config: None,
             },
         );
+        if let Some(progress) = progress {
+            engine.set_event_sink(Some(agent_progress_sink(progress)));
+        }
         engine.set_reasoning_effort(effort);
         if let Some(custom_agent) = &custom_agent {
             engine.set_max_tool_rounds(custom_agent.max_turns)?;
@@ -2056,6 +2095,45 @@ impl Tool for AgentStopTool {
     }
 }
 
+fn agent_progress_sink(progress: Arc<StdMutex<String>>) -> QueryEventSink {
+    Arc::new(move |event| {
+        let next = match event {
+            QueryEvent::TurnStarted => "Starting delegated turn".to_owned(),
+            QueryEvent::RequestStarted { round } => format!("Requesting model round {round}"),
+            QueryEvent::RequestRetry {
+                attempt,
+                max_attempts,
+                ..
+            } => format!("Retrying model request {attempt}/{max_attempts}"),
+            QueryEvent::AssistantMessage { .. } => "Preparing delegated response".to_owned(),
+            QueryEvent::CheckpointCreated { .. } => "Checkpointing workspace".to_owned(),
+            QueryEvent::ToolStarted { name, summary, .. } => {
+                if summary.trim().is_empty() {
+                    format!("Running {name}")
+                } else {
+                    format!("Running {name} · {summary}")
+                }
+            }
+            QueryEvent::ToolFinished { name, is_error, .. } => {
+                format!("{name} {}", if *is_error { "failed" } else { "finished" })
+            }
+            QueryEvent::CompactStarted => "Compacting delegated context".to_owned(),
+            QueryEvent::CompactFinished { .. } => "Delegated context compacted".to_owned(),
+            QueryEvent::TurnFinished => "Finishing delegated result".to_owned(),
+            QueryEvent::TurnInterrupted => "Delegated turn interrupted".to_owned(),
+            QueryEvent::TurnFailed { .. } => "Delegated turn failed".to_owned(),
+        };
+        *progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = bounded_agent_progress(&next);
+    })
+}
+
+fn bounded_agent_progress(value: &str) -> String {
+    let clean = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_text(&clean, MAX_AGENT_PROGRESS_BYTES).to_owned()
+}
+
 fn render_agent_run(run: &AgentRun) -> ToolOutput {
     let mut rendered = json!({
         "agent_id": run.id,
@@ -2128,6 +2206,7 @@ mod tests {
             cancel: Some(cancel),
             result,
             handle,
+            progress: Arc::new(StdMutex::new("Waiting for model".to_owned())),
             _reservation: reservation,
         }
     }
@@ -2149,6 +2228,7 @@ mod tests {
             cancel: None,
             result,
             handle: tokio::spawn(async {}),
+            progress: Arc::new(StdMutex::new("Finishing delegated result".to_owned())),
             _reservation: reservation,
         }
     }
@@ -2504,6 +2584,61 @@ mod tests {
             .unwrap();
         assert!(polled.content.contains("finished result"));
         assert!(!runtime.jobs.lock().await.contains_key(&id));
+    }
+
+    #[test]
+    fn agent_progress_is_exact_control_safe_and_bounded() {
+        let progress = Arc::new(StdMutex::new(String::new()));
+        let sink = agent_progress_sink(Arc::clone(&progress));
+        sink(&QueryEvent::ToolStarted {
+            id: "tool-1".to_owned(),
+            name: "Read".to_owned(),
+            summary: format!("src/main.rs\n{}", "x".repeat(MAX_AGENT_PROGRESS_BYTES)),
+            path: None,
+        });
+        let progress = progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(progress.starts_with("Running Read · src/main.rs "));
+        assert!(progress.len() <= MAX_AGENT_PROGRESS_BYTES);
+        assert!(!progress.chars().any(char::is_control));
+    }
+
+    #[tokio::test]
+    async fn task_ui_states_include_manageable_running_and_completed_agents() {
+        let runtime = test_runtime(AgentLimits::default());
+        let root = test_context();
+        let child = root.fork_for_agent();
+        let root_owner = root.async_owner();
+        let child_owner = child.async_owner();
+        let running = Uuid::new_v4();
+        let completed = Uuid::new_v4();
+        runtime.jobs.lock().await.insert(
+            running,
+            pending_background_agent(&runtime, &root_owner, running, "inspect parser"),
+        );
+        runtime.jobs.lock().await.insert(
+            completed,
+            completed_background_agent(&runtime, &child_owner, completed, "run tests", "done"),
+        );
+
+        let root_states = runtime.task_ui_states(&root_owner).await;
+        assert_eq!(root_states.len(), 2);
+        assert!(root_states.iter().any(|state| {
+            state.id == running.to_string()
+                && state.description == "inspect parser"
+                && state.progress == "Waiting for model"
+                && !state.completed
+        }));
+        assert!(root_states.iter().any(|state| {
+            state.id == completed.to_string() && state.description == "run tests" && state.completed
+        }));
+
+        let child_states = runtime.task_ui_states(&child_owner).await;
+        assert_eq!(child_states.len(), 1);
+        assert_eq!(child_states[0].id, completed.to_string());
+        runtime.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -3136,6 +3271,7 @@ mod tests {
             agent_worktree: Some(worktree),
             history_workspace: std::fs::canonicalize(&repo).unwrap(),
             persist_history: false,
+            progress: None,
         };
         let (cancel, cancel_rx) = oneshot::channel();
         cancel.send(()).unwrap();

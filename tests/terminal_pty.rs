@@ -420,20 +420,28 @@ fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
 
     terminal.write_all(b"/permissions\r").unwrap();
-    let permissions = read_until(&mut terminal, "Permissions", Duration::from_secs(3));
+    let permissions = read_until(&mut terminal, "Workspace", Duration::from_secs(3));
     assert!(permissions.contains("Allow"));
     assert!(permissions.contains("Workspace"));
     terminal.write_all(b"\x1b").unwrap();
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
 
     terminal.write_all(b"/config\r").unwrap();
-    let settings = read_until(&mut terminal, "Settings", Duration::from_secs(3));
+    let settings = read_until(
+        &mut terminal,
+        "Syntax highlighting",
+        Duration::from_secs(3),
+    );
     assert!(settings.contains("Syntax highlighting"));
     terminal.write_all(b"\x1b").unwrap();
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
 
     terminal.write_all(b"/tasks\r").unwrap();
-    let tasks = read_until(&mut terminal, "Background tasks", Duration::from_secs(3));
+    let tasks = read_until(
+        &mut terminal,
+        "No background tasks",
+        Duration::from_secs(3),
+    );
     assert!(tasks.contains("No background tasks"));
     terminal.write_all(b"\x1b").unwrap();
     let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));

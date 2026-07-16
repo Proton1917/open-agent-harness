@@ -74,6 +74,10 @@ The frontend comparison is grounded principally in these source files:
 - `/btw` runs a tool-free contextual side question without blocking or mutating
   the main transcript. `/copy` and `/export` expose bounded public answer text
   without private reasoning or silent overwrite.
+- Ctrl-T and `/tasks` include background agents as first-class actionable rows.
+  Their bounded detail is driven by exact child model/tool/retry/compaction
+  events, updates on the existing 250 ms UI snapshot cadence, and uses the same
+  `TaskOutput`/`TaskStop` boundary as other background work.
 - Explicitly enabled prompt suggestions use one replaceable, tool-free
   background request after successful turns. A short single-line result is an
   empty-composer placeholder: Enter sends it, while Tab or Right accepts it for
