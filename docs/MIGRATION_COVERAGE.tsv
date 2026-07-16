@@ -1,0 +1,132 @@
+# kind	source	status	implementation_evidence	test_evidence	note
+tool	AgentTool	equivalent	src/agents.rs	src/agents.rs;tests/agent_flow.rs	Split into Agent, AgentOutput, and AgentStop with bounded local histories.
+tool	AskUserQuestionTool	implemented	src/tools/ask_user.rs	src/tools/ask_user.rs;tests/generic_capabilities.rs	Trusted terminal or control answers only.
+tool	BashTool	implemented	src/tools/bash.rs;src/process.rs	src/tools/bash.rs;tests/tool_parity.rs	Cross-platform managed shell execution and output capture.
+tool	BriefTool	excluded	-	-	Feature-gated proactive or hosted user-delivery surface outside the open harness.
+tool	ConfigTool	equivalent	src/ui_settings.rs;src/main.rs	src/ui_settings.rs;tests/terminal_dialogs.rs	User-controlled slash and dialog surface; the model is not granted configuration authority.
+tool	EnterPlanModeTool	implemented	src/plan.rs	src/plan.rs	Session-local plan transition.
+tool	EnterWorktreeTool	implemented	src/worktree.rs	src/worktree.rs	Harness-owned or registered Git worktree transition.
+tool	ExitPlanModeTool	implemented	src/plan.rs	src/plan.rs	Explicit root-user approval is required.
+tool	ExitWorktreeTool	implemented	src/worktree.rs	src/worktree.rs	Keep or fail-closed removal with exact ownership checks.
+tool	FileEditTool	implemented	src/tools/edit.rs;src/tools/mod.rs	src/tools/edit.rs;tests/tool_parity.rs	Freshness, full-read, permission, and atomicity invariants.
+tool	FileReadTool	implemented	src/tools/read.rs;src/image_processing.rs	src/tools/read.rs;tests/tool_parity.rs	Text, notebook, PDF, and normalized raster media.
+tool	FileWriteTool	implemented	src/tools/write.rs;src/tools/mod.rs	src/tools/write.rs;tests/tool_parity.rs	Full-read-before-overwrite and atomic writes.
+tool	GlobTool	implemented	src/tools/glob.rs	src/tools/glob.rs;tests/tool_parity.rs	Ignore-aware bounded discovery without symlink traversal.
+tool	GrepTool	implemented	src/tools/grep.rs	src/tools/grep.rs;tests/tool_parity.rs	Bounded ripgrep-compatible search surface.
+tool	LSPTool	implemented	src/lsp.rs	src/lsp.rs	Deferred user-configured LSP clients and diagnostics.
+tool	ListMcpResourcesTool	implemented	src/mcp.rs	src/mcp.rs	Resources, templates, prompts, and opaque handles.
+tool	MCPTool	equivalent	src/mcp.rs	src/mcp.rs	Each discovered MCP tool is namespaced and schema checked.
+tool	McpAuthTool	equivalent	src/mcp.rs;src/mcp_oauth.rs	src/mcp.rs;src/mcp_oauth.rs	Explicit user-controlled bearer or headless OAuth flow; no model-launched login.
+tool	NotebookEditTool	implemented	src/tools/notebook.rs	src/tools/notebook.rs;tests/tool_parity.rs	Cell edits preserve source serialization style.
+tool	PowerShellTool	equivalent	src/tools/bash.rs;src/process.rs	src/tools/bash.rs;tests/tool_parity.rs	Bash tool dispatches through PowerShell or cmd on Windows with the same permission boundary.
+tool	REPLTool	excluded	-	-	An embedded arbitrary JavaScript VM conflicts with the Rust-runtime and authority boundary.
+tool	ReadMcpResourceTool	implemented	src/mcp.rs	src/mcp.rs	Bounded resource read through configured MCP transports.
+tool	RemoteTriggerTool	excluded	-	-	Hosted remote-trigger service and account identity are outside scope.
+tool	ScheduleCronTool	equivalent	src/tools/cron.rs;src/tools/wakeup.rs;src/cron.rs	src/tools/cron.rs;src/tools/wakeup.rs;src/cron.rs	Split into fixed CronCreate/Delete/List and one transactional dynamic wakeup slot.
+tool	SendMessageTool	equivalent	src/tools/team.rs;src/team.rs	src/tools/team.rs;src/team.rs	Unified local Team mailbox and lifecycle actions.
+tool	SkillTool	implemented	src/tools/skill.rs;src/skills.rs	src/tools/skill.rs;src/skills.rs	Trusted and project Skill boundaries remain distinct.
+tool	SleepTool	equivalent	src/tools/wakeup.rs;src/cron.rs	src/tools/wakeup.rs;src/cron.rs	Feature-gated proactive wait is represented by interruptible scheduled wakeups.
+tool	SyntheticOutputTool	implemented	src/structured_output.rs	src/structured_output.rs;tests/query_loop.rs	Full JSON Schema validation and exactly-once final output.
+tool	TaskCreateTool	implemented	src/tools/work_items.rs	src/tools/work_items.rs	Persistent bounded work-item store.
+tool	TaskGetTool	implemented	src/tools/work_items.rs	src/tools/work_items.rs	Persistent bounded work-item lookup.
+tool	TaskListTool	implemented	src/tools/work_items.rs	src/tools/work_items.rs	Persistent bounded work-item listing.
+tool	TaskOutputTool	implemented	src/tools/tasks.rs	src/tools/tasks.rs;tests/tool_parity.rs	Background command, agent, and workflow output aliases.
+tool	TaskStopTool	implemented	src/tools/tasks.rs	src/tools/tasks.rs;tests/tool_parity.rs	Managed process or task cancellation.
+tool	TaskUpdateTool	implemented	src/tools/work_items.rs	src/tools/work_items.rs	Validated state and relationship updates.
+tool	TeamCreateTool	equivalent	src/tools/team.rs;src/team.rs	src/tools/team.rs;src/team.rs	Create is one action of the unified Team tool.
+tool	TeamDeleteTool	equivalent	src/tools/team.rs;src/team.rs	src/tools/team.rs;src/team.rs	Delete is one coordinator-only action of the unified Team tool.
+tool	TodoWriteTool	implemented	src/tools/work_items.rs	src/tools/work_items.rs;tests/tool_parity.rs	Session todo compatibility surface.
+tool	ToolSearchTool	implemented	src/tools/mod.rs	src/tools/mod.rs	Bounded deferred registry search and exact selection.
+tool	WebFetchTool	implemented	src/web_tools.rs	src/web_tools.rs	DNS-pinned bounded fetch with redirect revalidation.
+tool	WebSearchTool	implemented	src/web_tools.rs	src/web_tools.rs	Exists only with a trusted provider-neutral endpoint.
+command	add-dir	implemented	src/main.rs;src/tools/mod.rs	src/main.rs;src/tools/mod.rs	Adds a session-scoped trusted workspace root.
+command	agents	implemented	src/main.rs;src/agents.rs	src/main.rs;src/agents.rs	Lists configured open local agents.
+command	ant-trace	excluded	-	-	Internal employee diagnostics are outside scope.
+command	autofix-pr	excluded	-	-	Bundled product prompt package; open Skills and custom commands are the replacement surface.
+command	backfill-sessions	excluded	-	-	Vendor storage migration command is not part of the open session format.
+command	branch	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Forks the local conversation with explicit parent metadata.
+command	break-cache	excluded	-	-	Internal cache fault-injection command is outside production scope.
+command	bridge	excluded	-	-	Vendor IDE or remote bridge and identity channel are outside scope.
+command	btw	implemented	src/main.rs;src/query.rs	src/main.rs;tests/query_loop.rs	Tool-free contextual side question without transcript mutation.
+command	bughunter	excluded	-	-	Bundled product prompt package; equivalent workflows belong in user Skills.
+command	chrome	excluded	-	-	Browser extension and account bridge are outside this coding harness.
+command	clear	implemented	src/main.rs;src/session.rs	src/main.rs;tests/cli_output.rs	Archives the current local session before creating a new one.
+command	color	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Private session prompt-bar color metadata.
+command	compact	implemented	src/main.rs;src/compact.rs	src/compact.rs;tests/compact_flow.rs	Manual bounded context compaction.
+command	config	implemented	src/main.rs;src/ui_settings.rs	src/ui_settings.rs;tests/terminal_dialogs.rs	Safe user-only terminal settings and typed dialog.
+command	context	implemented	src/main.rs;src/query.rs	src/main.rs;tests/query_loop.rs	Shows bounded context usage.
+command	copy	implemented	src/main.rs;src/clipboard.rs	src/main.rs;src/clipboard.rs	Copies bounded public assistant text only.
+command	cost	implemented	src/main.rs;src/types.rs	src/main.rs;src/types.rs	Shows provider-neutral token usage without account billing.
+command	ctx_viz	equivalent	src/main.rs;src/query.rs	src/main.rs;tests/query_loop.rs	Open context status replaces proprietary context visualization.
+command	debug-tool-call	excluded	-	-	Internal tool fault-injection command is excluded.
+command	desktop	excluded	-	-	Vendor desktop handoff and custom URL scheme are outside scope.
+command	diff	implemented	src/main.rs;src/file_history.rs	src/main.rs;src/file_history.rs	Previews exact local checkpoint changes.
+command	doctor	implemented	src/main.rs;src/config.rs	src/main.rs;tests/cli_output.rs	Diagnoses local settings, terminal, sandbox, and MCP state.
+command	effort	implemented	src/main.rs;src/protocol.rs	src/main.rs;src/protocol.rs	Provider-neutral reasoning effort hint.
+command	env	equivalent	src/main.rs;src/config.rs	src/main.rs;src/config.rs	Status and doctor expose the safe local environment subset without secret dumping.
+command	exit	implemented	src/main.rs;src/terminal.rs	src/main.rs;tests/terminal_pty.rs	Bounded terminal exit confirmation and cleanup.
+command	export	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Exports public local transcript without private reasoning or overwrite.
+command	extra-usage	excluded	-	-	Hosted subscription quota and billing surface are outside scope.
+command	fast	excluded	-	-	Vendor entitlement and branded fast-mode routing are outside scope.
+command	feedback	excluded	-	-	Vendor feedback upload and telemetry channel are outside scope.
+command	files	implemented	src/main.rs;src/tools/mod.rs	src/main.rs;src/tools/mod.rs	Lists trusted roots and bounded file references.
+command	good-claude	excluded	-	-	Internal or branded prompt package is outside the generic command surface.
+command	heapdump	excluded	-	-	Runtime heap diagnostics for the source implementation are outside scope.
+command	help	implemented	src/main.rs;src/command_palette.rs	src/main.rs;src/command_palette.rs	Live bounded command catalog and aliases.
+command	hooks	implemented	src/main.rs;src/hooks.rs	src/main.rs;src/hooks.rs	Shows trusted hook configuration status.
+command	ide	excluded	-	-	Vendor IDE bridge and authentication are outside scope.
+command	install-github-app	excluded	-	-	Hosted application installation and account authorization are outside scope.
+command	install-slack-app	excluded	-	-	Hosted application installation and account authorization are outside scope.
+command	issue	excluded	-	-	Bundled hosted issue workflow; open Skills/plugins provide the extension point.
+command	keybindings	implemented	src/main.rs;src/keybindings.rs	src/keybindings.rs;tests/keybindings_pty.rs	Private hot-reloaded keybinding file.
+command	login	excluded	-	-	Vendor account identity and login are outside scope.
+command	logout	excluded	-	-	Vendor account identity and logout are outside scope.
+command	mcp	implemented	src/main.rs;src/mcp.rs	src/main.rs;src/mcp.rs	Status, tools, enable, disable, and reconnect for trusted definitions.
+command	memory	implemented	src/main.rs;src/auto_memory.rs	src/main.rs;src/auto_memory.rs	Local bounded memory status and explicit index.
+command	mobile	excluded	-	-	Hosted mobile and remote-control handoff are outside scope.
+command	mock-limits	excluded	-	-	Internal quota fault-injection command is excluded.
+command	model	implemented	src/main.rs;src/query.rs	src/main.rs;tests/terminal_pty.rs	Session model selection from trusted options or explicit ID.
+command	oauth-refresh	excluded	-	-	Vendor account token refresh is excluded; open MCP OAuth is separately implemented.
+command	onboarding	excluded	-	-	Branded product onboarding is not a harness primitive.
+command	output-style	implemented	src/main.rs;src/plugins.rs	src/main.rs;tests/cli_output.rs	Trusted provider-neutral output-style selection.
+command	passes	excluded	-	-	Hosted entitlement or internal access-pass surface is outside scope.
+command	perf-issue	excluded	-	-	Internal performance-report upload command is outside scope.
+command	permissions	implemented	src/main.rs;src/permissions.rs	src/main.rs;tests/terminal_dialogs.rs	Typed user rules and recent/workspace inspection without project elevation.
+command	plan	implemented	src/main.rs;src/plan.rs	src/main.rs;src/plan.rs	Session plan mode and saved plan view.
+command	plugin	implemented	src/main.rs;src/plugin_manager.rs	src/plugin_manager.rs;tests/plugin_lifecycle.rs	Explicit local/checksummed plugin lifecycle outside model authority.
+command	pr_comments	excluded	-	-	Bundled hosted review workflow; open Skills/plugins provide the replacement surface.
+command	privacy-settings	excluded	-	-	Vendor telemetry/privacy account controls are absent because the harness has no telemetry channel.
+command	rate-limit-options	excluded	-	-	Hosted account quota selection is outside scope.
+command	release-notes	excluded	-	-	Vendor product release feed is outside the harness runtime.
+command	reload-plugins	implemented	src/main.rs;src/plugins.rs	src/main.rs;tests/plugin_lifecycle.rs	Reloads already trusted local plugin contributions.
+command	remote-env	excluded	-	-	Hosted remote execution environment is outside scope.
+command	remote-setup	excluded	-	-	Hosted remote-control setup and identity are outside scope.
+command	rename	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Private local session title.
+command	reset-limits	excluded	-	-	Internal quota reset command is outside scope.
+command	resume	implemented	src/main.rs;src/session.rs;src/worktree.rs	src/main.rs;src/session.rs	Searches and switches compatible local sessions and worktrees.
+command	review	excluded	-	-	Bundled proprietary review prompt; user Skills/custom commands are the open equivalent.
+command	rewind	implemented	src/main.rs;src/file_history.rs;src/session.rs	src/main.rs;tests/cli_output.rs	Conversation, files, or combined rewind from exact message boundaries.
+command	sandbox-toggle	equivalent	src/main.rs;src/sandbox.rs;src/permissions.rs	src/main.rs;src/sandbox.rs	Sandbox status and permission-mode controls remain explicit and cannot silently elevate authority.
+command	session	equivalent	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Status, branch, resume, rename, tag, and clear split the local session surface.
+command	share	excluded	-	-	Hosted transcript sharing and identity are outside scope.
+command	skills	implemented	src/main.rs;src/skills.rs	src/main.rs;src/skills.rs	Lists current trusted and project Skill catalog.
+command	stats	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Local activity statistics only.
+command	status	implemented	src/main.rs;src/query.rs	src/main.rs;src/query.rs	Current local model, mode, context, and integration status.
+command	stickers	excluded	-	-	Branded decorative assets are outside scope.
+command	summary	equivalent	src/main.rs;src/compact.rs	src/compact.rs;tests/compact_flow.rs	Manual compact provides the bounded continuation summary primitive.
+command	tag	implemented	src/main.rs;src/session.rs	src/main.rs;src/session.rs	Private searchable local tag with toggle semantics.
+command	tasks	implemented	src/main.rs;src/tools/work_items.rs;src/tools/tasks.rs	src/main.rs;tests/terminal_dialogs.rs	Unified persistent items, background work, agents, workflows, and cron view.
+command	teleport	excluded	-	-	Hosted session transfer and account identity are outside scope.
+command	terminalSetup	equivalent	src/main.rs;src/terminal.rs	src/main.rs;tests/terminal_pty.rs	Exposed as the provider-neutral terminal-setup command.
+command	theme	implemented	src/main.rs;src/ui_settings.rs	src/main.rs;tests/terminal_pty.rs	Private theme picker with preview and rollback.
+command	thinkback	excluded	-	-	Bundled hosted or internal history workflow is outside scope.
+command	thinkback-play	excluded	-	-	Bundled hosted or internal history workflow is outside scope.
+command	upgrade	excluded	-	-	Vendor distribution updater is outside the open runtime.
+command	usage	equivalent	src/main.rs;src/types.rs	src/main.rs;src/types.rs	Cost, context, and stats expose local token/activity data without hosted billing.
+command	vim	implemented	src/main.rs;src/vim.rs	src/vim.rs;tests/vim_interactions_pty.rs	Live standard/Vim editor mode transition.
+command	voice	excluded	-	-	Voice capture, account speech services, and microphone authority are outside scope.
+native	audio-capture.node	excluded	-	-	Voice capture and microphone authority are outside scope.
+native	computer-use-input.node	excluded	-	-	Desktop input injection is outside the coding-harness authority boundary.
+native	computer-use-swift.node	excluded	-	-	Platform desktop automation and capture are outside scope.
+native	image-processor.node	equivalent	src/image_processing.rs	src/image_processing.rs	Original bounded Rust decoder and normalizer replaces the opaque native wrapper.
+native	url-handler.node	excluded	-	-	Vendor custom URL registration and remote handoff are outside scope.

@@ -197,6 +197,8 @@ else
   echo 'reference_archive_checksum=not_present'
 fi
 
+"$root/scripts/audit-migration-coverage.sh" --strict
+
 # Flag only URL literals that begin with a concrete hostname/IP. Bare scheme
 # checks (for example `starts_with("https://")`) and runtime-composed hosts are
 # configuration logic, not embedded endpoints.
