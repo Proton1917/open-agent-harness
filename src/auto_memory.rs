@@ -422,6 +422,40 @@ impl AutoMemory {
         Ok(rendered)
     }
 
+    pub(crate) fn render_all_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<String> {
+        let Some(file) = &self.file else {
+            return Ok(String::new());
+        };
+        if max_entries == 0 || max_entries > MAX_RECALL_ENTRIES {
+            bail!("memory render max_entries 必须在 1..={MAX_RECALL_ENTRIES}")
+        }
+        if max_bytes == 0 || max_bytes > MAX_RECALL_BYTES {
+            bail!("memory render max_bytes 必须在 1..={MAX_RECALL_BYTES}")
+        }
+        let _guard = self.acquire_lock()?;
+        let mut rendered = String::new();
+        for entry in load_entries(file)?.into_iter().take(max_entries) {
+            let block = format!(
+                "## {}\nTags: {}\n{}\n",
+                entry.title,
+                entry.tags.join(", "),
+                entry.content
+            );
+            if rendered.len().saturating_add(block.len()) > max_bytes {
+                break;
+            }
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(&block);
+        }
+        Ok(rendered)
+    }
+
     /// Inserts or replaces an entry with the same title using an atomic 0600
     /// write. Callers decide what is worth remembering; likely secrets are
     /// rejected before persistence.

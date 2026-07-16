@@ -61,6 +61,25 @@ impl Default for SecretEnvScrubber {
 }
 
 impl SecretEnvScrubber {
+    pub(crate) fn merged(&self, other: &Self) -> Result<Self> {
+        let names = self
+            .names
+            .iter()
+            .chain(other.names.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if names.len() > MAX_SECRET_ENV_NAMES {
+            bail!("MCP secret env 名称超过 {MAX_SECRET_ENV_NAMES} 项限制")
+        }
+        let total = names.iter().map(String::len).sum::<usize>();
+        if total > MAX_SECRET_ENV_TOTAL_BYTES {
+            bail!("MCP secret env 名称超过 {MAX_SECRET_ENV_TOTAL_BYTES} 字节限制")
+        }
+        Ok(Self {
+            names: names.into_iter().collect::<Vec<_>>().into(),
+        })
+    }
+
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self> {
         let mut names = BUILTIN_SECRET_ENV_NAMES
             .iter()
@@ -507,6 +526,38 @@ mod tests {
                 raw: json!({"mcpServers":servers})
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn secret_env_scrubber_merge_is_monotonic_and_deduplicated() {
+        let first = SecretEnvScrubber::from_settings(&Settings {
+            raw: json!({"mcpServers":{"first":{"auth":{
+                "type":"bearer-env", "env":"MCP_FIRST_SECRET"
+            }}}}),
+        })
+        .unwrap();
+        let second = SecretEnvScrubber::from_settings(&Settings {
+            raw: json!({"mcpServers":{"second":{"auth":{
+                "type":"bearer-env", "env":"MCP_SECOND_SECRET"
+            }}}}),
+        })
+        .unwrap();
+        let merged = first.merged(&second).unwrap();
+        assert!(merged.names().iter().any(|name| name == "MCP_FIRST_SECRET"));
+        assert!(
+            merged
+                .names()
+                .iter()
+                .any(|name| name == "MCP_SECOND_SECRET")
+        );
+        assert_eq!(
+            merged
+                .names()
+                .iter()
+                .filter(|name| name.as_str() == "HARNESS_API_KEY")
+                .count(),
+            1
         );
     }
 

@@ -38,6 +38,7 @@ use url::Url;
 
 use crate::{
     config::Settings,
+    control::ControlHandle,
     image_processing::{ProcessedImage, normalize_image},
     mcp_oauth::{OAuthCredentialProvider, RawOAuthConfig},
     mcp_websocket::{WebSocketMcpConfig, WebSocketMcpRpc},
@@ -100,6 +101,7 @@ const MAX_LEGACY_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_SSE_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LEGACY_PENDING_REQUESTS: usize = 64;
 const WAIT_FOR_MCP_SERVERS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SDK_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct McpIntegration {
     pub active_tools: Vec<Arc<dyn Tool>>,
@@ -111,6 +113,13 @@ pub struct McpIntegration {
     pub server_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct McpServerChangeReport {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub errors: BTreeMap<String, String>,
+}
+
 #[async_trait]
 pub trait McpControl: Send + Sync {
     fn status(&self) -> Vec<McpServerStatus>;
@@ -118,6 +127,20 @@ pub trait McpControl: Send + Sync {
     async fn reconnect(&self, server: &str) -> Result<()>;
     async fn enable(&self, server: &str) -> Result<()>;
     async fn disable(&self, server: &str) -> Result<()>;
+    async fn replace_dynamic_servers(
+        &self,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<McpServerChangeReport>;
+    async fn replace_flag_servers(
+        &self,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<McpServerChangeReport>;
+    async fn replace_plugin_servers(
+        &self,
+        servers: &BTreeMap<String, Value>,
+    ) -> Result<McpServerChangeReport>;
+    async fn connect_pending_sdk_servers(&self) -> Result<()>;
+    async fn deliver_sdk_message(&self, server: &str, message: Value) -> Result<()>;
     async fn list_prompts(&self, context: &ToolContext) -> Result<Value>;
     async fn get_prompt(
         &self,
@@ -190,6 +213,7 @@ struct RawServerConfig {
     timeout_ms: Option<u64>,
     #[serde(rename = "type")]
     transport_type: Option<String>,
+    name: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(rename = "allowPrivateNetwork", default)]
@@ -223,7 +247,7 @@ enum RawAuthConfig {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ServerConfig {
     name: String,
     namespace: String,
@@ -240,7 +264,7 @@ struct McpRoot {
     name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ServerTransport {
     Stdio {
         command: String,
@@ -263,6 +287,34 @@ enum ServerTransport {
         allow_private_network: bool,
         credential: Option<TokenCredentialProvider>,
     },
+    Sdk {
+        control: ControlHandle,
+    },
+}
+
+impl std::fmt::Debug for ServerTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdio { .. } => "Stdio(<redacted>)",
+            Self::Http { .. } => "Http(<redacted>)",
+            Self::WebSocket { .. } => "WebSocket(<redacted>)",
+            Self::Sdk { .. } => "Sdk(control)",
+        })
+    }
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("transport", &self.transport)
+            .field("request_timeout", &self.request_timeout)
+            .field("elicitation_timeout", &self.elicitation_timeout)
+            .field("root_count", &self.roots.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -329,11 +381,186 @@ pub(crate) trait McpRpc: Send + Sync {
             })?
     }
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<()>;
+    async fn ingest(&self, _message: Value) -> Result<()> {
+        bail!("MCP transport 不接受外部注入消息")
+    }
     fn subscribe(&self) -> broadcast::Receiver<Value>;
     async fn set_protocol_version(&self, version: &str);
     async fn start_notifications(&self);
     async fn diagnostic_excerpt(&self) -> String;
     async fn shutdown(&self);
+}
+
+struct SdkControlRpc {
+    server_name: String,
+    control: ControlHandle,
+    request_timeout: Duration,
+    next_id: AtomicU64,
+    events: broadcast::Sender<Value>,
+    request_handler: McpClientRequestHandler,
+    closing: AtomicBool,
+}
+
+impl SdkControlRpc {
+    fn new(
+        server_name: String,
+        control: ControlHandle,
+        request_timeout: Duration,
+        request_handler: McpClientRequestHandler,
+    ) -> Self {
+        let (events, _) = broadcast::channel(64);
+        Self {
+            server_name,
+            control,
+            request_timeout,
+            next_id: AtomicU64::new(1),
+            events,
+            request_handler,
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    async fn exchange(&self, message: Value, request_timeout: Duration) -> Result<Value> {
+        if self.closing.load(Ordering::Acquire) {
+            bail!("SDK MCP transport 已关闭")
+        }
+        validate_sdk_jsonrpc_message(&message)?;
+        if serde_json::to_vec(&message)?.len() > MAX_SDK_MCP_MESSAGE_BYTES {
+            bail!("SDK MCP message 超过 {MAX_SDK_MCP_MESSAGE_BYTES} 字节限制")
+        }
+        let control = self.control.clone();
+        let server_name = self.server_name.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            control.request_with_timeout(
+                json!({
+                    "subtype":"mcp_message",
+                    "server_name":server_name,
+                    "message":message,
+                }),
+                request_timeout,
+            )
+        })
+        .await
+        .context("SDK MCP control worker 失败")??;
+        let response = response
+            .get("mcp_response")
+            .cloned()
+            .context("SDK MCP control response 缺少 mcp_response")?;
+        validate_sdk_jsonrpc_message(&response)?;
+        if serde_json::to_vec(&response)?.len() > MAX_SDK_MCP_MESSAGE_BYTES {
+            bail!("SDK MCP response 超过 {MAX_SDK_MCP_MESSAGE_BYTES} 字节限制")
+        }
+        Ok(response)
+    }
+}
+
+fn validate_sdk_jsonrpc_message(message: &Value) -> Result<()> {
+    let object = message
+        .as_object()
+        .context("SDK MCP message 必须是 JSON object")?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        bail!("SDK MCP message jsonrpc 必须是 2.0")
+    }
+    let has_method = object.get("method").and_then(Value::as_str).is_some();
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
+    if has_method {
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .expect("checked above");
+        if method.is_empty() || method.len() > 1024 || method.contains(['\0', '\n', '\r']) {
+            bail!("SDK MCP method 为空、过长或包含控制字符")
+        }
+        if has_result || has_error {
+            bail!("SDK MCP request/notification 不得同时包含 result/error")
+        }
+    } else if object.get("id").is_none() || has_result == has_error {
+        bail!("SDK MCP response 必须包含 id 且只能包含 result/error 之一")
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl McpRpc for SdkControlRpc {
+    async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_with_timeout(method, params, self.request_timeout)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        request_timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut message = json!({"jsonrpc":"2.0", "id":id, "method":method});
+        if let Some(params) = params {
+            message["params"] = params;
+        }
+        let response = self.exchange(message, request_timeout).await?;
+        if response.get("id") != Some(&Value::from(id)) {
+            bail!("SDK MCP response id 不匹配")
+        }
+        parse_rpc_result(&response)
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let mut message = json!({"jsonrpc":"2.0", "method":method});
+        if let Some(params) = params {
+            message["params"] = params;
+        }
+        let _ = self.exchange(message, self.request_timeout).await?;
+        Ok(())
+    }
+
+    async fn ingest(&self, message: Value) -> Result<()> {
+        validate_sdk_jsonrpc_message(&message)?;
+        if serde_json::to_vec(&message)?.len() > MAX_SDK_MCP_MESSAGE_BYTES {
+            bail!("SDK MCP message 超过 {MAX_SDK_MCP_MESSAGE_BYTES} 字节限制")
+        }
+        let method = message.get("method").and_then(Value::as_str);
+        let id = message.get("id").cloned();
+        match (method, id) {
+            (Some(method), Some(id)) => {
+                let response = self
+                    .request_handler
+                    .result(method, message.get("params"))
+                    .map_or_else(
+                        || {
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{"code":-32601,"message":"Client method not supported"}
+                            })
+                        },
+                        |result| json!({"jsonrpc":"2.0", "id":id, "result":result}),
+                    );
+                let _ = self.exchange(response, self.request_timeout).await?;
+            }
+            _ => {
+                let _ = self.events.send(message);
+            }
+        }
+        Ok(())
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Value> {
+        self.events.subscribe()
+    }
+
+    async fn set_protocol_version(&self, _: &str) {}
+
+    async fn start_notifications(&self) {}
+
+    async fn diagnostic_excerpt(&self) -> String {
+        String::new()
+    }
+
+    async fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
 }
 
 #[async_trait]
@@ -468,8 +695,18 @@ struct McpManager {
     resource_handles: Arc<Mutex<ResourceHandleStore>>,
     server_states: Arc<McpServerStates>,
     connection_task: Mutex<Option<JoinHandle<()>>>,
+    static_names: HashSet<String>,
+    dynamic_layers: StdRwLock<BTreeMap<String, BTreeMap<String, Value>>>,
+    base_settings: Settings,
+    workspace: PathBuf,
+    sdk_control: Option<ControlHandle>,
     strict: bool,
     debug: bool,
+}
+
+struct ParsedDynamicConfigs {
+    configs: HashMap<String, ServerConfig>,
+    disabled: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,6 +779,53 @@ impl McpServerStates {
             let next = (*self.generation.borrow()).wrapping_add(1);
             self.generation.send_replace(next);
         }
+    }
+
+    fn upsert(&self, name: String, kind: McpServerStateKind) {
+        let changed = {
+            let mut values = self
+                .values
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(state) = values
+                .iter_mut()
+                .find(|state| state.name.eq_ignore_ascii_case(&name))
+            {
+                if state.kind == kind && state.name == name {
+                    false
+                } else {
+                    state.name = name;
+                    state.kind = kind;
+                    true
+                }
+            } else {
+                values.push(McpServerState { name, kind });
+                true
+            }
+        };
+        if changed {
+            let next = (*self.generation.borrow()).wrapping_add(1);
+            self.generation.send_replace(next);
+        }
+    }
+
+    fn remove(&self, name: &str) -> bool {
+        let changed = {
+            let mut values = self
+                .values
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            values
+                .iter()
+                .position(|state| state.name.eq_ignore_ascii_case(name))
+                .map(|index| values.remove(index))
+                .is_some()
+        };
+        if changed {
+            let next = (*self.generation.borrow()).wrapping_add(1);
+            self.generation.send_replace(next);
+        }
+        changed
     }
 
     fn get(&self, name: &str) -> Option<McpServerState> {
@@ -689,11 +973,61 @@ pub async fn connect_mcp(
     workspace: &Path,
     debug: bool,
 ) -> Result<Option<McpIntegration>> {
+    connect_mcp_inner(settings, workspace, debug, None, BTreeMap::new(), false).await
+}
+
+pub async fn connect_mcp_with_control(
+    settings: &Settings,
+    workspace: &Path,
+    debug: bool,
+    control: ControlHandle,
+) -> Result<Option<McpIntegration>> {
+    connect_mcp_inner(
+        settings,
+        workspace,
+        debug,
+        Some(control),
+        BTreeMap::new(),
+        true,
+    )
+    .await
+}
+
+pub async fn connect_mcp_with_runtime_layers(
+    settings: &Settings,
+    workspace: &Path,
+    debug: bool,
+    sdk_control: Option<ControlHandle>,
+    plugin_servers: BTreeMap<String, Value>,
+) -> Result<Option<McpIntegration>> {
+    // The main runtime keeps an empty manager registered so a trusted plugin
+    // reload or stream-json control request can add the first server without
+    // rebuilding the tool registry.
+    let allow_empty = true;
+    connect_mcp_inner(
+        settings,
+        workspace,
+        debug,
+        sdk_control,
+        plugin_servers,
+        allow_empty,
+    )
+    .await
+}
+
+async fn connect_mcp_inner(
+    settings: &Settings,
+    workspace: &Path,
+    debug: bool,
+    sdk_control: Option<ControlHandle>,
+    plugin_servers: BTreeMap<String, Value>,
+    allow_empty: bool,
+) -> Result<Option<McpIntegration>> {
     let configured_states = configured_server_states(settings)?;
-    if configured_states.is_empty() {
+    if configured_states.is_empty() && !allow_empty {
         return Ok(None);
     }
-    let all_configs = parse_server_configs(settings, workspace)?;
+    let all_configs = parse_server_configs_with_control(settings, workspace, sdk_control.as_ref())?;
     let reconnect_configs = all_configs
         .iter()
         .map(|config| (config.name.to_ascii_lowercase(), config.clone()))
@@ -707,13 +1041,32 @@ pub async fn connect_mcp(
         .into_iter()
         .filter(|config| !disabled_names.contains(&config.name.to_ascii_lowercase()))
         .collect::<Vec<_>>();
-    let has_configured_servers = !configured_states.is_empty();
+    let has_configured_servers = !configured_states.is_empty() || allow_empty;
     let strict = settings
         .raw
         .get("strictMcpConfig")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let server_states = Arc::new(McpServerStates::new(configured_states));
+    let plugin_names = plugin_servers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let static_names = server_states
+        .status()
+        .into_iter()
+        .map(|state| state.name.to_ascii_lowercase())
+        .filter(|name| !plugin_names.contains(name))
+        .collect::<HashSet<_>>();
+    for name in &plugin_names {
+        if server_states.get(name).is_none() {
+            bail!("plugin MCP layer 包含未合并到有效 settings 的 server: {name}")
+        }
+    }
+    let mut dynamic_layers = BTreeMap::new();
+    if !plugin_servers.is_empty() {
+        dynamic_layers.insert("plugins".to_owned(), plugin_servers);
+    }
     let mut clients = Vec::new();
     let mut background_configs = configs;
     if strict {
@@ -757,6 +1110,11 @@ pub async fn connect_mcp(
         resource_handles: Arc::new(Mutex::new(ResourceHandleStore::default())),
         server_states,
         connection_task: Mutex::new(None),
+        static_names,
+        dynamic_layers: StdRwLock::new(dynamic_layers),
+        base_settings: settings.clone(),
+        workspace: workspace.to_owned(),
+        sdk_control,
         strict,
         debug,
     });
@@ -855,7 +1213,7 @@ fn server_config_uses_auth(config: &ServerConfig) -> bool {
     match &config.transport {
         ServerTransport::Http { credential, .. }
         | ServerTransport::WebSocket { credential, .. } => credential.is_some(),
-        ServerTransport::Stdio { .. } => false,
+        ServerTransport::Stdio { .. } | ServerTransport::Sdk { .. } => false,
     }
 }
 
@@ -880,7 +1238,11 @@ fn classify_connection_failure(error: &anyhow::Error, auth_configured: bool) -> 
     }
 }
 
-fn parse_server_configs(settings: &Settings, workspace: &Path) -> Result<Vec<ServerConfig>> {
+fn parse_server_configs_with_control(
+    settings: &Settings,
+    workspace: &Path,
+    sdk_control: Option<&ControlHandle>,
+) -> Result<Vec<ServerConfig>> {
     let secret_env_scrubber = SecretEnvScrubber::from_settings(settings)?;
     let Some(raw_servers) = settings.raw.get("mcpServers") else {
         return Ok(Vec::new());
@@ -906,6 +1268,8 @@ fn parse_server_configs(settings: &Settings, workspace: &Path) -> Result<Vec<Ser
         if !namespaces.insert(namespace.clone()) {
             bail!("MCP server 名称规范化后冲突: {name}")
         }
+        let sdk_transport = raw.transport_type.as_deref() == Some("sdk");
+        let sdk_name = raw.name.clone();
         let transport = match (raw.command, raw.url) {
             (Some(command), None) => {
                 if raw
@@ -1020,7 +1384,27 @@ fn parse_server_configs(settings: &Settings, workspace: &Path) -> Result<Vec<Ser
                     }
                 }
             }
-            _ => bail!("MCP server {name} 必须且只能配置 command 或 url 之一"),
+            (None, None) if sdk_transport => {
+                if sdk_name.as_deref() != Some(name.as_str()) {
+                    bail!("SDK MCP server {name} 的 name 必须与配置键一致")
+                }
+                if !raw.args.is_empty()
+                    || !raw.env.is_empty()
+                    || raw.cwd.is_some()
+                    || !raw.headers.is_empty()
+                    || raw.allow_private_network
+                    || !raw.roots.is_empty()
+                    || raw.auth.is_some()
+                {
+                    bail!("SDK MCP server {name} 不接受 process/network 配置字段")
+                }
+                ServerTransport::Sdk {
+                    control: sdk_control
+                        .cloned()
+                        .context("SDK MCP server 仅可用于 stream-json control session")?,
+                }
+            }
+            _ => bail!("MCP server {name} 必须且只能配置 command、url 或 type=sdk 之一"),
         };
         let timeout_ms = raw
             .timeout_ms
@@ -3161,6 +3545,12 @@ impl McpClient {
                 })
                 .await?,
             ),
+            ServerTransport::Sdk { control } => Arc::new(SdkControlRpc::new(
+                config.name.clone(),
+                control.clone(),
+                config.request_timeout,
+                request_handler.clone(),
+            )),
         };
         let initialize = match rpc
             .request(
@@ -4755,6 +5145,217 @@ impl McpManager {
             .map(|index| clients.remove(index))
     }
 
+    fn parse_dynamic_configs(
+        &self,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<ParsedDynamicConfigs> {
+        if servers.len().saturating_add(self.static_names.len()) > MAX_SERVERS {
+            bail!("静态与动态 MCP server 总数超过 {MAX_SERVERS} 个限制")
+        }
+        let mut normalized = HashSet::new();
+        let mut disabled = HashSet::new();
+        for (name, value) in servers {
+            let key = name.to_ascii_lowercase();
+            if !normalized.insert(key.clone()) {
+                bail!("动态 MCP server 名称大小写归一后冲突: {name}")
+            }
+            if self.static_names.contains(&key) {
+                bail!("动态 MCP server 不得覆盖启动配置: {name}")
+            }
+            if value.get("disabled").and_then(Value::as_bool) == Some(true) {
+                disabled.insert(key);
+            }
+        }
+        let mut raw = self.base_settings.raw.clone();
+        let object = raw
+            .as_object_mut()
+            .context("内部 MCP settings root 不是 object")?;
+        object.insert("mcpServers".to_owned(), Value::Object(servers.clone()));
+        let settings = Settings { raw };
+        let configs = parse_server_configs_with_control(
+            &settings,
+            &self.workspace,
+            self.sdk_control.as_ref(),
+        )?
+        .into_iter()
+        .map(|config| (config.name.to_ascii_lowercase(), config))
+        .collect::<HashMap<_, _>>();
+        Ok(ParsedDynamicConfigs { configs, disabled })
+    }
+
+    async fn replace_server_layer_impl(
+        &self,
+        layer: &str,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<McpServerChangeReport> {
+        let _transition = self.reconnect_lock.lock().await;
+        let current_layers = self
+            .dynamic_layers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut desired_layers = current_layers.clone();
+        if servers.is_empty() {
+            desired_layers.remove(layer);
+        } else {
+            desired_layers.insert(
+                layer.to_owned(),
+                servers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            );
+        }
+        let flatten = |layers: &BTreeMap<String, BTreeMap<String, Value>>| -> Result<_> {
+            let mut combined = BTreeMap::<String, Value>::new();
+            let mut owners = HashMap::<String, String>::new();
+            for (owner, specs) in layers {
+                for (name, value) in specs {
+                    let key = name.to_ascii_lowercase();
+                    if let Some(previous) = owners.insert(key, owner.clone()) {
+                        bail!("MCP server {name} 同时由动态层 {previous} 与 {owner} 声明")
+                    }
+                    combined.insert(name.clone(), value.clone());
+                }
+            }
+            Ok(combined)
+        };
+        let current_specs = flatten(&current_layers)?;
+        let desired_specs = flatten(&desired_layers)?;
+        let desired_object = desired_specs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let ParsedDynamicConfigs {
+            configs: mut desired_configs,
+            disabled,
+        } = self.parse_dynamic_configs(&desired_object)?;
+        let current_by_key = current_specs
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (name.clone(), value.clone())))
+            .collect::<HashMap<_, _>>();
+        let desired_by_key = desired_specs
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (name.clone(), value.clone())))
+            .collect::<HashMap<_, _>>();
+        let removed_keys = current_by_key
+            .keys()
+            .filter(|key| !desired_by_key.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let replaced_keys = current_by_key
+            .iter()
+            .filter_map(|(key, (_, current))| {
+                desired_by_key
+                    .get(key)
+                    .filter(|(_, desired)| desired != current)
+                    .map(|_| key.clone())
+            })
+            .collect::<Vec<_>>();
+        let added_keys = desired_by_key
+            .keys()
+            .filter(|key| !current_by_key.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut report = McpServerChangeReport::default();
+        for key in removed_keys.iter().chain(&replaced_keys) {
+            let (name, _) = current_by_key
+                .get(key)
+                .expect("change key came from current dynamic specs");
+            if let Some(client) = self.remove_connected_client(name) {
+                client.shutdown().await;
+            }
+            self.resource_handles.lock().await.remove_server(name);
+            self.reconnect_configs
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(key);
+            self.server_states.remove(name);
+            if removed_keys.contains(key) {
+                report.removed.push(name.clone());
+            }
+        }
+
+        let changed_keys = added_keys
+            .iter()
+            .chain(&replaced_keys)
+            .cloned()
+            .collect::<HashSet<_>>();
+        for key in &changed_keys {
+            let (name, _) = desired_by_key
+                .get(key)
+                .expect("change key came from desired dynamic specs");
+            let config = desired_configs
+                .remove(key)
+                .expect("validated dynamic config is missing");
+            self.reconnect_configs
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key.clone(), config.clone());
+            if disabled.contains(key) {
+                self.server_states
+                    .upsert(name.clone(), McpServerStateKind::Disabled);
+            } else {
+                self.server_states
+                    .upsert(name.clone(), McpServerStateKind::Pending);
+            }
+            report.added.push(name.clone());
+            if disabled.contains(key) || matches!(config.transport, ServerTransport::Sdk { .. }) {
+                continue;
+            }
+            let state = self
+                .server_states
+                .get(name)
+                .expect("new dynamic MCP state is missing");
+            if let Err(error) = self.connect_configured(state, config, "dynamic add").await {
+                report.errors.insert(
+                    name.clone(),
+                    crate::session::sanitize_transport_text(&format!("{error:#}"), &self.workspace),
+                );
+            }
+        }
+        report.added.sort();
+        report.removed.sort();
+        *self
+            .dynamic_layers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_layers;
+        Ok(report)
+    }
+
+    async fn connect_pending_sdk_servers_impl(&self) -> Result<()> {
+        let _transition = self.reconnect_lock.lock().await;
+        let configs = self
+            .reconnect_configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|config| matches!(config.transport, ServerTransport::Sdk { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for config in configs {
+            let Some(state) = self.server_states.get(&config.name) else {
+                continue;
+            };
+            if state.kind != McpServerStateKind::Pending {
+                continue;
+            }
+            if let Err(error) = self.connect_configured(state, config, "SDK connect").await {
+                failures.push(crate::session::sanitize_transport_text(
+                    &format!("{error:#}"),
+                    &self.workspace,
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", failures.join("; "))
+        }
+    }
+
     fn configured_server(&self, server: &str) -> Result<(McpServerState, ServerConfig)> {
         if server.is_empty()
             || server.len() > MAX_SERVER_NAME_BYTES
@@ -5128,6 +5729,44 @@ impl McpControl for McpManager {
             previous.shutdown().await;
         }
         Ok(())
+    }
+
+    async fn replace_dynamic_servers(
+        &self,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<McpServerChangeReport> {
+        self.replace_server_layer_impl("control", servers).await
+    }
+
+    async fn replace_flag_servers(
+        &self,
+        servers: &serde_json::Map<String, Value>,
+    ) -> Result<McpServerChangeReport> {
+        self.replace_server_layer_impl("flags", servers).await
+    }
+
+    async fn replace_plugin_servers(
+        &self,
+        servers: &BTreeMap<String, Value>,
+    ) -> Result<McpServerChangeReport> {
+        let servers = servers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        self.replace_server_layer_impl("plugins", &servers).await
+    }
+
+    async fn connect_pending_sdk_servers(&self) -> Result<()> {
+        self.connect_pending_sdk_servers_impl().await
+    }
+
+    async fn deliver_sdk_message(&self, server: &str, message: Value) -> Result<()> {
+        let client = self
+            .clients_snapshot()
+            .into_iter()
+            .find(|client| client.name.eq_ignore_ascii_case(server))
+            .with_context(|| format!("SDK MCP server {server:?} 未连接"))?;
+        client.rpc.ingest(message).await
     }
 
     async fn list_prompts(&self, context: &ToolContext) -> Result<Value> {
@@ -5930,6 +6569,11 @@ done
                 kind: state,
             }])),
             connection_task: Mutex::new(None),
+            static_names: HashSet::from(["configured".to_owned()]),
+            dynamic_layers: StdRwLock::new(BTreeMap::new()),
+            base_settings: Settings::default(),
+            workspace: std::env::current_dir().unwrap(),
+            sdk_control: None,
             strict: true,
             debug: false,
         }
@@ -6505,6 +7149,202 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn dynamic_server_replacement_is_in_memory_transactional_and_refreshable() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_script = temp.path().join("dynamic-one.sh");
+        let second_script = temp.path().join("dynamic-two.sh");
+        let counter = temp.path().join("starts.txt");
+        write_toggle_test_server(&first_script);
+        write_toggle_test_server(&second_script);
+        let session = crate::control::ControlSession::with_io(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Vec::<u8>::new(),
+        );
+        let integration =
+            connect_mcp_with_control(&Settings::default(), temp.path(), false, session.handle())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let first = serde_json::Map::from_iter([(
+            "Dynamic".to_owned(),
+            json!({
+                "command":"/bin/sh",
+                "args":[first_script],
+                "env":{"MCP_TEST_COUNTER":counter},
+            }),
+        )]);
+        let added = integration
+            .control
+            .replace_dynamic_servers(&first)
+            .await
+            .unwrap();
+        assert_eq!(added.added, ["Dynamic"]);
+        assert!(added.removed.is_empty());
+        assert!(added.errors.is_empty());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        let refresh = integration.discovery.refresh().await.unwrap();
+        assert!(
+            refresh
+                .upsert
+                .iter()
+                .any(|tool| tool.name() == "mcp__dynamic__echo")
+        );
+
+        let invalid =
+            serde_json::Map::from_iter([("Dynamic".to_owned(), json!({"command":"", "args":[]}))]);
+        assert!(
+            integration
+                .control
+                .replace_dynamic_servers(&invalid)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        assert_eq!(integration.control.status()[0].name, "Dynamic");
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Connected
+        );
+        let unchanged = integration.discovery.refresh().await.unwrap();
+        assert!(unchanged.remove.is_empty());
+
+        let replacement = serde_json::Map::from_iter([(
+            "Dynamic".to_owned(),
+            json!({
+                "command":"/bin/sh",
+                "args":[second_script],
+                "env":{"MCP_TEST_COUNTER":counter},
+            }),
+        )]);
+        let replaced = integration
+            .control
+            .replace_dynamic_servers(&replacement)
+            .await
+            .unwrap();
+        assert_eq!(replaced.added, ["Dynamic"]);
+        assert!(replaced.removed.is_empty());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "xx");
+
+        let removed = integration
+            .control
+            .replace_dynamic_servers(&serde_json::Map::new())
+            .await
+            .unwrap();
+        assert!(removed.added.is_empty());
+        assert_eq!(removed.removed, ["Dynamic"]);
+        let refresh = integration.discovery.refresh().await.unwrap();
+        assert_eq!(refresh.remove, ["mcp__dynamic__echo"]);
+        assert!(integration.control.status().is_empty());
+        integration.service.shutdown().await;
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_mcp_transport_round_trips_through_bounded_control_requests() {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (harness_stream, sdk_stream) = UnixStream::pair().unwrap();
+        let session = crate::control::ControlSession::with_io(
+            harness_stream.try_clone().unwrap(),
+            harness_stream,
+        );
+        let peer = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(sdk_stream.try_clone().unwrap());
+            let mut writer = sdk_stream;
+            for _ in 0..3 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["type"], "control_request");
+                assert_eq!(request["request"]["subtype"], "mcp_message");
+                assert_eq!(request["request"]["server_name"], "SdkTools");
+                let message = &request["request"]["message"];
+                let method = message["method"].as_str().unwrap();
+                let mcp_response = match method {
+                    "initialize" => json!({
+                        "jsonrpc":"2.0",
+                        "id":message["id"],
+                        "result":{
+                            "protocolVersion":"2025-11-25",
+                            "capabilities":{"tools":{}},
+                            "serverInfo":{"name":"sdk-tools","version":"1"}
+                        }
+                    }),
+                    "tools/list" => json!({
+                        "jsonrpc":"2.0",
+                        "id":message["id"],
+                        "result":{"tools":[{
+                            "name":"echo",
+                            "description":"Echo",
+                            "inputSchema":{"type":"object","additionalProperties":false}
+                        }]}
+                    }),
+                    "notifications/initialized" => {
+                        json!({"jsonrpc":"2.0", "method":"notifications/ack"})
+                    }
+                    other => panic!("unexpected SDK MCP method: {other}"),
+                };
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({
+                        "type":"control_response",
+                        "response":{
+                            "subtype":"success",
+                            "request_id":request["request_id"],
+                            "response":{"mcp_response":mcp_response}
+                        }
+                    })
+                )
+                .unwrap();
+                writer.flush().unwrap();
+            }
+        });
+        let integration =
+            connect_mcp_with_control(&Settings::default(), temp.path(), false, session.handle())
+                .await
+                .unwrap()
+                .unwrap();
+        let servers = serde_json::Map::from_iter([(
+            "SdkTools".to_owned(),
+            json!({"type":"sdk", "name":"SdkTools", "timeoutMs":1000}),
+        )]);
+        let report = integration
+            .control
+            .replace_dynamic_servers(&servers)
+            .await
+            .unwrap();
+        assert_eq!(report.added, ["SdkTools"]);
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Pending
+        );
+        integration
+            .control
+            .connect_pending_sdk_servers()
+            .await
+            .unwrap();
+        assert_eq!(
+            integration.control.status()[0].status,
+            McpServerStatusKind::Connected
+        );
+        let refresh = integration.discovery.refresh().await.unwrap();
+        assert!(
+            refresh
+                .upsert
+                .iter()
+                .any(|tool| tool.name() == "mcp__sdktools__echo")
+        );
+        peer.join().unwrap();
+        integration.service.shutdown().await;
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn concurrent_enable_calls_connect_a_disabled_server_once() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("concurrent-toggle-mcp.sh");
@@ -6583,7 +7423,7 @@ done
                 }
             }),
         };
-        let configs = parse_server_configs(&settings, temp.path()).unwrap();
+        let configs = parse_server_configs_with_control(&settings, temp.path(), None).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].namespace, "local_server");
         assert_eq!(configs[0].roots.len(), 1);
@@ -6604,7 +7444,7 @@ done
                 "url": format!("https://mcp.example.invalid/rpc?access_token={configured_secret}")
             }}}),
         };
-        let error = parse_server_configs(&settings, temp.path()).unwrap_err();
+        let error = parse_server_configs_with_control(&settings, temp.path(), None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains("请改用 headers"));
         assert!(!rendered.contains(configured_secret));
@@ -6621,7 +7461,7 @@ done
                 "elicitationTimeoutMs":2500
             }}}),
         };
-        let configs = parse_server_configs(&settings, temp.path()).unwrap();
+        let configs = parse_server_configs_with_control(&settings, temp.path(), None).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].elicitation_timeout, Duration::from_millis(2500));
         match &configs[0].transport {
@@ -6647,7 +7487,7 @@ done
                 "headers":{"X-Workspace":"trusted"}
             }}}),
         };
-        let configs = parse_server_configs(&websocket, temp.path()).unwrap();
+        let configs = parse_server_configs_with_control(&websocket, temp.path(), None).unwrap();
         assert!(matches!(
             &configs[0].transport,
             ServerTransport::WebSocket {
@@ -6672,7 +7512,7 @@ done
                 }
             }}}),
         };
-        let configs = parse_server_configs(&oauth, temp.path()).unwrap();
+        let configs = parse_server_configs_with_control(&oauth, temp.path(), None).unwrap();
         assert!(matches!(
             &configs[0].transport,
             ServerTransport::Http {
@@ -6696,7 +7536,7 @@ done
             }}}),
         };
         assert!(
-            parse_server_configs(&websocket_oauth, temp.path())
+            parse_server_configs_with_control(&websocket_oauth, temp.path(), None)
                 .unwrap_err()
                 .to_string()
                 .contains("仅适用于 HTTP/SSE")

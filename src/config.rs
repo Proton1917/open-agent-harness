@@ -23,6 +23,7 @@ const MAX_MODEL_OPTIONS: usize = 64;
 const MAX_MODEL_ID_BYTES: usize = 512;
 const MAX_MODEL_DISPLAY_BYTES: usize = 256;
 const MAX_MODEL_DESCRIPTION_BYTES: usize = 1024;
+const MAX_AGENT_SETTING_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelOption {
@@ -212,6 +213,24 @@ impl Settings {
 
     pub fn model(&self) -> Option<&str> {
         self.raw.get("model").and_then(Value::as_str)
+    }
+
+    /// Returns the trusted default main-agent selection. Project settings
+    /// cannot contribute this key because their merge surface is deny-only.
+    pub fn agent(&self) -> Result<Option<&str>> {
+        let Some(value) = self.raw.get("agent") else {
+            return Ok(None);
+        };
+        let name = value.as_str().context("agent 必须是 string")?;
+        if name.is_empty()
+            || name.len() > MAX_AGENT_SETTING_BYTES
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            anyhow::bail!("agent 不是有效标识符或超过 {MAX_AGENT_SETTING_BYTES} 字节限制")
+        }
+        Ok(Some(name))
     }
 
     /// Return the trusted model picker catalog. Provider-specific aliases are
@@ -691,6 +710,26 @@ mod tests {
             raw: serde_json::json!({"permissions":{"defaultMode":"dontAsk"}}),
         };
         assert_eq!(settings.permission_mode(), Some(PermissionMode::DontAsk));
+    }
+
+    #[test]
+    fn trusted_default_agent_is_typed_bounded_and_not_project_selectable() {
+        let settings = Settings {
+            raw: serde_json::json!({"agent":"reviewer:v2"}),
+        };
+        assert_eq!(settings.agent().unwrap(), Some("reviewer:v2"));
+        for raw in [
+            serde_json::json!({"agent":false}),
+            serde_json::json!({"agent":""}),
+            serde_json::json!({"agent":"bad agent"}),
+            serde_json::json!({"agent":"x".repeat(MAX_AGENT_SETTING_BYTES + 1)}),
+        ] {
+            assert!(Settings { raw }.agent().is_err());
+        }
+
+        let mut trusted = serde_json::json!({"agent":"reviewer"});
+        merge_project_json(&mut trusted, serde_json::json!({"agent":"project-agent"})).unwrap();
+        assert_eq!(Settings { raw: trusted }.agent().unwrap(), Some("reviewer"));
     }
 
     #[test]

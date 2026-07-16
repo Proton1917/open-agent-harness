@@ -29,6 +29,7 @@ const MAX_SESSION_LIST_RESULTS: usize = 100;
 const MAX_SESSION_METADATA_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_TITLE_BYTES: usize = 512;
 const MAX_SESSION_TAG_BYTES: usize = 128;
+const MAX_SESSION_AGENT_SETTING_BYTES: usize = 64;
 const SESSION_COLORS: &[&str] = &[
     "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
 ];
@@ -66,6 +67,8 @@ struct SessionMetadata {
     color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_setting: Option<String>,
 }
 
 impl SessionMetadata {
@@ -77,6 +80,7 @@ impl SessionMetadata {
             parent_session_id: None,
             color: None,
             tag: None,
+            agent_setting: None,
         }
     }
 }
@@ -615,6 +619,7 @@ impl SessionStore {
             if let Some(source) = read_session_metadata(&self.file, self.id)? {
                 metadata.color = source.color;
                 metadata.tag = source.tag;
+                metadata.agent_setting = source.agent_setting;
             }
             if let Err(error) = write_session_metadata(&destination.file, &metadata) {
                 let _ = fs::remove_file(&destination.file);
@@ -644,6 +649,28 @@ impl SessionStore {
             return Ok(None);
         }
         Ok(read_session_metadata(&self.file, self.id)?.and_then(|metadata| metadata.title))
+    }
+
+    pub fn agent_setting(&self) -> Result<Option<String>> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(read_session_metadata(&self.file, self.id)?.and_then(|metadata| metadata.agent_setting))
+    }
+
+    pub fn set_agent_setting(&self, agent: Option<&str>) -> Result<()> {
+        if !self.enabled || self.file.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let agent = agent.map(validate_session_agent_setting).transpose()?;
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metadata = read_session_metadata(&self.file, self.id)?
+            .unwrap_or_else(|| SessionMetadata::new(self.id));
+        metadata.agent_setting = agent;
+        write_session_metadata(&self.file, &metadata)
     }
 
     pub fn color(&self) -> Result<Option<String>> {
@@ -1550,6 +1577,20 @@ fn validate_session_tag(tag: &str, cwd: &Path) -> Result<String> {
     Ok(tag.to_owned())
 }
 
+fn validate_session_agent_setting(agent: &str) -> Result<String> {
+    if agent.is_empty()
+        || agent.len() > MAX_SESSION_AGENT_SETTING_BYTES
+        || !agent
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        bail!(
+            "session agent setting 不是有效标识符或超过 {MAX_SESSION_AGENT_SETTING_BYTES} 字节限制"
+        )
+    }
+    Ok(agent.to_owned())
+}
+
 fn validate_session_metadata(metadata: &SessionMetadata, expected_id: Uuid) -> Result<()> {
     if metadata.version != SESSION_METADATA_VERSION || metadata.session_id != expected_id {
         bail!("session metadata 版本或 session id 不匹配")
@@ -1570,6 +1611,11 @@ fn validate_session_metadata(metadata: &SessionMetadata, expected_id: Uuid) -> R
     if let Some(tag) = &metadata.tag {
         if validate_session_tag(tag, Path::new("<session-metadata>"))? != *tag {
             bail!("session metadata 标签无效")
+        }
+    }
+    if let Some(agent) = &metadata.agent_setting {
+        if validate_session_agent_setting(agent)? != *agent {
+            bail!("session metadata agent setting 无效")
         }
     }
     Ok(())
@@ -1996,6 +2042,7 @@ mod tests {
         );
         store.append(&[Message::user_text("hello")]).unwrap();
         store.rename("  会话标题  ").unwrap();
+        store.set_agent_setting(Some("reviewer:v2")).unwrap();
         assert_eq!(
             store.toggle_tag("#terminal-fix").unwrap().as_deref(),
             Some("terminal-fix")
@@ -2006,6 +2053,11 @@ mod tests {
         assert_eq!(metadata.title.as_deref(), Some("会话标题"));
         assert_eq!(metadata.parent_session_id, None);
         assert_eq!(metadata.tag.as_deref(), Some("terminal-fix"));
+        assert_eq!(metadata.agent_setting.as_deref(), Some("reviewer:v2"));
+        assert_eq!(
+            store.agent_setting().unwrap().as_deref(),
+            Some("reviewer:v2")
+        );
         assert!(
             !fs::read_to_string(&metadata_path)
                 .unwrap()
@@ -2028,6 +2080,11 @@ mod tests {
         assert_eq!(fork_metadata.title.as_deref(), Some("Branch α"));
         assert_eq!(fork_metadata.parent_session_id, Some(id));
         assert_eq!(fork_metadata.tag.as_deref(), Some("terminal-fix"));
+        assert_eq!(fork_metadata.agent_setting.as_deref(), Some("reviewer:v2"));
+        assert_eq!(
+            fork.agent_setting().unwrap().as_deref(),
+            Some("reviewer:v2")
+        );
 
         let listed = SessionStore::list_from_directory(directory.path().to_owned(), 10).unwrap();
         let source_summary = listed.iter().find(|summary| summary.id == id).unwrap();
@@ -2039,6 +2096,9 @@ mod tests {
         assert_eq!(fork_summary.parent_session_id, Some(id));
         assert_eq!(fork_summary.tag.as_deref(), Some("terminal-fix"));
         assert_eq!(store.toggle_tag("terminal-fix").unwrap(), None);
+        assert!(store.set_agent_setting(Some("bad agent")).is_err());
+        store.set_agent_setting(None).unwrap();
+        assert_eq!(store.agent_setting().unwrap(), None);
         assert!(
             !directory
                 .path()

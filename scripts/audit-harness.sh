@@ -35,7 +35,7 @@ scan_paths=(
   "$root/MIGRATION.md"
 )
 
-non_rust_runtime="$(find "$root/src" -type f ! -name '*.rs' -print -quit)"
+non_rust_runtime="$(find "$root/src" -type f ! -name '*.rs' ! -name '.DS_Store' -print -quit)"
 if [[ -n "$non_rust_runtime" ]]; then
   printf 'non_rust_runtime_file=%s\n' "$non_rust_runtime" >&2
   exit 1
@@ -103,8 +103,10 @@ if [[ ! -x "$release_binary" ]]; then
   echo 'release_binary_present=false' >&2
   exit 1
 fi
-if find "$root/Cargo.toml" "$root/Cargo.lock" "$root/src" -newer "$release_binary" -print -quit \
-  | rg -q .; then
+if {
+  find "$root/Cargo.toml" "$root/Cargo.lock" -newer "$release_binary" -print
+  find "$root/src" -type f -name '*.rs' -newer "$release_binary" -print
+} | rg -q .; then
   echo 'release_binary_current=false' >&2
   exit 1
 fi
@@ -121,7 +123,9 @@ for term in "${removed_terms[@]}"; do
       ':(exclude)README.md' \
       ':(exclude)CONTRIBUTING.md' \
       ':(exclude)docs/MIGRATION_COVERAGE.tsv' \
-      ':(exclude)docs/MIGRATION_FAMILY_INVENTORY.tsv' || true
+      ':(exclude)docs/MIGRATION_FAMILY_INVENTORY.tsv' \
+      ':(exclude)docs/MIGRATION_PROTOCOL_INVENTORY.tsv' \
+      ':(exclude)docs/MIGRATION_SURFACE_INVENTORY.tsv' || true
   )"
   if [[ -n "$tracked_brand_hits" ]]; then
     printf 'brand_text_outside_documented_exceptions=%s\n' "$tracked_brand_hits" >&2

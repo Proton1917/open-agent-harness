@@ -49,7 +49,7 @@ use crate::interactions::{
     InteractionWaitGuard, InteractionWaitObserver, UserInteractionHandler, UserInteractionRequest,
 };
 use crate::monitor::{MonitorNotificationCheckpoint, MonitorService, MonitorTool};
-use crate::permissions::{PermissionDecision, PermissionManager, PermissionTarget};
+use crate::permissions::{PermissionDecision, PermissionManager, PermissionMode, PermissionTarget};
 use crate::plugins::PluginMonitorDefinition;
 use crate::process::SecretEnvScrubber;
 use crate::sandbox::SandboxRuntime;
@@ -376,7 +376,7 @@ pub struct ToolContext {
     current_cwd_state_recorder: Arc<RwLock<Option<CurrentCwdStateRecorder>>>,
     cron: CronService,
     monitor: MonitorService,
-    secret_env_scrubber: SecretEnvScrubber,
+    secret_env_scrubber: Arc<RwLock<SecretEnvScrubber>>,
 }
 
 #[derive(Debug, Clone)]
@@ -597,25 +597,47 @@ impl ToolContext {
             current_cwd_state_recorder: Arc::new(RwLock::new(None)),
             cron: CronService::for_workspace(&workspace_root),
             monitor: MonitorService::default(),
-            secret_env_scrubber: SecretEnvScrubber::default(),
+            secret_env_scrubber: Arc::new(RwLock::new(SecretEnvScrubber::default())),
         }
     }
 
-    pub(crate) fn set_secret_env_scrubber(&mut self, scrubber: SecretEnvScrubber) {
-        self.secret_env_scrubber = scrubber;
+    pub(crate) fn set_secret_env_scrubber(&self, scrubber: SecretEnvScrubber) {
+        *self
+            .secret_env_scrubber
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = scrubber;
     }
 
-    pub fn configure_secret_env_scrubber(&mut self, settings: &Settings) -> Result<()> {
+    pub fn configure_secret_env_scrubber(&self, settings: &Settings) -> Result<()> {
         self.set_secret_env_scrubber(SecretEnvScrubber::from_settings(settings)?);
         Ok(())
     }
 
+    /// Extend the process-wide child credential deny set after a trusted
+    /// runtime MCP/plugin topology update. Names are never removed during the
+    /// process, so an old credential cannot become inheritable after reload.
+    pub fn extend_secret_env_scrubber(&self, settings: &Settings) -> Result<()> {
+        let additional = SecretEnvScrubber::from_settings(settings)?;
+        let mut scrubber = self
+            .secret_env_scrubber
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *scrubber = scrubber.merged(&additional)?;
+        Ok(())
+    }
+
     pub(crate) fn scrub_child_environment(&self, command: &mut tokio::process::Command) {
-        self.secret_env_scrubber.scrub_tokio(command);
+        self.secret_env_scrubber
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scrub_tokio(command);
     }
 
     pub(crate) fn secret_env_scrubber(&self) -> SecretEnvScrubber {
-        self.secret_env_scrubber.clone()
+        self.secret_env_scrubber
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn monitor_service(&self) -> MonitorService {
@@ -2736,7 +2758,8 @@ impl ToolContext {
         &self.agent_tool_policy
     }
 
-    pub(crate) fn set_agent_tool_policy(&mut self, policy: AgentToolPolicy) {
+    #[doc(hidden)]
+    pub fn set_agent_tool_policy(&mut self, policy: AgentToolPolicy) {
         self.agent_tool_policy = policy;
     }
 
@@ -2892,8 +2915,13 @@ impl ToolContext {
             current_cwd_state_recorder: Arc::new(RwLock::new(None)),
             cron: self.cron.clone(),
             monitor: self.monitor.clone(),
-            secret_env_scrubber: self.secret_env_scrubber.clone(),
+            secret_env_scrubber: Arc::clone(&self.secret_env_scrubber),
         }
+    }
+
+    pub(crate) fn with_agent_permission_mode(mut self, mode: PermissionMode) -> Result<Self> {
+        self.permissions = Arc::new(self.permissions.fork_for_context_with_mode(mode)?);
+        Ok(self)
     }
 
     pub fn cwd(&self) -> PathBuf {
@@ -4136,7 +4164,22 @@ impl ToolRegistry {
         Ok(())
     }
 
-    pub(crate) fn scoped_for_agent(&self, policy: &AgentToolPolicy) -> Result<Self> {
+    pub(crate) fn install_runtime_structured_output(&self, tool: Arc<dyn Tool>) -> Result<()> {
+        validate_registry_tool(tool.as_ref())?;
+        if tool.name() != "StructuredOutput" {
+            bail!("runtime active-tool replacement 仅允许 StructuredOutput")
+        }
+        let mut state = write_registry(&self.state);
+        if !state.active.contains_key(tool.name()) && state.active.len() >= MAX_ACTIVE_TOOLS {
+            bail!("active tool 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
+        }
+        state.deferred.remove(tool.name());
+        state.active.insert(tool.name().to_owned(), tool);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn scoped_for_agent(&self, policy: &AgentToolPolicy) -> Result<Self> {
         let state = read_registry(&self.state);
         let known = state
             .active
@@ -4198,6 +4241,67 @@ impl ToolRegistry {
             })),
             services: Arc::clone(&self.services),
             discoverers: Arc::new(Vec::new()),
+        })
+    }
+
+    /// Builds an isolated registry view with invocation-owned integrations.
+    /// The parent registry is never mutated, and duplicate public tool names
+    /// fail closed before any agent request can start.
+    pub(crate) fn with_additional_integrations(
+        &self,
+        active_extensions: Vec<Arc<dyn Tool>>,
+        deferred_extensions: Vec<Arc<dyn Tool>>,
+        services: Vec<Arc<dyn ToolService>>,
+        discoverers: Vec<Arc<dyn ToolDiscovery>>,
+    ) -> Result<Self> {
+        let state = read_registry(&self.state);
+        let mut active = state
+            .active
+            .iter()
+            .filter(|(name, _)| name.as_str() != "ToolSearch")
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect::<HashMap<_, _>>();
+        let mut deferred = state
+            .deferred
+            .iter()
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect::<HashMap<_, _>>();
+        drop(state);
+        for tool in active_extensions {
+            validate_registry_tool(tool.as_ref())?;
+            insert_unique_tool(&mut active, &deferred, tool)?;
+        }
+        for tool in deferred_extensions {
+            validate_registry_tool(tool.as_ref())?;
+            insert_unique_tool(&mut deferred, &active, tool)?;
+        }
+        let mut all_discoverers = self.discoverers.as_ref().clone();
+        all_discoverers.extend(discoverers);
+        let has_dynamic_discovery = !all_discoverers.is_empty();
+        let search_slots = usize::from(!deferred.is_empty() || has_dynamic_discovery);
+        if active.len().saturating_add(search_slots) > MAX_ACTIVE_TOOLS {
+            bail!("agent integration active tool 数量超过 {MAX_ACTIVE_TOOLS} 个限制")
+        }
+        if deferred.len() > MAX_DEFERRED_TOOLS {
+            bail!("agent integration deferred tool 数量超过 {MAX_DEFERRED_TOOLS} 个限制")
+        }
+        let state = Arc::new(RwLock::new(RegistryState { active, deferred }));
+        let discoverers = Arc::new(all_discoverers);
+        if !read_registry(&state).deferred.is_empty() || has_dynamic_discovery {
+            let search: Arc<dyn Tool> = Arc::new(ToolSearchTool {
+                state: Arc::downgrade(&state),
+                discoverers: Arc::clone(&discoverers),
+            });
+            write_registry(&state)
+                .active
+                .insert(search.name().to_owned(), search);
+        }
+        let mut all_services = self.services.as_ref().clone();
+        all_services.extend(services);
+        Ok(Self {
+            state,
+            services: Arc::new(all_services),
+            discoverers,
         })
     }
 
@@ -6098,6 +6202,30 @@ mod tests {
 
     use super::*;
     use crate::permissions::{PermissionDecision, PermissionMode};
+
+    #[test]
+    fn secret_env_scrubber_updates_are_shared_across_context_clones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temporary.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let cloned = context.clone();
+        context
+            .extend_secret_env_scrubber(&Settings {
+                raw: json!({"mcpServers":{"dynamic":{"auth":{
+                    "type":"bearer-env", "env":"MCP_DYNAMIC_SECRET"
+                }}}}),
+            })
+            .unwrap();
+        assert!(
+            cloned
+                .secret_env_scrubber()
+                .names()
+                .iter()
+                .any(|name| name == "MCP_DYNAMIC_SECRET")
+        );
+    }
 
     #[test]
     fn control_interaction_handler_is_wrapped_by_wait_observer() {

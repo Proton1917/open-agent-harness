@@ -838,7 +838,7 @@ impl ConversationUi {
                 *delay_ms as f64 / 1000.0,
                 single_line(reason, 80)
             )),
-            QueryEvent::CompactStarted => Some("Compressing context".to_owned()),
+            QueryEvent::CompactStarted { .. } => Some("Compressing context".to_owned()),
             _ => None,
         };
         let mut state = self
@@ -979,7 +979,7 @@ impl ConversationUi {
                 }
                 let _ = queue!(out, Print(RAW_LINE_END));
             }
-            QueryEvent::CompactStarted => {
+            QueryEvent::CompactStarted { .. } => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
                 let _ = styled_status(&mut out, self.color, "Compressing context…");
@@ -988,6 +988,7 @@ impl ConversationUi {
             QueryEvent::CompactFinished {
                 before_tokens,
                 after_tokens,
+                ..
             } => {
                 clear_status(&mut out, &mut state);
                 let _ = muted_line(
@@ -1486,13 +1487,14 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
                 state.fullscreen.push_message(&line);
             }
         }
-        QueryEvent::CompactStarted => {
+        QueryEvent::CompactStarted { .. } => {
             finish_fullscreen_stream(state);
             state.fullscreen.set_status(Some("Compressing context…"));
         }
         QueryEvent::CompactFinished {
             before_tokens,
             after_tokens,
+            ..
         } => {
             state.fullscreen.set_status(None);
             state.fullscreen.push_message(&format!(
@@ -1544,6 +1546,7 @@ enum BindingDispatch {
     ClearInput,
     ClearScreen,
     PasteImage,
+    TerminalPanel,
     WorkspaceSearch(WorkspaceSearchKind),
     Unsupported(String),
 }
@@ -1587,6 +1590,7 @@ fn dispatch_binding(action: String) -> BindingDispatch {
         "chat:clearInput" => return BindingDispatch::ClearInput,
         "chat:clearScreen" => return BindingDispatch::ClearScreen,
         "chat:imagePaste" => return BindingDispatch::PasteImage,
+        "app:toggleTerminal" => return BindingDispatch::TerminalPanel,
         "app:quickOpen" => {
             return BindingDispatch::WorkspaceSearch(WorkspaceSearchKind::QuickOpen);
         }
@@ -1991,6 +1995,7 @@ pub struct PromptRead {
 pub enum ActiveTurnAction {
     Submit(String),
     Interrupt,
+    ToggleTerminal,
 }
 
 pub struct ActiveTurnInput {
@@ -2004,7 +2009,7 @@ pub struct ActiveTurnInput {
 }
 
 impl ActiveTurnInput {
-    pub fn begin(ui: ConversationUi) -> Result<Self> {
+    pub fn begin(ui: ConversationUi, terminal_panel_enabled: bool) -> Result<Self> {
         let raw_guard = RawModeGuard::enter()?;
         let handle = ActiveTurnInputHandle {
             state: Arc::downgrade(&ui.inner),
@@ -2027,7 +2032,11 @@ impl ActiveTurnInput {
             raw_guard: Some(raw_guard),
             buffer: String::new(),
             cursor_byte: 0,
-            hint: "Agent working · /btw asks separately · Enter queues".to_owned(),
+            hint: if terminal_panel_enabled {
+                "Agent working · /btw asks separately · Enter queues · Alt+J terminal".to_owned()
+            } else {
+                "Agent working · /btw asks separately · Enter queues".to_owned()
+            },
             fullscreen_wheel_epoch: Instant::now(),
             active: true,
         };
@@ -2075,6 +2084,18 @@ impl ActiveTurnInput {
                     self.cursor_byte = 0;
                     self.hint = "Active-turn input cleared".to_owned();
                     changed = true;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('j'),
+                    modifiers,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+                    && !modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::HYPER,
+                    ) =>
+                {
+                    return Ok(Some(ActiveTurnAction::ToggleTerminal));
                 }
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter,
@@ -2218,6 +2239,21 @@ impl ActiveTurnInput {
         self.redraw()
     }
 
+    /// Temporarily releases raw/fullscreen ownership for an interactive child
+    /// process, then restores the active-turn composer even when the child
+    /// action itself fails.
+    pub fn run_modal<T>(&mut self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.ui.clear_active_turn_input()?;
+        drop(self.raw_guard.take());
+        let fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
+        let result = action();
+        drop(fullscreen);
+        flush_terminal_input_buffer();
+        self.raw_guard = Some(RawModeGuard::enter()?);
+        self.redraw()?;
+        result
+    }
+
     pub fn finish(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
@@ -2266,6 +2302,7 @@ pub struct InputReadActions<'a> {
     pub model_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
     pub rewind_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
     pub workspace_search: &'a mut dyn FnMut(WorkspaceSearchKind) -> Result<WorkspaceSearchOutcome>,
+    pub terminal_panel: &'a mut dyn FnMut() -> Result<String>,
     pub transcript_viewer: &'a mut dyn FnMut() -> Result<()>,
     /// Returns `Some(new_value)` only when an asynchronous refresh completed.
     /// The inner `None` clears an existing status line.
@@ -4451,6 +4488,7 @@ impl InputEditor {
             model_picker,
             rewind_picker,
             workspace_search,
+            terminal_panel,
             transcript_viewer,
             status_line_refresh,
             task_refresh,
@@ -5212,6 +5250,30 @@ impl InputEditor {
                                     hint =
                                         "Clipboard does not contain a supported image".to_owned();
                                 }
+                                continue;
+                            }
+                            BindingDispatch::TerminalPanel => {
+                                if let Some(ui) =
+                                    self.ui.as_ref().filter(|ui| ui.fullscreen_active())
+                                {
+                                    ui.render_fullscreen_prompt(&[], 1)?;
+                                } else {
+                                    rendered.erase(&mut out)?;
+                                }
+                                drop(raw_guard.take());
+                                let fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
+                                let outcome = terminal_panel();
+                                drop(fullscreen);
+                                flush_terminal_input_buffer();
+                                raw_guard = Some(RawModeGuard::enter()?);
+                                rendered = RenderedInput::default();
+                                hint = match outcome {
+                                    Ok(message) => single_line(&message, 160),
+                                    Err(error) => format!(
+                                        "Terminal panel failed: {}",
+                                        single_line(&format!("{error:#}"), 160)
+                                    ),
+                                };
                                 continue;
                             }
                             BindingDispatch::WorkspaceSearch(kind) => {
@@ -9301,5 +9363,13 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn terminal_panel_binding_is_dispatched_to_the_modal_action() {
+        assert!(matches!(
+            dispatch_binding("app:toggleTerminal".to_owned()),
+            BindingDispatch::TerminalPanel
+        ));
     }
 }

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     permissions::PermissionMode,
@@ -35,6 +36,110 @@ pub enum HarnessCommand {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Expose the provider-neutral local tool surface over MCP.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpCommand {
+    /// Serve bounded newline-delimited MCP JSON-RPC on stdin/stdout.
+    Serve(McpServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct McpServeArgs {
+    /// Load an extra settings JSON file or inline JSON object.
+    #[arg(long)]
+    pub settings: Option<String>,
+
+    /// Permission mode for tool execution. The server is always non-interactive.
+    #[arg(long, value_enum)]
+    pub permission_mode: Option<PermissionMode>,
+
+    /// Allow permission-requiring calls without a prompt. Explicit deny rules still win.
+    #[arg(long)]
+    pub dangerously_skip_permissions: bool,
+
+    /// Restrict the exposed tool set (comma-separated, repeatable).
+    #[arg(long, value_delimiter = ',')]
+    pub tools: Option<Vec<String>>,
+
+    /// Add trusted server-scoped permission allow rules (comma-separated, repeatable).
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_tools: Vec<String>,
+
+    /// Add trusted server-scoped permission deny rules (comma-separated, repeatable).
+    #[arg(long, value_delimiter = ',')]
+    pub disallowed_tools: Vec<String>,
+
+    /// Add an existing directory to the server's trusted workspace scope.
+    #[arg(long = "add-dir", value_name = "DIRECTORY")]
+    pub add_dirs: Vec<PathBuf>,
+
+    /// Disable project settings and automatic context discovery.
+    #[arg(long)]
+    pub bare: bool,
+
+    /// Disable instructions, skills, plugins, hooks, LSP, memory, and web extensions.
+    #[arg(long)]
+    pub safe_mode: bool,
+
+    /// Enable bounded protocol diagnostics on stderr. Request arguments are never logged.
+    #[arg(short = 'd', long)]
+    pub debug: bool,
+}
+
+impl McpServeArgs {
+    /// Accept the same trusted execution flags on either side of `mcp serve`.
+    /// Scalar conflicts fail closed instead of silently choosing one scope.
+    pub fn merge_parent_options(&mut self, parent: &Cli) -> Result<()> {
+        if let Some(settings) = &parent.settings {
+            if self
+                .settings
+                .as_ref()
+                .is_some_and(|nested| nested != settings)
+            {
+                bail!("conflicting --settings values before and after mcp serve")
+            }
+            self.settings.get_or_insert_with(|| settings.clone());
+        }
+        if let Some(mode) = parent.permission_mode {
+            if self.permission_mode.is_some_and(|nested| nested != mode) {
+                bail!("conflicting --permission-mode values before and after mcp serve")
+            }
+            self.permission_mode.get_or_insert(mode);
+        }
+        if let Some(parent_tools) = &parent.tools {
+            match &mut self.tools {
+                Some(tools) => {
+                    let mut merged = parent_tools.clone();
+                    merged.append(tools);
+                    *tools = merged;
+                }
+                None => self.tools = Some(parent_tools.clone()),
+            }
+        }
+        prepend(&mut self.allowed_tools, &parent.allowed_tools);
+        prepend(&mut self.disallowed_tools, &parent.disallowed_tools);
+        prepend(&mut self.add_dirs, &parent.add_dirs);
+        self.dangerously_skip_permissions |= parent.dangerously_skip_permissions;
+        self.bare |= parent.bare;
+        self.safe_mode |= parent.safe_mode;
+        self.debug |= parent.debug;
+        Ok(())
+    }
+}
+
+fn prepend<T: Clone>(nested: &mut Vec<T>, parent: &[T]) {
+    if parent.is_empty() {
+        return;
+    }
+    let mut merged = parent.to_vec();
+    merged.append(nested);
+    *nested = merged;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -129,6 +234,10 @@ pub struct Cli {
     /// Model alias or full API model identifier.
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Use a trusted custom agent definition as the main conversation agent.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
 
     /// Select the default or a namespaced trusted plugin output style.
     #[arg(long, value_name = "NAME")]
@@ -282,6 +391,85 @@ mod tests {
                 output: Some(_),
             })
         ));
+    }
+
+    #[test]
+    fn parses_mcp_serve_as_an_explicit_noninteractive_surface() {
+        let cli = Cli::try_parse_from([
+            "open-agent-harness",
+            "mcp",
+            "serve",
+            "--bare",
+            "--tools",
+            "Read,Glob",
+            "--allowed-tools",
+            "Read(*)",
+        ])
+        .unwrap();
+        let Some(HarnessCommand::Mcp {
+            command: McpCommand::Serve(args),
+        }) = cli.command
+        else {
+            panic!("expected mcp serve command")
+        };
+        assert!(args.bare);
+        assert_eq!(args.tools, Some(vec!["Read".into(), "Glob".into()]));
+        assert_eq!(args.allowed_tools, vec!["Read(*)"]);
+    }
+
+    #[test]
+    fn mcp_serve_merges_flags_on_both_sides_of_the_subcommand() {
+        let mut cli = Cli::try_parse_from([
+            "open-agent-harness",
+            "--debug",
+            "--bare",
+            "--tools",
+            "Read",
+            "--allowed-tools",
+            "Read(*)",
+            "mcp",
+            "serve",
+            "--safe-mode",
+            "--tools",
+            "Glob",
+            "--disallowed-tools",
+            "Write(*)",
+        ])
+        .unwrap();
+        let Some(HarnessCommand::Mcp {
+            command: McpCommand::Serve(mut args),
+        }) = cli.command.take()
+        else {
+            panic!("expected mcp serve command")
+        };
+        args.merge_parent_options(&cli).unwrap();
+        assert!(args.debug);
+        assert!(args.bare);
+        assert!(args.safe_mode);
+        assert_eq!(args.tools, Some(vec!["Read".into(), "Glob".into()]));
+        assert_eq!(args.allowed_tools, vec!["Read(*)"]);
+        assert_eq!(args.disallowed_tools, vec!["Write(*)"]);
+    }
+
+    #[test]
+    fn mcp_serve_rejects_conflicting_scalar_scopes() {
+        let mut cli = Cli::try_parse_from([
+            "open-agent-harness",
+            "--permission-mode",
+            "default",
+            "mcp",
+            "serve",
+            "--permission-mode",
+            "plan",
+        ])
+        .unwrap();
+        let Some(HarnessCommand::Mcp {
+            command: McpCommand::Serve(mut args),
+        }) = cli.command.take()
+        else {
+            panic!("expected mcp serve command")
+        };
+        assert!(args.merge_parent_options(&cli).is_err());
     }
 
     #[test]

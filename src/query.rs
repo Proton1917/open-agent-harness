@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    agents::{AgentRegistryFilter, AgentRuntime, AgentToolPolicy, CustomAgentCatalog},
+    agents::{
+        AgentRegistryFilter, AgentRuntime, AgentTaskEventSink, AgentToolPolicy, CustomAgentCatalog,
+    },
     api::{ApiRetryEvent, ModelClient, is_size_rejection},
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
     context_inspection::ContextUsageReport,
@@ -21,7 +23,7 @@ use crate::{
     },
     structured_output::STRUCTURED_OUTPUT_TOOL_NAME,
     tokens::{estimate_messages, rough_token_count},
-    tools::{ToolContext, ToolExecutionObserver, ToolOutput, ToolRegistry},
+    tools::{Tool, ToolContext, ToolExecutionObserver, ToolOutput, ToolRegistry},
     types::{Message, Role, SessionUsage, Usage},
 };
 
@@ -44,6 +46,21 @@ const MAX_SIDE_ANSWER_BYTES: usize = 256 * 1024;
 const COMPACT_RETRY_MARKER: &str = "[earlier conversation truncated for compaction retry]";
 pub type TextDeltaSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub type QueryEventSink = Arc<dyn Fn(&QueryEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    Manual,
+    Auto,
+}
+
+impl CompactTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryEvent {
@@ -90,8 +107,11 @@ pub enum QueryEvent {
         is_error: bool,
         elapsed_ms: u128,
     },
-    CompactStarted,
+    CompactStarted {
+        trigger: CompactTrigger,
+    },
     CompactFinished {
+        trigger: CompactTrigger,
         before_tokens: usize,
         after_tokens: usize,
     },
@@ -337,6 +357,21 @@ impl QueryEngine {
         let filter: AgentRegistryFilter =
             Arc::new(|registry, policy| registry.scoped_for_agent(policy));
         runtime.install_custom_agents(catalog, Some(filter));
+        Ok(())
+    }
+
+    pub fn set_agent_task_event_sink(&self, sink: Option<AgentTaskEventSink>) -> Result<()> {
+        self.tool_context.agent_runtime()?.set_task_event_sink(sink);
+        Ok(())
+    }
+
+    pub fn set_agent_mcp_server_names(
+        &self,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
+        self.tool_context
+            .agent_runtime()?
+            .set_known_mcp_servers(names);
         Ok(())
     }
 
@@ -667,6 +702,27 @@ impl QueryEngine {
         self.structured_output_required = required;
     }
 
+    pub fn install_runtime_structured_output(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
+        self.registry.install_runtime_structured_output(tool)?;
+        self.structured_output_required = true;
+        Ok(())
+    }
+
+    pub fn system_prompt(&self) -> &str {
+        &self.system
+    }
+
+    pub fn set_system_prompt(&mut self, system: String) -> Result<()> {
+        if system.len() > 4 * 1024 * 1024 || system.contains('\0') {
+            bail!("system prompt 超过 4 MiB 或包含 NUL")
+        }
+        if let Ok(runtime) = self.tool_context.agent_runtime() {
+            runtime.set_system_prompt(system.clone());
+        }
+        self.system = system;
+        Ok(())
+    }
+
     pub fn set_model(&mut self, model: String) {
         if let Ok(runtime) = self.tool_context.agent_runtime() {
             runtime.set_default_model(model.clone());
@@ -886,7 +942,9 @@ impl QueryEngine {
                 .saturating_add(estimate_messages(std::slice::from_ref(&pending)))
                 >= self.compact_config.auto_threshold()
         {
-            let stats = self.compact(None).await?;
+            let stats = self
+                .compact_preserving_suffix(None, Vec::new(), None, None, 0, CompactTrigger::Auto)
+                .await?;
             compacted = true;
             if self.debug {
                 eprintln!(
@@ -1487,8 +1545,15 @@ impl QueryEngine {
     }
 
     pub async fn compact(&mut self, custom_instructions: Option<&str>) -> Result<CompactStats> {
-        self.compact_preserving_suffix(custom_instructions, Vec::new(), None, None, 0)
-            .await
+        self.compact_preserving_suffix(
+            custom_instructions,
+            Vec::new(),
+            None,
+            None,
+            0,
+            CompactTrigger::Manual,
+        )
+        .await
     }
 
     /// Summarizes the conversation from a selected message boundary onward,
@@ -1514,6 +1579,7 @@ impl QueryEngine {
                 Some(full_before_tokens),
                 Some(full_messages_before),
                 start,
+                CompactTrigger::Manual,
             )
             .await;
         let compacted_or_restored = std::mem::take(&mut self.messages);
@@ -1529,6 +1595,7 @@ impl QueryEngine {
         full_before_tokens: Option<usize>,
         full_messages_before: Option<usize>,
         preserved_prefix_messages: usize,
+        trigger: CompactTrigger,
     ) -> Result<CompactStats> {
         if !self.compact_config.enabled {
             self.messages.extend(suffix);
@@ -1538,7 +1605,7 @@ impl QueryEngine {
             self.messages.extend(suffix);
             bail!("消息不足，至少需要一轮对话才能 compact")
         }
-        self.emit(QueryEvent::CompactStarted);
+        self.emit(QueryEvent::CompactStarted { trigger });
         let prefix_messages = self.messages.len();
         let messages_before =
             full_messages_before.unwrap_or_else(|| prefix_messages.saturating_add(suffix.len()));
@@ -1640,6 +1707,7 @@ impl QueryEngine {
             eprintln!("[debug] PostCompact hook failed after compaction: {error:#}");
         }
         self.emit(QueryEvent::CompactFinished {
+            trigger,
             before_tokens: stats.before_tokens,
             after_tokens: stats.after_tokens,
         });
@@ -1653,8 +1721,15 @@ impl QueryEngine {
         let before_tokens = self.estimated_tokens();
         let messages_before = self.messages.len();
         let suffix = self.messages.split_off(prefix_len);
-        self.compact_preserving_suffix(None, suffix, Some(before_tokens), Some(messages_before), 0)
-            .await
+        self.compact_preserving_suffix(
+            None,
+            suffix,
+            Some(before_tokens),
+            Some(messages_before),
+            0,
+            CompactTrigger::Auto,
+        )
+        .await
     }
 
     fn emit(&self, event: QueryEvent) {

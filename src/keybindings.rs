@@ -768,6 +768,7 @@ fn default_bindings() -> Vec<Binding> {
         ("Global", "cmd+shift+p", "app:quickOpen"),
         ("Global", "ctrl+shift+f", "app:globalSearch"),
         ("Global", "cmd+shift+f", "app:globalSearch"),
+        ("Global", "meta+j", "app:toggleTerminal"),
         // Classic PTYs collapse Ctrl-Shift-letter into Ctrl-letter. These
         // chords keep both dialogs reachable without shadowing readline keys.
         ("Global", "ctrl+x ctrl+p", "app:quickOpen"),
@@ -1053,6 +1054,18 @@ mod tests {
                 &["Chat", "Global"]
             ),
             KeyResolution::Match("app:globalSearch".to_owned())
+        );
+    }
+
+    #[test]
+    fn terminal_panel_uses_the_source_meta_j_shortcut() {
+        let mut manager = KeybindingManager::new(None);
+        assert_eq!(
+            manager.resolve(
+                key(KeyCode::Char('j'), KeyModifiers::ALT),
+                &["Chat", "Global"]
+            ),
+            KeyResolution::Match("app:toggleTerminal".to_owned())
         );
     }
 

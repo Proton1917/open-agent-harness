@@ -181,7 +181,19 @@ is accurate; “complete parity with the proprietary product” is not.
   while the main model future remains active; its response and usage are
   bounded and it cannot mutate the main transcript. The same explicit prompt
   option drives an interactive empty-composer suggestion without changing the
-  transcript.
+  transcript. Typed control requests can also replace a distinct in-memory MCP
+  layer, exchange SDK-hosted MCP messages, reload trusted plugin catalogs, and
+  atomically apply bounded flag settings; settings responses redact credential
+  fields and runtime changes never persist as project authority.
+- SDK initialization applies bounded system replacement/append, structured
+  output, hooks, MCP transports, prompt suggestions, agent progress summaries,
+  and full trusted custom-agent definitions. An explicitly selected main agent
+  can contribute model, prompt, initial input, permission mode, isolated MCP,
+  and private user/project/local memory without widening the parent authority.
+  Stream output uses one capability list before and after initialization,
+  source-shaped replay/partial/compact/hook/tool/task envelopes, and explicit
+  equivalents where vendor account, billing, or provider-state fields are not
+  portable.
 
 ### MCP, web, prompt, context, and memory
 
@@ -196,6 +208,17 @@ is accurate; “complete parity with the proprietary product” is not.
   userinfo, query strings, and fragments are not reflected into model context.
   Images and PDFs become model media blocks; audio and other opaque binary data
   expose bounded metadata rather than raw bytes.
+- The inverse `mcp serve` entrypoint is model-independent: it exposes the
+  permission-safe local Rust tool registry over bounded newline-delimited
+  stdio JSON-RPC, requires the MCP initialization sequence, validates tool
+  inputs through the shared registry, limits requests/results, and processes
+  calls sequentially so filesystem mutations cannot race.
+- Stream control keeps configured, plugin, and SDK-requested MCP ownership in
+  separate collision-checked layers. Process transports reconnect in the CLI;
+  SDK transports use correlated bounded control requests and connect only
+  after the topology response to avoid deadlock. Plugin reload and dynamic
+  replacement refresh the existing tool discovery registry without rebuilding
+  the model client, while invalid candidates leave the prior layer intact.
 - Every model-bound PNG/JPEG/GIF/WebP path uses one bounded Rust normalizer:
   `Read` and explicit file mentions, clipboard attachments, exact shell data
   URIs, MCP image blocks/resources, and direct SDK/stream user blocks. It
@@ -234,7 +257,10 @@ is accurate; “complete parity with the proprietary product” is not.
   `NotebookEdit` mutations through `didOpen`/`didChange`/`didSave` without an
   explicit LSP query. Version-checked, workspace-confined diagnostics are
   attached to that file-tool result; integration failure is visible but does
-  not silently reverse a successful file mutation.
+  not silently reverse a successful file mutation. Plugin reload replaces its
+  LSP layer transactionally, rejects static/plugin collisions, restarts only
+  changed clients, removes stale clients, and updates extension routing without
+  rebuilding the model session.
 
 ## Honest remaining boundaries
 
@@ -242,12 +268,12 @@ is accurate; “complete parity with the proprietary product” is not.
   implicit callback listener. Authorization URL and callback exchange are
   explicit private file/environment handoffs; this is suitable for headless
   operation but is not a graphical account-login flow.
-- Stream-JSON does not permit live in-process plugin/MCP installation or
-  configuration mutation, arbitrary transcript injection/replay, or vendor
-  callback families. Plugin lifecycle is a separate CLI operation for a later
-  process, and accepted-user replay is a bounded delivery acknowledgement.
-- The interactive composer does not yet accept a concurrent one-off side query
-  while another model turn is active.
+- Stream-JSON does not install package archives, mutate the persistent plugin
+  cache, accept arbitrary transcript injection, or expose vendor callback
+  families. It may refresh already trusted local plugin definitions, replace a
+  session-only MCP layer, and apply an in-memory bounded settings overlay;
+  persistent plugin lifecycle remains a separate CLI operation, and accepted
+  user replay is only a bounded delivery acknowledgement.
 - The main conversation supports both native scrollback and an optional
   `/tui fullscreen` virtual viewport with sticky-bottom/unseen state, resize,
   wheel/page scrolling, mouse word/line/drag selection, grapheme-aware keyboard
@@ -272,6 +298,9 @@ is accurate; “complete parity with the proprietary product” is not.
   accepts immediate `/btw` questions or queues up to eight ordinary inputs.
   Exact modal suspension and nested raw-mode ownership prevent permission
   prompts from racing the active composer;
+  an explicit default-off terminal-panel setting gives Alt-J a private
+  process-local tmux shell with direct-shell fallback, exact owned cleanup,
+  credential scrubbing, and restoration during both idle and active turns;
   status-line commands refresh asynchronously on relevant state changes and at
   the configured idle interval. Custom theme editing remains outside the
   declared integration surface.

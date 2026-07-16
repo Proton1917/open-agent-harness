@@ -119,6 +119,9 @@ pub struct UiSettings {
     pub syntax_highlighting: bool,
     #[serde(default)]
     pub prompt_suggestion_enabled: bool,
+    /// Explicit local replacement for the source build's remote experiment flag.
+    #[serde(default)]
+    pub terminal_panel_enabled: bool,
     #[serde(default)]
     pub preferred_notif_channel: NotificationChannel,
     #[serde(default = "default_idle_notification_threshold_ms")]
@@ -142,6 +145,7 @@ impl Default for UiSettings {
             copy_on_select: true,
             syntax_highlighting: true,
             prompt_suggestion_enabled: false,
+            terminal_panel_enabled: false,
             preferred_notif_channel: NotificationChannel::default(),
             message_idle_notif_threshold_ms: DEFAULT_IDLE_NOTIFICATION_THRESHOLD_MS,
             status_line: None,
@@ -203,6 +207,11 @@ impl UiSettings {
                 next.prompt_suggestion_enabled = value
                     .parse::<bool>()
                     .context("promptSuggestionEnabled must be true or false")?;
+            }
+            "terminalPanelEnabled" => {
+                next.terminal_panel_enabled = value
+                    .parse::<bool>()
+                    .context("terminalPanelEnabled must be true or false")?;
             }
             "preferredNotifChannel" => {
                 next.preferred_notif_channel = NotificationChannel::parse(value)?;
@@ -412,6 +421,10 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     },
     UiSettingSpec {
         key: "promptSuggestionEnabled",
+        value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "terminalPanelEnabled",
         value_kind: UiSettingValueKind::Boolean,
     },
     UiSettingSpec {
@@ -835,6 +848,7 @@ mod tests {
             copy_on_select: false,
             syntax_highlighting: false,
             prompt_suggestion_enabled: true,
+            terminal_panel_enabled: true,
             preferred_notif_channel: NotificationChannel::Ghostty,
             message_idle_notif_threshold_ms: 90_000,
             status_line: Some(StatusLineConfig {
@@ -1021,6 +1035,38 @@ mod tests {
         assert!(
             settings
                 .apply_setting(UiSettingSource::User, "promptSuggestionEnabled", "yes")
+                .is_err()
+        );
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn terminal_panel_is_explicit_local_typed_and_transactional() {
+        let mut settings = UiSettings::default();
+        assert!(!settings.terminal_panel_enabled);
+        settings
+            .apply_setting(UiSettingSource::User, "terminalPanelEnabled", "true")
+            .unwrap();
+        assert!(settings.terminal_panel_enabled);
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["terminalPanelEnabled"],
+            true
+        );
+        assert!(
+            UI_SETTING_REGISTRY
+                .iter()
+                .any(|spec| spec.key == "terminalPanelEnabled")
+        );
+        let before = settings.clone();
+        assert!(
+            settings
+                .apply_setting(UiSettingSource::User, "terminalPanelEnabled", "remote")
+                .is_err()
+        );
+        assert_eq!(settings, before);
+        assert!(
+            settings
+                .apply_setting(UiSettingSource::Project, "terminalPanelEnabled", "false")
                 .is_err()
         );
         assert_eq!(settings, before);

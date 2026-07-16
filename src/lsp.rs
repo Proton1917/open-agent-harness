@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
@@ -51,7 +51,22 @@ const MAX_RESTARTS: u8 = 3;
 pub struct LspIntegration {
     pub deferred_tools: Vec<Arc<dyn Tool>>,
     pub service: Arc<dyn ToolService>,
+    pub control: Arc<dyn LspControl>,
     pub server_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspServerChangeReport {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[async_trait]
+pub trait LspControl: Send + Sync {
+    async fn replace_plugin_servers(
+        &self,
+        servers: &BTreeMap<String, Value>,
+    ) -> Result<LspServerChangeReport>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,11 +132,15 @@ struct DiagnosticStore {
 
 struct LspManager {
     workspace: PathBuf,
-    configs: HashMap<String, ServerConfig>,
-    extensions: HashMap<String, String>,
+    configs: StdRwLock<HashMap<String, ServerConfig>>,
+    extensions: StdRwLock<HashMap<String, String>>,
     clients: Mutex<HashMap<String, Arc<LspClient>>>,
     diagnostics: Arc<Mutex<DiagnosticStore>>,
     diagnostic_notify: Arc<Notify>,
+    reload_lock: Mutex<()>,
+    base_settings: Settings,
+    static_specs: BTreeMap<String, Value>,
+    plugin_specs: StdRwLock<BTreeMap<String, Value>>,
     debug: bool,
 }
 
@@ -130,28 +149,66 @@ pub fn configure_lsp(
     workspace: &Path,
     debug: bool,
 ) -> Result<Option<LspIntegration>> {
+    configure_lsp_inner(settings, workspace, debug, BTreeMap::new(), false)
+}
+
+pub fn configure_lsp_with_runtime_layers(
+    settings: &Settings,
+    workspace: &Path,
+    debug: bool,
+    plugin_servers: BTreeMap<String, Value>,
+) -> Result<Option<LspIntegration>> {
+    configure_lsp_inner(settings, workspace, debug, plugin_servers, true)
+}
+
+fn configure_lsp_inner(
+    settings: &Settings,
+    workspace: &Path,
+    debug: bool,
+    plugin_servers: BTreeMap<String, Value>,
+    allow_empty: bool,
+) -> Result<Option<LspIntegration>> {
     let (configs, extensions) = parse_server_configs(settings, workspace)?;
-    if configs.is_empty() {
+    if configs.is_empty() && !allow_empty {
         return Ok(None);
     }
     let server_count = configs.len();
+    let plugin_names = plugin_servers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let static_specs = settings
+        .raw
+        .get("lspServers")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| !plugin_names.contains(&name.to_ascii_lowercase()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
     let manager = Arc::new(LspManager {
         workspace: std::fs::canonicalize(workspace)
             .with_context(|| format!("无法解析 LSP workspace: {}", workspace.display()))?,
-        configs,
-        extensions,
+        configs: StdRwLock::new(configs),
+        extensions: StdRwLock::new(extensions),
         clients: Mutex::new(HashMap::new()),
         diagnostics: Arc::new(Mutex::new(DiagnosticStore::default())),
         diagnostic_notify: Arc::new(Notify::new()),
+        reload_lock: Mutex::new(()),
+        base_settings: settings.clone(),
+        static_specs,
+        plugin_specs: StdRwLock::new(plugin_servers),
         debug,
     });
     let tool: Arc<dyn Tool> = Arc::new(LspTool {
         manager: Arc::clone(&manager),
     });
-    let service: Arc<dyn ToolService> = manager;
+    let service: Arc<dyn ToolService> = manager.clone();
+    let control: Arc<dyn LspControl> = manager;
     Ok(Some(LspIntegration {
         deferred_tools: vec![tool],
         service,
+        control,
         server_count,
     }))
 }
@@ -512,7 +569,12 @@ impl LspManager {
         let Ok(extension) = extension_of(path) else {
             return Ok(None);
         };
-        Ok(self.extensions.get(&extension).cloned())
+        Ok(self
+            .extensions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&extension)
+            .cloned())
     }
 
     async fn sync_changed_files(&self, paths: &[PathBuf]) -> Result<Vec<String>> {
@@ -578,6 +640,8 @@ impl LspManager {
         }
         let config = self
             .configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&name)
             .cloned()
             .with_context(|| format!("LSP server config 消失: {name}"))?;
@@ -652,6 +716,113 @@ impl LspManager {
         for client in clients {
             client.shutdown().await;
         }
+    }
+
+    async fn replace_plugin_servers_impl(
+        &self,
+        servers: &BTreeMap<String, Value>,
+    ) -> Result<LspServerChangeReport> {
+        let _reload = self.reload_lock.lock().await;
+        let current = self
+            .plugin_specs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut combined = self.static_specs.clone();
+        let mut normalized = combined
+            .keys()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        for (name, value) in servers {
+            if !normalized.insert(name.to_ascii_lowercase()) {
+                bail!("plugin LSP server 与静态配置名称冲突: {name}")
+            }
+            combined.insert(name.clone(), value.clone());
+        }
+        let mut raw = self.base_settings.raw.clone();
+        raw.as_object_mut()
+            .context("LSP runtime settings root 不是 object")?
+            .insert(
+                "lspServers".to_owned(),
+                Value::Object(
+                    combined
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+        let (next_configs, next_extensions) =
+            parse_server_configs(&Settings { raw }, &self.workspace)?;
+        let current_by_key = current
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (name.clone(), value.clone())))
+            .collect::<HashMap<_, _>>();
+        let next_by_key = servers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (name.clone(), value.clone())))
+            .collect::<HashMap<_, _>>();
+        let removed = current_by_key
+            .keys()
+            .filter(|key| !next_by_key.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let replaced = current_by_key
+            .iter()
+            .filter_map(|(key, (name, value))| {
+                next_by_key
+                    .get(key)
+                    .filter(|(next_name, next_value)| next_name != name || next_value != value)
+                    .map(|_| key.clone())
+            })
+            .collect::<Vec<_>>();
+        let added = next_by_key
+            .keys()
+            .filter(|key| !current_by_key.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for key in removed.iter().chain(&replaced) {
+            let (name, _) = current_by_key
+                .get(key)
+                .expect("changed LSP key came from current plugin layer");
+            self.restart(name).await;
+        }
+        *self
+            .configs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_configs;
+        *self
+            .extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_extensions;
+        *self
+            .plugin_specs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = servers.clone();
+        let mut report = LspServerChangeReport {
+            added: added
+                .iter()
+                .chain(&replaced)
+                .filter_map(|key| next_by_key.get(key).map(|(name, _)| name.clone()))
+                .collect(),
+            removed: removed
+                .iter()
+                .filter_map(|key| current_by_key.get(key).map(|(name, _)| name.clone()))
+                .collect(),
+        };
+        report.added.sort();
+        report.removed.sort();
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl LspControl for LspManager {
+    async fn replace_plugin_servers(
+        &self,
+        servers: &BTreeMap<String, Value>,
+    ) -> Result<LspServerChangeReport> {
+        self.replace_plugin_servers_impl(servers).await
     }
 }
 
@@ -745,11 +916,14 @@ impl Tool for LspTool {
         let text = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("LSP file 不是有效 UTF-8: {}", path.display()))?;
-        let config = self
-            .manager
-            .server_name_for_path(&path)?
-            .and_then(|name| self.manager.configs.get(&name))
-            .cloned();
+        let config = self.manager.server_name_for_path(&path)?.and_then(|name| {
+            self.manager
+                .configs
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&name)
+                .cloned()
+        });
         let Some(config) = config else {
             return Ok(ToolOutput::error(format!(
                 "没有为 {} 配置 LSP server",
@@ -1204,6 +1378,89 @@ mod tests {
         assert_eq!(position["range"]["start"]["character"], 1);
         assert_eq!(position["range"]["end"]["line"], 5);
         assert_eq!(position["range"]["end"]["character"], 9);
+    }
+
+    #[tokio::test]
+    async fn runtime_plugin_servers_replace_extension_routing_transactionally() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("sample.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let settings = Settings { raw: json!({}) };
+        let integration =
+            configure_lsp_with_runtime_layers(&settings, workspace.path(), false, BTreeMap::new())
+                .unwrap()
+                .unwrap();
+        let control = Arc::clone(&integration.control);
+        let registry = ToolRegistry::with_services(
+            Vec::new(),
+            integration.deferred_tools,
+            vec![integration.service],
+        )
+        .unwrap();
+        let context = ToolContext::new(
+            workspace.path().to_owned(),
+            PermissionManager::new(
+                PermissionMode::BypassPermissions,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let selected = registry
+            .execute(&context, "ToolSearch", json!({"query":"select:LSP"}))
+            .await;
+        assert!(!selected.is_error, "{}", selected.content);
+
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "rust-runtime".to_owned(),
+            json!({
+                "command":"unused-language-server",
+                "extensionToLanguage":{"rs":"rust"}
+            }),
+        );
+        let report = control.replace_plugin_servers(&servers).await.unwrap();
+        assert_eq!(report.added, vec!["rust-runtime"]);
+        let routed = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({"operation":"restart", "filePath":"sample.rs"}),
+            )
+            .await;
+        assert!(!routed.is_error, "{}", routed.content);
+        assert!(routed.content.contains("rust-runtime"));
+
+        let mut invalid = BTreeMap::new();
+        invalid.insert(
+            "broken".to_owned(),
+            json!({"command":"", "extensionToLanguage":{"rs":"rust"}}),
+        );
+        assert!(control.replace_plugin_servers(&invalid).await.is_err());
+        let still_routed = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({"operation":"restart", "filePath":"sample.rs"}),
+            )
+            .await;
+        assert!(!still_routed.is_error, "{}", still_routed.content);
+        assert!(still_routed.content.contains("rust-runtime"));
+
+        let report = control
+            .replace_plugin_servers(&BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(report.removed, vec!["rust-runtime"]);
+        let removed = registry
+            .execute(
+                &context,
+                "LSP",
+                json!({"operation":"restart", "filePath":"sample.rs"}),
+            )
+            .await;
+        assert!(removed.is_error);
+        assert!(removed.content.contains("没有为 .rs 配置"));
     }
 
     #[tokio::test]

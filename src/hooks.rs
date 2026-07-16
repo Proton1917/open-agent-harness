@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -121,6 +122,7 @@ pub struct HookRunner {
     additional: Vec<Arc<HookRunner>>,
     async_slots: Arc<Semaphore>,
     mcp_invoker: Option<Arc<dyn McpHookInvoker>>,
+    sdk_hook_invoker: Option<Arc<dyn SdkHookInvoker>>,
     secret_env_scrubber: SecretEnvScrubber,
     observer: Option<HookObserver>,
     next_observer_id: Arc<AtomicU64>,
@@ -129,6 +131,19 @@ pub struct HookRunner {
 }
 
 pub type HookObserver = Arc<dyn Fn(&HookExecutionEvent) + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct SdkHookCall {
+    pub callback_id: String,
+    pub input: Value,
+    pub tool_use_id: Option<String>,
+    pub timeout: Duration,
+}
+
+#[async_trait]
+pub trait SdkHookInvoker: Send + Sync {
+    async fn invoke(&self, call: SdkHookCall) -> Result<Value>;
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -159,6 +174,7 @@ impl Default for HookRunner {
             additional: Vec::new(),
             async_slots: Arc::new(Semaphore::new(MAX_ASYNC_HOOKS)),
             mcp_invoker: None,
+            sdk_hook_invoker: None,
             secret_env_scrubber: SecretEnvScrubber::default(),
             observer: None,
             next_observer_id: Arc::new(AtomicU64::new(1)),
@@ -203,9 +219,15 @@ struct McpToolHook {
     fired: AtomicBool,
 }
 
+struct SdkCallbackHook {
+    callback_id: String,
+    timeout: Duration,
+}
+
 enum HookAction {
     Command(Box<HookCommand>),
     McpTool(Box<McpToolHook>),
+    SdkCallback(Box<SdkCallbackHook>),
 }
 
 struct HookCondition {
@@ -360,6 +382,7 @@ impl HookRunner {
             additional: Vec::new(),
             async_slots: Arc::new(Semaphore::new(MAX_ASYNC_HOOKS)),
             mcp_invoker: None,
+            sdk_hook_invoker: None,
             secret_env_scrubber,
             observer: None,
             next_observer_id: Arc::new(AtomicU64::new(1)),
@@ -384,6 +407,119 @@ impl HookRunner {
             .map(|runner| Arc::new((**runner).clone().with_mcp_invoker(invoker.clone())))
             .collect();
         self
+    }
+
+    pub fn with_sdk_callbacks(
+        mut self,
+        hooks: &Value,
+        invoker: Arc<dyn SdkHookInvoker>,
+    ) -> Result<Self> {
+        let hooks = hooks.as_object().context("SDK hooks 必须是 object")?;
+        let existing_rules = self
+            .events
+            .values()
+            .map(Vec::len)
+            .chain(
+                self.additional
+                    .iter()
+                    .flat_map(|runner| runner.events.values().map(Vec::len)),
+            )
+            .sum::<usize>();
+        let incoming_rules = hooks
+            .values()
+            .map(|rules| rules.as_array().map_or(usize::MAX, Vec::len))
+            .sum::<usize>();
+        if existing_rules.saturating_add(incoming_rules) > MAX_RULES {
+            bail!("SDK hooks 使总规则数超过 {MAX_RULES} 项限制")
+        }
+        let mut events = HashMap::new();
+        let mut file_watch_patterns = Vec::new();
+        for (event, matchers) in hooks {
+            if !SUPPORTED_EVENTS.contains(&event.as_str()) {
+                bail!("不支持的 SDK hook event: {event}")
+            }
+            let matchers = matchers
+                .as_array()
+                .with_context(|| format!("SDK hooks.{event} 必须是 array"))?;
+            let mut rules = Vec::new();
+            for matcher in matchers {
+                let matcher = matcher
+                    .as_object()
+                    .with_context(|| format!("SDK hooks.{event} matcher 必须是 object"))?;
+                let pattern = matcher.get("matcher").and_then(Value::as_str).unwrap_or("");
+                if event == "FileChanged" {
+                    for path in pattern
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                    {
+                        if path.len() > MAX_HOOK_WATCH_PATH_BYTES || path.contains('\0') {
+                            bail!("SDK FileChanged matcher 路径过长或包含 NUL")
+                        }
+                        if !file_watch_patterns.iter().any(|existing| existing == path) {
+                            file_watch_patterns.push(path.to_owned());
+                        }
+                    }
+                }
+                let timeout = matcher
+                    .get("timeout")
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .context("SDK hook timeout 必须是 number")
+                            .and_then(|seconds| parse_hook_timeout(Some(seconds), None))
+                    })
+                    .transpose()?
+                    .unwrap_or(Duration::from_millis(DEFAULT_TIMEOUT_MS));
+                let callback_ids = matcher
+                    .get("hookCallbackIds")
+                    .and_then(Value::as_array)
+                    .context("SDK hook matcher 缺少 hookCallbackIds")?;
+                if callback_ids.is_empty() || callback_ids.len() > MAX_COMMANDS_PER_RULE {
+                    bail!("SDK hook matcher 必须包含 1..={MAX_COMMANDS_PER_RULE} 个 callback")
+                }
+                let actions = callback_ids
+                    .iter()
+                    .map(|callback_id| {
+                        let callback_id = callback_id
+                            .as_str()
+                            .context("SDK hook callback id 必须是 string")?;
+                        if callback_id.is_empty()
+                            || callback_id.len() > 512
+                            || callback_id.contains(['\0', '\n', '\r'])
+                        {
+                            bail!("SDK hook callback id 无效")
+                        }
+                        Ok(Arc::new(HookAction::SdkCallback(Box::new(
+                            SdkCallbackHook {
+                                callback_id: callback_id.to_owned(),
+                                timeout,
+                            },
+                        ))))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rules.push(HookRule {
+                    matcher: parse_matcher(pattern)?,
+                    actions,
+                });
+            }
+            events.insert(event.clone(), rules);
+        }
+        let sdk_runner = HookRunner {
+            events: Arc::new(events),
+            file_watch_patterns: Arc::new(file_watch_patterns),
+            additional: Vec::new(),
+            async_slots: Arc::clone(&self.async_slots),
+            mcp_invoker: self.mcp_invoker.clone(),
+            sdk_hook_invoker: Some(invoker),
+            secret_env_scrubber: self.secret_env_scrubber.clone(),
+            observer: self.observer.clone(),
+            next_observer_id: Arc::clone(&self.next_observer_id),
+            async_tasks: Arc::clone(&self.async_tasks),
+            async_finalizing: Arc::clone(&self.async_finalizing),
+        };
+        self.additional.push(Arc::new(sdk_runner));
+        Ok(self)
     }
 
     fn with_secret_env_scrubber(mut self, scrubber: SecretEnvScrubber) -> Self {
@@ -492,7 +628,7 @@ impl HookRunner {
             || self.additional.iter().any(|runner| runner.has_event(event))
     }
 
-    pub(crate) fn file_watch_patterns(&self) -> Result<Vec<String>> {
+    pub fn file_watch_patterns(&self) -> Result<Vec<String>> {
         let mut patterns = self.file_watch_patterns.as_ref().clone();
         for runner in &self.additional {
             patterns.extend(runner.file_watch_patterns()?);
@@ -647,6 +783,7 @@ impl HookRunner {
                     let payload = payload.clone();
                     let cwd = cwd.to_owned();
                     let mcp_invoker = self.mcp_invoker.clone();
+                    let sdk_hook_invoker = self.sdk_hook_invoker.clone();
                     let secret_env_scrubber = self.secret_env_scrubber.clone();
                     let observer = self.observer.clone();
                     let event = event.to_owned();
@@ -679,6 +816,7 @@ impl HookRunner {
                             &payload,
                             &cwd,
                             mcp_invoker.as_ref(),
+                            sdk_hook_invoker.as_ref(),
                             &secret_env_scrubber,
                         )
                         .await;
@@ -714,6 +852,7 @@ impl HookRunner {
                     &payload,
                     cwd,
                     self.mcp_invoker.as_ref(),
+                    self.sdk_hook_invoker.as_ref(),
                     &self.secret_env_scrubber,
                 )
                 .await
@@ -1055,6 +1194,7 @@ impl HookAction {
         match self {
             Self::Command(hook) => hook.asynchronous,
             Self::McpTool(hook) => hook.asynchronous,
+            Self::SdkCallback(_) => false,
         }
     }
 
@@ -1062,6 +1202,7 @@ impl HookAction {
         match self {
             Self::Command(hook) => hook.status_message.as_deref(),
             Self::McpTool(hook) => hook.status_message.as_deref(),
+            Self::SdkCallback(_) => None,
         }
     }
 
@@ -1069,6 +1210,7 @@ impl HookAction {
         let condition = match self {
             Self::Command(hook) => hook.condition.as_ref(),
             Self::McpTool(hook) => hook.condition.as_ref(),
+            Self::SdkCallback(_) => None,
         };
         condition.is_none_or(|condition| condition.matches(event, payload))
     }
@@ -1079,6 +1221,7 @@ impl HookAction {
             Self::Command(hook) if hook.once => hook.fired.swap(true, Ordering::AcqRel),
             Self::McpTool(hook) if hook.once => hook.fired.swap(true, Ordering::AcqRel),
             Self::Command(_) | Self::McpTool(_) => false,
+            Self::SdkCallback(_) => false,
         }
     }
 
@@ -1087,6 +1230,7 @@ impl HookAction {
             Self::Command(hook) if hook.once => hook.fired.store(false, Ordering::Release),
             Self::McpTool(hook) if hook.once => hook.fired.store(false, Ordering::Release),
             Self::Command(_) | Self::McpTool(_) => {}
+            Self::SdkCallback(_) => {}
         }
     }
 }
@@ -1218,6 +1362,7 @@ async fn execute_action(
     payload: &Value,
     cwd: &std::path::Path,
     mcp_invoker: Option<&Arc<dyn McpHookInvoker>>,
+    sdk_hook_invoker: Option<&Arc<dyn SdkHookInvoker>>,
     secret_env_scrubber: &SecretEnvScrubber,
 ) -> Result<ActionResult> {
     match action {
@@ -1261,6 +1406,42 @@ async fn execute_action(
                 body: result.output,
                 detail,
                 exit_code: Some(i32::from(result.is_error)),
+                truncated: false,
+            })
+        }
+        HookAction::SdkCallback(hook) => {
+            let invoker = sdk_hook_invoker.context("SDK hook callback invoker 未配置")?;
+            let tool_use_id = payload
+                .get("tool_use_id")
+                .or_else(|| payload.get("toolUseId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let response = timeout(
+                hook.timeout,
+                invoker.invoke(SdkHookCall {
+                    callback_id: hook.callback_id.clone(),
+                    input: payload.clone(),
+                    tool_use_id,
+                    timeout: hook.timeout,
+                }),
+            )
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .unwrap_or_else(|| json!({}));
+            if !response.is_object() {
+                bail!("SDK hook callback response 必须是 object")
+            }
+            let body = serde_json::to_string(&response)?;
+            if body.len() > MAX_HOOK_OUTPUT_BYTES {
+                bail!("SDK hook callback response 超过 {MAX_HOOK_OUTPUT_BYTES} 字节限制")
+            }
+            Ok(ActionResult {
+                succeeded: true,
+                blocked: false,
+                body,
+                detail: String::new(),
+                exit_code: Some(0),
                 truncated: false,
             })
         }
@@ -1533,7 +1714,13 @@ fn merge_hook_response(event: &str, value: Value, outcome: &mut HookOutcome) -> 
         .get("decision")
         .and_then(Value::as_str)
         .is_some_and(|decision| matches!(decision, "block" | "deny"))
-        || object.get("continue").and_then(Value::as_bool) == Some(false);
+        || object.get("continue").and_then(Value::as_bool) == Some(false)
+        || object
+            .get("hookSpecificOutput")
+            .and_then(Value::as_object)
+            .and_then(|specific| specific.get("permissionDecision"))
+            .and_then(Value::as_str)
+            .is_some_and(|decision| matches!(decision, "deny" | "block"));
     if decision_blocked {
         let reason = object
             .get("reason")
@@ -1554,6 +1741,7 @@ fn merge_hook_response(event: &str, value: Value, outcome: &mut HookOutcome) -> 
     }
     if let Some(output) = specific
         .and_then(|specific| specific.get("updatedToolOutput"))
+        .or_else(|| specific.and_then(|specific| specific.get("updatedMCPToolOutput")))
         .or_else(|| object.get("updatedToolOutput"))
     {
         outcome.updated_output = Some(match output {
@@ -1616,12 +1804,97 @@ fn merge_hook_response(event: &str, value: Value, outcome: &mut HookOutcome) -> 
 mod tests {
     use super::*;
 
+    struct TestSdkHookInvoker {
+        calls: std::sync::Mutex<Vec<SdkHookCall>>,
+        response: Value,
+    }
+
+    #[async_trait]
+    impl SdkHookInvoker for TestSdkHookInvoker {
+        async fn invoke(&self, call: SdkHookCall) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(call);
+            Ok(self.response.clone())
+        }
+    }
+
     struct TestMcpInvoker {
         calls: std::sync::Mutex<Vec<McpHookCall>>,
         output: String,
         is_error: bool,
         delay: Duration,
         failure: Option<String>,
+    }
+
+    #[tokio::test]
+    async fn sdk_callback_hooks_apply_structured_updates_and_matchers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let invoker = Arc::new(TestSdkHookInvoker {
+            calls: std::sync::Mutex::new(Vec::new()),
+            response: json!({
+                "hookSpecificOutput":{
+                    "hookEventName":"PreToolUse",
+                    "updatedInput":{"file_path":"updated.txt"},
+                    "additionalContext":"sdk-context"
+                }
+            }),
+        });
+        let runner = HookRunner::default()
+            .with_sdk_callbacks(
+                &json!({
+                    "PreToolUse":[{
+                        "matcher":"Write|Edit",
+                        "hookCallbackIds":["callback-1"],
+                        "timeout":1
+                    }]
+                }),
+                invoker.clone(),
+            )
+            .unwrap();
+        let (input, context) = runner
+            .pre_tool(
+                "Write",
+                json!({"file_path":"original.txt"}),
+                temporary.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(input["file_path"], "updated.txt");
+        assert_eq!(context, ["sdk-context"]);
+        let calls = invoker
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].callback_id, "callback-1");
+        assert_eq!(calls[0].input["hook_event_name"], "PreToolUse");
+    }
+
+    #[tokio::test]
+    async fn sdk_callback_hook_block_decisions_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let invoker = Arc::new(TestSdkHookInvoker {
+            calls: std::sync::Mutex::new(Vec::new()),
+            response: json!({"decision":"block", "reason":"SDK denied"}),
+        });
+        let runner = HookRunner::default()
+            .with_sdk_callbacks(
+                &json!({
+                    "PreToolUse":[{
+                        "hookCallbackIds":["callback-2"],
+                        "timeout":1
+                    }]
+                }),
+                invoker,
+            )
+            .unwrap();
+        let error = runner
+            .pre_tool("Write", json!({}), temporary.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("SDK denied"));
     }
 
     impl TestMcpInvoker {

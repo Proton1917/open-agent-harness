@@ -69,7 +69,8 @@ pub struct RequestParts<'a> {
     pub include_stream_usage: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
     Medium,

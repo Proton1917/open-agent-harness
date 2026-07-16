@@ -1,0 +1,92 @@
+# kind	source	status	category	implementation_evidence	test_evidence	note
+control	apply_flag_settings	implemented	config-environment-runtime	src/control.rs;src/main.rs	tests/cli_output.rs	Bounded in-memory settings overlay with live model permission hooks commands agents sandbox and scrubber refresh.
+control	can_use_tool	implemented	permission-sandbox-runtime	src/control.rs;src/permissions.rs	src/control.rs	Outbound correlated permission requests support updated input deny and interrupt.
+control	cancel_async_message	implemented	async-lifecycle-runtime	src/control.rs	src/control.rs	Queued UUID cancellation is immediate and lifecycle-aware.
+control	channel_enable	excluded	hosted-marketplace-excluded	-	-	Source operation requires marketplace plugin channel provenance.
+control	claude_authenticate	excluded	vendor-account-excluded	-	-	First-party account OAuth is outside the provider-neutral endpoint contract.
+control	claude_oauth_callback	excluded	vendor-account-excluded	-	-	First-party account OAuth callback is outside scope.
+control	claude_oauth_wait_for_completion	excluded	vendor-account-excluded	-	-	First-party account OAuth completion is outside scope.
+control	elicitation	implemented	mcp-lsp-runtime	src/control.rs;src/mcp.rs	src/control.rs;src/mcp.rs	Outbound bounded MCP form and URL elicitation uses the SDK interaction channel.
+control	end_session	implemented	async-lifecycle-runtime	src/control.rs;src/main.rs	src/control.rs;tests/cli_output.rs	Acknowledged termination exits the input loop and runs normal service and hook cleanup.
+control	generate_session_title	equivalent	session-runtime	src/main.rs;src/session.rs	src/main.rs	Returns and optionally persists a bounded deterministic title without an extra proprietary small-model call.
+control	get_context_usage	implemented	context-inspection-runtime	src/context_inspection.rs;src/main.rs	tests/cli_output.rs	Returns bounded category and context-window data.
+control	get_settings	implemented	config-environment-runtime	src/control.rs;src/main.rs	tests/cli_output.rs	Returns effective runtime state and redacted flag source.
+control	hook_callback	implemented	extension-runtime	src/control.rs;src/hooks.rs;src/main.rs	src/hooks.rs	Outbound SDK hook callbacks are correlated bounded cancellable and fail open on host errors as in source.
+control	initialize	implemented	model-protocol-runtime	src/control.rs;src/main.rs	tests/cli_output.rs	Single-use initialization applies all audited fields before queued turns.
+control	interrupt	implemented	async-lifecycle-runtime	src/control.rs;src/main.rs	src/control.rs;tests/cli_interrupt.rs	Immediate cancellation generation interrupts turns pending callbacks and suggestions.
+control	mcp_authenticate	equivalent	mcp-lsp-runtime	src/mcp_oauth.rs;src/mcp.rs	src/mcp_oauth.rs	Headless OAuth starts during connect or reconnect and exchanges authorization URL and callback through explicit private channels.
+control	mcp_clear_auth	equivalent	mcp-lsp-runtime	src/mcp_oauth.rs;src/mcp.rs	src/mcp_oauth.rs	Fingerprint-bound private token stores can be explicitly replaced or removed before reconnect without account state.
+control	mcp_message	implemented	mcp-lsp-runtime	src/control.rs;src/mcp.rs	src/mcp.rs;tests/cli_output.rs	Bounded SDK transport JSON-RPC delivery is correlated through control IO.
+control	mcp_oauth_callback_url	equivalent	mcp-lsp-runtime	src/mcp_oauth.rs;src/mcp.rs	src/mcp_oauth.rs	Validated callback URLs enter through configured private file or environment channels rather than an implicit browser listener.
+control	mcp_reconnect	implemented	mcp-lsp-runtime	src/mcp.rs;src/main.rs	src/mcp.rs;tests/cli_output.rs	Reconnect refreshes client state and discovered tools.
+control	mcp_set_servers	implemented	mcp-lsp-runtime	src/control.rs;src/mcp.rs;src/main.rs	src/mcp.rs;tests/cli_output.rs	Dedicated dynamic layer is replaced transactionally with collision and resource checks.
+control	mcp_status	implemented	mcp-lsp-runtime	src/mcp.rs;src/main.rs	tests/cli_output.rs	All configured plugin and SDK-owned server states are reported.
+control	mcp_toggle	implemented	mcp-lsp-runtime	src/mcp.rs;src/main.rs	src/mcp.rs	Enable and disable update clients tools resources and state in the current session.
+control	reload_plugins	implemented	extension-runtime	src/main.rs;src/mcp.rs;src/lsp.rs	tests/cli_output.rs	Commands skills agents hooks monitors MCP and LSP layers refresh in the live session.
+control	remote_control	excluded	vendor-hosted-remote-excluded	-	-	Hosted bridge ingress and remote session URLs require vendor identity and infrastructure.
+control	rewind_files	implemented	git-worktree-runtime	src/file_history.rs;src/main.rs	src/file_history.rs;tests/cli_output.rs	Dry-run and apply paths use exact checkpoints and bounded reports.
+control	seed_read_state	implemented	filesystem-runtime	src/control.rs;src/main.rs	src/control.rs	Permission checked mtime validated bounded UTF-8 content seeds the same stale-read cache.
+control	set_max_thinking_tokens	excluded	vendor-model-routing-excluded	-	-	Exact token budgets do not map consistently across Messages Chat Completions and Responses; named effort remains supported.
+control	set_model	implemented	model-protocol-runtime	src/control.rs;src/main.rs	src/control.rs;tests/cli_output.rs	Validated runtime model selection supports reset to the session base model.
+control	set_permission_mode	implemented	permission-sandbox-runtime	src/control.rs;src/main.rs	src/control.rs	Live mode changes preserve plan locks deny rules and prompt authority.
+control	set_proactive	excluded	experimental-proactive-excluded	-	-	Source branch is build and remote-feature gated proactive delivery.
+control	side_question	implemented	model-protocol-runtime	src/control.rs;src/query.rs;src/main.rs	tests/cli_output.rs;tests/terminal_pty.rs	Bounded tool-free side request runs concurrently without mutating the main transcript.
+control	stop_task	implemented	task-schedule-runtime	src/control.rs;src/main.rs	src/control.rs	TaskStop runs through the normal registry and ownership checks.
+initialize	hooks	implemented	extension-runtime	src/control.rs;src/hooks.rs;src/main.rs	src/hooks.rs	All source hook event names map to bounded SDK callback actions.
+initialize	sdkMcpServers	implemented	mcp-lsp-runtime	src/control.rs;src/mcp.rs;src/main.rs	src/mcp.rs	Pending SDK transports connect after the initialize response to avoid stdin deadlock.
+initialize	jsonSchema	implemented	tool-runtime	src/structured_output.rs;src/tools/mod.rs;src/main.rs	tests/cli_output.rs	Runtime StructuredOutput replacement remains schema validated and exactly once.
+initialize	systemPrompt	implemented	model-protocol-runtime	src/query.rs;src/main.rs	tests/cli_output.rs	Replaces the live root and subagent system prompt within the shared size bound.
+initialize	appendSystemPrompt	implemented	model-protocol-runtime	src/query.rs;src/main.rs	tests/cli_output.rs	Appends after selected main-agent system context.
+initialize	agents	implemented	agent-team-runtime	src/agents.rs;src/main.rs	src/agents.rs;tests/cli_output.rs	SDK definitions merge into the live catalog and can provide the explicitly selected main agent.
+initialize	promptSuggestions	implemented	command-input-runtime	src/query.rs;src/main.rs	tests/terminal_pty.rs	Explicit true or false updates the current session behavior.
+initialize	agentProgressSummaries	equivalent	agent-team-runtime	src/agents.rs;src/query.rs;src/main.rs	src/agents.rs;src/main.rs	Exact bounded agent activity is emitted in task progress summary fields without a hidden proprietary summarizer call.
+agent-option	description	implemented	agent-team-runtime	src/agents.rs	src/agents.rs	Bounded agent selection description.
+agent-option	tools	implemented	agent-team-runtime	src/agents.rs;src/tools/mod.rs	src/agents.rs	Allowed tool policy can only narrow parent capability.
+agent-option	disallowedTools	implemented	agent-team-runtime	src/agents.rs;src/tools/mod.rs	src/agents.rs	Deny policy accumulates across parent and child.
+agent-option	prompt	implemented	agent-team-runtime	src/agents.rs;src/main.rs	src/agents.rs;tests/cli_output.rs	Used as subagent context and selected main-agent system prompt.
+agent-option	model	implemented	model-protocol-runtime	src/agents.rs;src/main.rs	src/agents.rs	Agent model inherits or selects a validated identifier.
+agent-option	mcpServers	implemented	mcp-lsp-runtime	src/agents.rs;src/mcp.rs;src/tools/mod.rs	src/agents.rs	Named servers are validated and inline servers use an isolated owned registry and cleanup service.
+agent-option	criticalSystemReminder_EXPERIMENTAL	implemented	agent-team-runtime	src/main.rs;src/agents.rs	tests/cli_output.rs	Reminder is retained in the persistent agent system context.
+agent-option	skills	implemented	extension-runtime	src/agents.rs	src/agents.rs	Trusted skills are preloaded with an independent context byte ceiling.
+agent-option	initialPrompt	implemented	command-input-runtime	src/cli.rs;src/main.rs	tests/cli_output.rs	Explicit main-agent selection prepends or auto-submits the first user turn and processes slash expansion.
+agent-option	maxTurns	implemented	agent-team-runtime	src/agents.rs	src/agents.rs	Per-agent model round ceiling is bounded.
+agent-option	background	implemented	agent-team-runtime	src/agents.rs	src/agents.rs	Definition can default invocations to owned background jobs.
+agent-option	memory	equivalent	memory-runtime	src/agents.rs;src/auto_memory.rs	src/agents.rs	User project and local scopes map to private provider-neutral memory stores injected as untrusted bounded data.
+agent-option	effort	equivalent	model-protocol-runtime	src/agents.rs;src/protocol.rs	src/agents.rs	Portable named effort levels are per-agent; source-only numeric routing values fail closed.
+agent-option	permissionMode	implemented	permission-sandbox-runtime	src/agents.rs;src/permissions.rs	src/agents.rs	Invocation-local view preserves shared denies and cannot escape a parent Plan lock.
+stdin-schema	SDKControlRequestSchema	implemented	model-protocol-runtime	src/control.rs	src/control.rs	Bounded validated request input.
+stdin-schema	SDKControlResponseSchema	implemented	model-protocol-runtime	src/control.rs	src/control.rs	Correlated response resolves pending outbound requests.
+stdin-schema	SDKKeepAliveMessageSchema	implemented	async-lifecycle-runtime	src/control.rs	src/control.rs	Keep-alive is accepted and ignored without queue growth.
+stdin-schema	SDKUpdateEnvironmentVariablesMessageSchema	excluded	vendor-hosted-remote-excluded	-	-	Source message exists to refresh hosted bridge auth tokens; runtime environment mutation is explicitly rejected.
+stdin-schema	SDKUserMessageSchema	implemented	model-protocol-runtime	src/control.rs;src/main.rs	src/control.rs;tests/cli_output.rs	Validated direct user content supports priority queues and lifecycle acknowledgements.
+stdout-schema	SDKAPIRetryMessageSchema	equivalent	model-protocol-runtime	src/query.rs;src/main.rs	tests/query_loop.rs	Bounded retry status carries attempt delay and sanitized reason.
+stdout-schema	SDKAssistantMessageSchema	implemented	model-protocol-runtime	src/main.rs	tests/cli_output.rs	Assistant content is emitted with UUID and session identity.
+stdout-schema	SDKAuthStatusMessageSchema	excluded	vendor-account-excluded	-	-	Account authentication status is outside endpoint-neutral runtime.
+stdout-schema	SDKCompactBoundaryMessageSchema	implemented	context-compact-runtime	src/query.rs;src/main.rs	tests/compact_flow.rs	Compaction boundary includes before and after token estimates.
+stdout-schema	SDKControlCancelRequestSchema	equivalent	async-lifecycle-runtime	src/control.rs	src/control.rs	Cancellation generations and incoming cancel responses end pending requests without leaking orphan state.
+stdout-schema	SDKControlRequestSchema	implemented	model-protocol-runtime	src/control.rs	src/control.rs	Outbound permissions hooks MCP messages and elicitation are correlated.
+stdout-schema	SDKControlResponseSchema	implemented	model-protocol-runtime	src/control.rs	src/control.rs;tests/cli_output.rs	Success error and unsupported responses are explicit.
+stdout-schema	SDKElicitationCompleteMessageSchema	equivalent	mcp-lsp-runtime	src/mcp.rs;src/control.rs	src/mcp.rs	Synchronous bounded elicitation completion is returned on the correlated interaction instead of a later hosted event.
+stdout-schema	SDKFilesPersistedEventSchema	excluded	vendor-hosted-remote-excluded	-	-	Hosted file upload identifiers are outside local persistence.
+stdout-schema	SDKHookProgressMessageSchema	equivalent	extension-runtime	src/hooks.rs;src/main.rs	src/hooks.rs	Hook start and terminal response events expose bounded lifecycle without streaming arbitrary hook stdout.
+stdout-schema	SDKHookResponseMessageSchema	implemented	extension-runtime	src/hooks.rs;src/main.rs	src/hooks.rs	Hook outcome event is sanitized before transport.
+stdout-schema	SDKHookStartedMessageSchema	implemented	extension-runtime	src/hooks.rs;src/main.rs	src/hooks.rs	Hook start event is available when explicitly requested.
+stdout-schema	SDKKeepAliveMessageSchema	equivalent	async-lifecycle-runtime	src/control.rs	src/control.rs	Local stdio accepts keep-alive frames as bounded no-ops; it does not manufacture proxy keep-alives needed only by hosted WebSocket bridges.
+stdout-schema	SDKLocalCommandOutputMessageSchema	equivalent	command-input-runtime	src/main.rs	tests/cli_output.rs	Control slash results carry structured command_result and error state.
+stdout-schema	SDKPartialAssistantMessageSchema	equivalent	model-protocol-runtime	src/main.rs;src/query.rs	tests/cli_output.rs	Explicit partial mode emits schema-compatible stream_event wrappers around provider-neutral visible text deltas while withholding private reasoning and provider state.
+stdout-schema	SDKPostTurnSummaryMessageSchema	excluded	experimental-proactive-excluded	-	-	Internal post-turn classifier is not active provider-neutral conversation output.
+stdout-schema	SDKPromptSuggestionMessageSchema	implemented	command-input-runtime	src/query.rs;src/main.rs	tests/terminal_pty.rs	Opt-in bounded next-prompt event.
+stdout-schema	SDKRateLimitEventSchema	equivalent	model-protocol-runtime	src/api.rs;src/query.rs;src/main.rs	tests/query_loop.rs	Provider-neutral retry and failure state replaces first-party quota metadata.
+stdout-schema	SDKResultMessageSchema	equivalent	model-protocol-runtime	src/main.rs	tests/cli_output.rs	Final text usage structured output and errors are bounded; vendor billing and account-derived model cost fields are intentionally absent.
+stdout-schema	SDKSessionStateChangedMessageSchema	implemented	async-lifecycle-runtime	src/main.rs	tests/cli_output.rs	Running and authoritative idle bookends surround stream control turns.
+stdout-schema	SDKStatusMessageSchema	equivalent	model-protocol-runtime	src/main.rs	tests/cli_output.rs	The open stream extends compacting and null status with running interrupted failed and idle lifecycle states.
+stdout-schema	SDKStreamlinedTextMessageSchema	excluded	internal-diagnostics-excluded	-	-	Source transformer is build-gated internal compact telemetry output.
+stdout-schema	SDKStreamlinedToolUseSummaryMessageSchema	excluded	internal-diagnostics-excluded	-	-	Source transformer is build-gated internal compact telemetry output.
+stdout-schema	SDKSystemMessageSchema	equivalent	model-protocol-runtime	src/main.rs	tests/cli_output.rs	Provider-neutral init metadata omits vendor API-key and branded-version fields while retaining bounded tools commands skills agents plugins settings and capabilities.
+stdout-schema	SDKTaskNotificationMessageSchema	implemented	agent-team-runtime	src/agents.rs;src/main.rs	src/agents.rs;src/main.rs	Agent completion and failure bookends include actual final token tool-use and duration counters without exposing output paths.
+stdout-schema	SDKTaskProgressMessageSchema	implemented	agent-team-runtime	src/agents.rs;src/main.rs	src/agents.rs;src/main.rs	Exact bounded agent activity includes cumulative tool-use elapsed duration last tool and optional summary; unavailable in-flight token totals remain zero until completion.
+stdout-schema	SDKTaskStartedMessageSchema	implemented	agent-team-runtime	src/agents.rs;src/main.rs	src/agents.rs;src/main.rs	Owned agent execution emits a start event.
+stdout-schema	SDKToolProgressMessageSchema	implemented	tool-runtime	src/query.rs;src/main.rs	tests/cli_output.rs	Tool start and finish include stable IDs names elapsed time and error state.
+stdout-schema	SDKToolUseSummaryMessageSchema	equivalent	tool-runtime	src/query.rs;src/main.rs	tests/cli_output.rs	Exact tool progress and bounded results replace an additional proprietary summarizer message.
+stdout-schema	SDKUserMessageReplaySchema	implemented	command-input-runtime	src/control.rs	src/control.rs;tests/cli_output.rs	Explicit replay mode acknowledges accepted user delivery only.
+stdout-schema	SDKUserMessageSchema	implemented	model-protocol-runtime	src/control.rs;src/main.rs	src/control.rs	User messages remain validated input and transcript content.

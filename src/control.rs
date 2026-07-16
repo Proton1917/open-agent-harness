@@ -380,7 +380,10 @@ impl ControlHandle {
                 PendingStreamOutput::Lifecycle(command_uuid, state) => {
                     self.emit_command_lifecycle_for(&session_id, command_uuid, state)?;
                 }
-                PendingStreamOutput::Message(message) => self.emit(&message)?,
+                PendingStreamOutput::Message(mut message) => {
+                    message["session_id"] = Value::String(session_id.clone());
+                    self.emit(&message)?;
+                }
             }
         }
         Ok(())
@@ -410,14 +413,14 @@ impl ControlHandle {
         Ok(())
     }
 
-    fn replay_user_message(&self, message: Value) -> Result<()> {
-        let active = {
+    fn replay_user_message(&self, mut message: Value) -> Result<()> {
+        let session_id = {
             let mut lifecycle = self
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if lifecycle.session_id.is_some() {
-                true
+            if let Some(session_id) = &lifecycle.session_id {
+                Some(session_id.clone())
             } else {
                 if lifecycle.pending.len() >= MAX_PENDING_LIFECYCLE_EVENTS {
                     lifecycle.pending.pop_front();
@@ -425,10 +428,11 @@ impl ControlHandle {
                 lifecycle
                     .pending
                     .push_back(PendingStreamOutput::Message(message.clone()));
-                false
+                None
             }
         };
-        if active {
+        if let Some(session_id) = session_id {
+            message["session_id"] = Value::String(session_id);
             self.emit(&message)?;
         }
         Ok(())
@@ -509,7 +513,7 @@ impl ControlHandle {
         self.request_with_timeout(request, self.request_timeout)
     }
 
-    fn request_with_timeout(&self, request: Value, request_timeout: Duration) -> Result<Value> {
+    pub fn request_with_timeout(&self, request: Value, request_timeout: Duration) -> Result<Value> {
         if !request.is_object() || request.get("subtype").and_then(Value::as_str).is_none() {
             bail!("control request 必须是带 subtype 的 object")
         }
@@ -910,7 +914,9 @@ fn read_input_loop<R: BufRead>(mut reader: R, inbound: InboundSenders, state: In
                                     "type":"user",
                                     "uuid":uuid,
                                     "message":{"role":"user", "content":content.clone()},
+                                    "parent_tool_use_id":Value::Null,
                                     "priority":priority_name(*priority),
+                                    "isReplay":true,
                                     "replayed":true,
                                 }))
                                 .is_err())
@@ -1225,6 +1231,26 @@ fn validate_control_request(request: &Value) -> Result<()> {
             }
             Ok(())
         }
+        "set_model" => {
+            if let Some(model) = request.get("model") {
+                let model = model.as_str().context("set_model.model 必须是 string")?;
+                validate_bounded_text("set_model.model", model, 512)?;
+            }
+            Ok(())
+        }
+        "set_max_thinking_tokens" => {
+            let value = request
+                .get("max_thinking_tokens")
+                .context("set_max_thinking_tokens 缺少 max_thinking_tokens")?;
+            if !value.is_null()
+                && value.as_f64().is_none_or(|tokens| {
+                    !tokens.is_finite() || tokens < 0.0 || tokens > u32::MAX as f64
+                })
+            {
+                bail!("max_thinking_tokens 必须是 null 或有界非负 number")
+            }
+            Ok(())
+        }
         "mcp_reconnect" => {
             required_bounded_string(request, "serverName", MAX_CONTROL_NAME_BYTES)?;
             Ok(())
@@ -1250,6 +1276,65 @@ fn validate_control_request(request: &Value) -> Result<()> {
                 if !config.is_object() {
                     bail!("mcp_set_servers.servers.{name} 必须是 object")
                 }
+            }
+            Ok(())
+        }
+        "mcp_message" => {
+            required_bounded_string(request, "server_name", MAX_CONTROL_NAME_BYTES)?;
+            let message = request.get("message").context("mcp_message 缺少 message")?;
+            if !message.is_object() || serde_json::to_vec(message)?.len() > 8 * 1024 * 1024 {
+                bail!("mcp_message.message 必须是有界 JSON object")
+            }
+            Ok(())
+        }
+        "apply_flag_settings" => {
+            let settings = request
+                .get("settings")
+                .and_then(Value::as_object)
+                .context("apply_flag_settings.settings 必须是 object")?;
+            if settings.len() > MAX_CONTROL_COLLECTION_ITEMS
+                || serde_json::to_vec(settings)?.len() > 512 * 1024
+            {
+                bail!("apply_flag_settings.settings 超过资源限制")
+            }
+            for key in settings.keys() {
+                validate_bounded_text("apply_flag_settings key", key, 256)?;
+            }
+            Ok(())
+        }
+        "stop_task" => {
+            let task_id = request
+                .get("task_id")
+                .or_else(|| request.get("taskId"))
+                .and_then(Value::as_str)
+                .context("stop_task.task_id 必须是 string")?;
+            validate_bounded_text("stop_task.task_id", task_id, MAX_CONTROL_NAME_BYTES)
+        }
+        "end_session" => {
+            if let Some(reason) = request.get("reason") {
+                let reason = reason
+                    .as_str()
+                    .context("end_session.reason 必须是 string")?;
+                validate_bounded_text("end_session.reason", reason, 4096)?;
+            }
+            Ok(())
+        }
+        "generate_session_title" => {
+            if let Some(description) = request.get("description") {
+                let description = description
+                    .as_str()
+                    .context("generate_session_title.description 必须是 string")?;
+                validate_bounded_text(
+                    "generate_session_title.description",
+                    description,
+                    16 * 1024,
+                )?;
+            }
+            if request
+                .get("persist")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                bail!("generate_session_title.persist 必须是 boolean")
             }
             Ok(())
         }
@@ -1337,8 +1422,8 @@ fn validate_initialize_hooks(value: &Value) -> Result<()> {
                 let timeout = timeout
                     .as_f64()
                     .with_context(|| format!("initialize.hooks.{event}.timeout 必须是 number"))?;
-                if !timeout.is_finite() || timeout < 0.0 {
-                    bail!("initialize.hooks.{event}.timeout 必须是非负有限数")
+                if !timeout.is_finite() || timeout <= 0.0 || timeout > 600.0 {
+                    bail!("initialize.hooks.{event}.timeout 必须在 0..=600 秒范围内")
                 }
             }
         }
@@ -1957,6 +2042,9 @@ mod tests {
         assert_eq!(replayed["uuid"], uuid.to_string());
         assert_eq!(replayed["message"]["content"], "ack me");
         assert_eq!(replayed["priority"], "later");
+        assert_eq!(replayed["parent_tool_use_id"], Value::Null);
+        assert_eq!(replayed["session_id"], "session-1");
+        assert_eq!(replayed["isReplay"], true);
         assert_eq!(replayed["replayed"], true);
     }
 

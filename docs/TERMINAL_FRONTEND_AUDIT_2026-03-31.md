@@ -37,6 +37,9 @@ The frontend comparison is grounded principally in these source files:
   command behavior.
 - `src/components/StatusLine.tsx` and the status-line setup implementation for
   refresh behavior and the public JSON input schema.
+- `src/utils/terminalPanel.ts`, `src/hooks/useGlobalKeybindings.tsx`, and
+  `src/components/SessionBackgroundHint.tsx` for terminal suspension, Alt-J,
+  process-local shell persistence, fallback, and source activation gates.
 
 ## Implemented provider-neutral behavior
 
@@ -100,6 +103,11 @@ The frontend comparison is grounded principally in these source files:
 - Model, theme, permission, settings, task, MCP, resume, and rewind pickers are
   terminal-sized and preserve the draft. `/effort`, `/output-style`, plugin
   reload, and the status-line public schema are provider-neutral.
+- `terminalPanelEnabled` is an explicit user-only, default-off setting. Alt-J
+  releases raw/fullscreen ownership and opens a credential-scrubbed private
+  shell; a process-instance tmux server preserves it between toggles, while a
+  direct login shell is the bounded fallback. The active-turn composer is
+  restored without cancelling the running model request.
 - The trusted status line refreshes asynchronously and receives source-shaped
   model/workspace/context fields with local absolute paths intentionally
   reduced to public relative or opaque identities.
@@ -143,3 +151,7 @@ The frontend comparison is grounded principally in these source files:
   frequency data derived from a vendor's private installation are not copied.
 - The 2.1.207 archive may inform a separate generic backend capability audit,
   but it cannot expand or redefine the frontend claim in this document.
+- Main-session backgrounding is not an active snapshot behavior: both the
+  mounted hint and its keybinding branch are guarded by `isEnvTruthy("false")`.
+  The implementation file is inventoried as source-inactive rather than
+  presented as a missing provider-neutral feature.

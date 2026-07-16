@@ -17,7 +17,8 @@ pub const MAX_USER_PERMISSION_RULE_BYTES: usize = 512;
 pub const MAX_RECENT_PERMISSION_PROMPTS: usize = 64;
 pub const MAX_RECENT_PERMISSION_SUMMARY_BYTES: usize = 512;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
     Default,
     AcceptEdits,
@@ -302,6 +303,19 @@ impl PermissionManager {
             user_rules: Arc::clone(&self.user_rules),
             recent_prompts: Arc::clone(&self.recent_prompts),
         }
+    }
+
+    /// Creates a context-local permission view for an explicitly selected
+    /// custom agent. Shared deny rules, grants, prompts, and user policy remain
+    /// live, while the requested mode cannot escape a parent Plan lock.
+    pub(crate) fn fork_for_context_with_mode(&self, mode: PermissionMode) -> Result<Self> {
+        if self.effective_mode() == PermissionMode::Plan && mode != PermissionMode::Plan {
+            bail!("custom agent 不能解除 parent plan permission mode")
+        }
+        let mut fork = self.fork_for_context();
+        fork.mode = mode;
+        fork.session_mode = Arc::new(RwLock::new(Some(mode)));
+        Ok(fork)
     }
 
     /// Creates an invocation-local view that adds trusted allow rules while

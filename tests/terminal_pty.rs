@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::os::unix::fs::PermissionsExt as _;
+
 #[test]
 fn composer_handles_mode_help_and_double_interrupt_exit() {
     let _serial = serial_terminal_test();
@@ -87,6 +89,74 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     terminal.write_all(b"\x03").unwrap();
     assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     assert!(output.contains("accept edits"));
+}
+
+#[test]
+fn terminal_panel_is_explicit_and_restores_the_live_composer() {
+    let _serial = serial_terminal_test();
+    let programs = tempfile::tempdir().unwrap();
+    let shell = programs.path().join("panel-shell");
+    let marker = programs.path().join("opened");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf 'opened' > '{}'\nprintf 'PANEL_SHELL_OPENED\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let shell_env = format!("SHELL={}", shell.display());
+    let path_env = format!("PATH={}", programs.path().display());
+    let (mut child, mut terminal) = spawn_terminal(&[&shell_env, &path_env]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+    terminal.write_all(b"\x1bj").unwrap();
+    let disabled = read_until(
+        &mut terminal,
+        "Terminal panel disabled",
+        Duration::from_secs(3),
+    );
+    assert!(disabled.contains("terminalPanelEnabled"), "{disabled}");
+    assert!(!marker.exists());
+
+    terminal
+        .write_all(b"/config terminalPanelEnabled=true\r")
+        .unwrap();
+    let updated = read_until(
+        &mut terminal,
+        "Updated UI setting terminalPanelEnabled.",
+        Duration::from_secs(3),
+    );
+    if !updated.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x1bj").unwrap();
+    let opened = read_until(&mut terminal, "PANEL_SHELL_OPENED", Duration::from_secs(5));
+    let restored = if opened.contains("Returned from direct terminal shell") {
+        opened
+    } else {
+        read_until(
+            &mut terminal,
+            "Returned from direct terminal shell",
+            Duration::from_secs(3),
+        )
+    };
+    assert!(marker.exists());
+    assert!(restored.contains("Shift+Tab mode"), "{restored}");
+    assert!(child.try_wait().unwrap().is_none());
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -760,6 +830,88 @@ fn active_turn_btw_answers_without_interrupting_or_mutating_the_main_queue() {
     assert!(requests[2].contains("queued follow-up"));
     assert!(!requests[2].contains("SIDE_QUESTION_ANSWER"));
     assert!(!requests[2].contains("what is the active objective?"));
+}
+
+#[test]
+fn active_turn_terminal_panel_suspends_and_restores_without_cancelling_the_turn() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        thread::sleep(Duration::from_secs(2));
+        let response = text_stream("ACTIVE_PANEL_TURN_DONE");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let programs = tempfile::tempdir().unwrap();
+    let shell = programs.path().join("active-panel-shell");
+    std::fs::write(&shell, "#!/bin/sh\nprintf 'ACTIVE_PANEL_SHELL_OPENED\\n'\n").unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let shell_env = format!("SHELL={}", shell.display());
+    let path_env = format!("PATH={}", programs.path().display());
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url, &shell_env, &path_env]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    terminal
+        .write_all(b"/config terminalPanelEnabled=true\r")
+        .unwrap();
+    let configured = read_until(
+        &mut terminal,
+        "Updated UI setting terminalPanelEnabled.",
+        Duration::from_secs(3),
+    );
+    if !configured.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"keep the main turn alive\r").unwrap();
+    let active = read_until(&mut terminal, "Alt+J terminal", Duration::from_secs(5));
+    assert!(active.contains("/btw asks separately"), "{active}");
+
+    terminal.write_all(b"\x1bj").unwrap();
+    let shell_output = read_until(
+        &mut terminal,
+        "ACTIVE_PANEL_SHELL_OPENED",
+        Duration::from_secs(5),
+    );
+    let restored = if shell_output.contains("main turn still running") {
+        shell_output
+    } else {
+        read_until(
+            &mut terminal,
+            "main turn still running",
+            Duration::from_secs(3),
+        )
+    };
+    assert!(restored.contains("Returned from direct terminal shell"));
+    let completed = read_until(
+        &mut terminal,
+        "ACTIVE_PANEL_TURN_DONE",
+        Duration::from_secs(6),
+    );
+    assert!(completed.contains("ACTIVE_PANEL_TURN_DONE"));
+    assert!(child.try_wait().unwrap().is_none());
+
+    if !completed.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
 }
 
 #[test]

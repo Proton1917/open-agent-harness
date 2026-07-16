@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
@@ -13,6 +13,27 @@ const MAX_USER_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_SYSTEM_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SYSTEM_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_QUEUED_INTERACTIVE_INPUTS: usize = 8;
+const STREAM_CAPABILITIES: &[&str] = &[
+    "agent_task_events_v1",
+    "cancel_async_message_v1",
+    "command_lifecycle_v1",
+    "dynamic_flag_settings_v1",
+    "dynamic_plugin_reload_v1",
+    "end_session_v1",
+    "generate_session_title_v1",
+    "interrupt_receipt_v1",
+    "main_agent_initialize_v1",
+    "mcp_dynamic_servers_v1",
+    "mcp_reconnect_v1",
+    "mcp_sdk_transport_v1",
+    "mcp_toggle_v1",
+    "queue_priority_v1",
+    "replay_user_messages_v1",
+    "rewind_conversation_v1",
+    "sdk_hooks_v1",
+    "side_question_v1",
+    "stop_task_v1",
+];
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -23,10 +44,10 @@ use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 
 use open_agent_harness::{
-    agents::configure_agents,
+    agents::{AgentTaskEvent, configure_agents, render_custom_agent_memory_context},
     api::ModelClient,
     auto_memory::{AutoMemory, AutoMemoryExtractor},
-    cli::{Cli, HarnessCommand, InputFormat, OutputFormat},
+    cli::{Cli, HarnessCommand, InputFormat, McpCommand, McpServeArgs, OutputFormat},
     clipboard::{ClipboardImage, write_clipboard_text},
     command_palette::{
         CommandCatalog, CommandDescriptor, CommandKind, CommandSource, MAX_PALETTE_RESULTS,
@@ -36,14 +57,15 @@ use open_agent_harness::{
     context_inspection::render_context_report,
     control::{ControlHandle, ControlSession, InboundMessage},
     file_history::{CheckpointInfo, CheckpointStatus, FileHistory, RewindReport},
-    hooks::{HookExecutionEvent, HookObserver, HookRunner},
+    hooks::{HookExecutionEvent, HookObserver, HookRunner, SdkHookCall, SdkHookInvoker},
     image_processing::normalize_image,
     input_history::{HistoryContext, HistoryQuery, HistoryScope, InputHistoryStore},
     interactions::UserInteractionHandler,
     keybindings::KeybindingManager,
-    lsp::configure_lsp,
-    mcp::{McpControl, McpHookInvoker, McpServerStatusKind, connect_mcp},
-    permissions::{PermissionManager, PermissionMode},
+    lsp::{LspControl, configure_lsp_with_runtime_layers},
+    mcp::{McpControl, McpHookInvoker, McpServerStatusKind, connect_mcp_with_runtime_layers},
+    mcp_server::run_stdio_server,
+    permissions::{PermissionManager, PermissionMode, UserPermissionRules},
     plan::{clear_latest_plan, load_latest_plan, plan_tools},
     plugin_manager::run_plugin_command,
     plugins::PluginCatalog,
@@ -77,6 +99,7 @@ use open_agent_harness::{
         IdleNotificationService, TerminalEnvironment, TerminalNotification,
         render_terminal_notification,
     },
+    terminal_panel::TerminalPanel,
     tools::{
         MemoryTool, TaskUiItem, TaskUiItemKind, TaskUiStatus, TeamTool, ToolContext, ToolRegistry,
         ToolService,
@@ -284,9 +307,12 @@ async fn run_active_terminal_turn(
     side_question_active: &Arc<AtomicBool>,
     side_question_usage: &Arc<Mutex<SessionUsage>>,
     queued_inputs: &mut VecDeque<String>,
+    terminal_panel: &mut TerminalPanel,
+    terminal_panel_context: &ToolContext,
+    terminal_panel_enabled: bool,
 ) -> Result<Option<TurnResult>> {
     let side_context = engine.side_question_context(Some(&content))?;
-    let mut active_input = match ActiveTurnInput::begin(ui.clone()) {
+    let mut active_input = match ActiveTurnInput::begin(ui.clone(), terminal_panel_enabled) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("Active-turn input unavailable: {error:#}");
@@ -331,6 +357,43 @@ async fn run_active_terminal_turn(
                         Ok(Some(ActiveTurnAction::Interrupt)) => {
                             if let Some(sender) = cancel_sender.take() {
                                 let _ = sender.send(());
+                            }
+                        }
+                        Ok(Some(ActiveTurnAction::ToggleTerminal)) => {
+                            if !terminal_panel_enabled {
+                                if let Err(error) = active_input.set_hint(
+                                    "Terminal panel disabled · enable terminalPanelEnabled in /config",
+                                ) {
+                                    terminal_error = Some(
+                                        error.context("cannot redraw terminal-panel status"),
+                                    );
+                                }
+                            } else {
+                                match active_input.run_modal(|| {
+                                    terminal_panel.show(terminal_panel_context)
+                                }) {
+                                    Ok(outcome) => {
+                                        if let Err(error) = active_input.set_hint(format!(
+                                            "{} · main turn still running",
+                                            outcome.message()
+                                        )) {
+                                            terminal_error = Some(
+                                                error.context("cannot redraw terminal-panel status"),
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let Err(render_error) = active_input.set_hint(format!(
+                                            "Terminal panel failed: {error:#}"
+                                        )) {
+                                            terminal_error = Some(
+                                                render_error.context(
+                                                    "cannot redraw terminal-panel failure",
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(Some(ActiveTurnAction::Submit(input))) => {
@@ -518,6 +581,12 @@ fn bootstrap() -> Result<()> {
                     .context("无法创建 plugin manager async runtime")?;
                 return runtime.block_on(run_plugin_command(command));
             }
+            HarnessCommand::Mcp {
+                command: McpCommand::Serve(mut args),
+            } => {
+                args.merge_parent_options(&cli)?;
+                return bootstrap_mcp_serve(args);
+            }
         }
     }
     let cwd = std::env::current_dir().context("无法确定当前目录")?;
@@ -550,6 +619,30 @@ fn bootstrap() -> Result<()> {
     runtime.block_on(run(cli, cwd, settings, endpoint))
 }
 
+fn bootstrap_mcp_serve(args: McpServeArgs) -> Result<()> {
+    let cwd = std::env::current_dir().context("无法确定当前目录")?;
+    let mut settings = Settings::load(&cwd, args.settings.as_deref(), args.bare)?;
+    if args.safe_mode {
+        settings.retain_safe_mode_core();
+    }
+    // SAFETY: command dispatch remains single-threaded until the runtime below is created.
+    unsafe { settings.apply_environment() };
+    // The MCP tool server does not construct a model client. Do not leak model or trust
+    // credentials into any child process launched by an explicitly authorized tool.
+    unsafe {
+        std::env::remove_var("HARNESS_API_KEY");
+        std::env::remove_var("HARNESS_AUTH_TOKEN");
+        std::env::remove_var("HARNESS_CA_CERT_FILE");
+        std::env::remove_var("HARNESS_CLIENT_CERT_FILE");
+        std::env::remove_var("HARNESS_CLIENT_KEY_FILE");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("无法创建 MCP server async runtime")?;
+    runtime.block_on(run_stdio_server(cwd, settings, args))
+}
+
 async fn run(
     cli: Cli,
     cwd: PathBuf,
@@ -565,12 +658,11 @@ async fn run(
     let mut control_session = (cli.input_format == InputFormat::StreamJson)
         .then(|| ControlSession::stdio(cli.replay_user_messages));
     let control_handle = control_session.as_ref().map(ControlSession::handle);
-    let model = cli
+    let mut model = cli
         .model
         .clone()
         .or_else(|| settings.model().map(ToOwned::to_owned))
         .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
-    let model_options = settings.model_options(&model)?;
     let mode = if cli.dangerously_skip_permissions {
         PermissionMode::BypassPermissions
     } else {
@@ -633,8 +725,8 @@ async fn run(
     // an explicit `--settings` plugin declaration remains explicit user input.
     let plugins = PluginCatalog::discover(&settings, &cwd, false)?;
     let mut plugin_count = plugins.plugins().len();
-    let plugin_mcp_definitions = plugins.mcp_servers().clone();
-    let plugin_lsp_definitions = plugins.lsp_servers().clone();
+    let mut plugin_mcp_definitions = plugins.mcp_servers().clone();
+    let mut plugin_lsp_definitions = plugins.lsp_servers().clone();
     let settings_output_style = settings.output_style()?.map(ToOwned::to_owned);
     let requested_output_style = (!cli.safe_mode)
         .then_some(
@@ -650,10 +742,36 @@ async fn run(
     let output_style = requested_output_style.unwrap_or("default").to_owned();
     let mut available_output_styles = plugins.available_output_style_names();
     plugins.apply_runtime_contributions(&mut settings)?;
+    let (store, history) = open_session(&cli, &cwd, session_state_root.as_ref())?;
+    let agents = configure_agents(&settings)?;
+    let requested_main_agent_name = cli
+        .agent
+        .clone()
+        .or(settings.agent()?.map(ToOwned::to_owned))
+        .or(store.agent_setting()?);
+    let startup_main_agent = requested_main_agent_name
+        .as_deref()
+        .and_then(|name| agents.custom_agents.get(name))
+        .cloned();
+    if let Some(name) = requested_main_agent_name.as_deref() {
+        if startup_main_agent.is_none() && cli.input_format != InputFormat::StreamJson {
+            bail!("main custom agent 不存在: {name}")
+        }
+    }
+    if let Some(agent) = &startup_main_agent {
+        store.set_agent_setting(Some(&agent.name))?;
+        if cli.model.is_none() {
+            if let Some(selected) = agent.model.as_deref().filter(|model| *model != "inherit") {
+                model = selected.to_owned();
+            }
+        }
+    }
+    let model_options = settings.model_options(&model)?;
     tool_context.configure_secret_env_scrubber(&settings)?;
-    let (plugin_skills, plugin_commands, plugin_hooks, plugin_monitors) = plugins.into_parts();
+    let (plugin_skills, mut plugin_commands, mut plugin_hooks, plugin_monitors) =
+        plugins.into_parts();
     let mut custom_commands = CustomCommandCatalog::from_settings(&settings)?;
-    custom_commands.merge(plugin_commands)?;
+    custom_commands.merge(plugin_commands.clone())?;
     tool_context.set_extension_skills(plugin_skills);
     tool_context.configure_plugin_monitors(plugin_monitors);
     let memory = AutoMemory::open(&cwd, &settings)?;
@@ -682,14 +800,12 @@ async fn run(
             });
         tool_context.set_user_interaction_handler(Some(interaction_handler));
     }
-    let agents = configure_agents(&settings)?;
     let mut custom_agent_names = agents
         .custom_agents
         .iter()
         .map(|(name, definition)| json!({"name":name, "description":definition.description}))
         .collect::<Vec<_>>();
     tool_context.set_agent_limits(agents.limits);
-    let (store, history) = open_session(&cli, &cwd, session_state_root.as_ref())?;
     let worktree = configure_worktree(&settings, &cwd)?;
     let workspace_state = store.workspace_state();
     if let Some(restored) = worktree.restore_session(&workspace_state).await? {
@@ -724,6 +840,7 @@ async fn run(
     let mut discoveries = Vec::new();
     let mut mcp_hook_invoker: Option<Arc<dyn McpHookInvoker>> = None;
     let mut mcp_control: Option<Arc<dyn McpControl>> = None;
+    let mut lsp_control: Option<Arc<dyn LspControl>> = None;
     if let Some(schema) = parse_json_schema(cli.json_schema.as_deref())? {
         active_tools.push(StructuredOutputTool::new(schema)?.into_tool());
     }
@@ -733,7 +850,15 @@ async fn run(
     deferred_tools.extend(agents.deferred_tools);
     deferred_tools.push(TeamTool::new(agents.custom_agents.clone()).into_tool());
     deferred_tools.extend(plan_tools());
-    if let Some(integration) = connect_mcp(&settings, &active_cwd, cli.debug).await? {
+    let mcp_integration = connect_mcp_with_runtime_layers(
+        &settings,
+        &active_cwd,
+        cli.debug,
+        control_handle.clone(),
+        plugin_mcp_definitions.clone(),
+    )
+    .await?;
+    if let Some(integration) = mcp_integration {
         mcp_hook_invoker = Some(Arc::clone(&integration.hook_invoker));
         mcp_control = Some(Arc::clone(&integration.control));
         if cli.debug {
@@ -748,7 +873,12 @@ async fn run(
         services.push(integration.service);
         discoveries.push(integration.discovery);
     }
-    let lsp_integration = match configure_lsp(&settings, &active_cwd, cli.debug) {
+    let lsp_integration = match configure_lsp_with_runtime_layers(
+        &settings,
+        &active_cwd,
+        cli.debug,
+        plugin_lsp_definitions.clone(),
+    ) {
         Ok(integration) => integration,
         Err(error) => {
             shutdown_services(&services).await;
@@ -756,6 +886,7 @@ async fn run(
         }
     };
     if let Some(integration) = lsp_integration {
+        lsp_control = Some(Arc::clone(&integration.control));
         if cli.debug {
             eprintln!(
                 "[debug] configured {} lazy LSP server(s)",
@@ -775,7 +906,7 @@ async fn run(
     };
     deferred_tools.extend(web.deferred_tools);
     let cleanup_services = services.clone();
-    let registry = match ToolRegistry::with_integrations(
+    let mut registry = match ToolRegistry::with_integrations(
         active_tools,
         deferred_tools,
         services,
@@ -791,6 +922,19 @@ async fn run(
         if let Err(error) = registry.restrict_to(tools) {
             registry.shutdown().await;
             return Err(error);
+        }
+    }
+    if let Some(agent) = &startup_main_agent {
+        let policy = agent.tool_policy();
+        if policy.requires_filter() {
+            registry = match registry.scoped_for_agent(&policy) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    registry.shutdown().await;
+                    return Err(error);
+                }
+            };
+            tool_context.set_agent_tool_policy(policy);
         }
     }
     let hook_events = HookEventEmitter::new(
@@ -819,6 +963,11 @@ async fn run(
             return Err(error);
         }
     };
+    if cli.system_prompt.is_none() && cli.system_prompt_file.is_none() {
+        if let Some(agent) = &startup_main_agent {
+            system = agent.prompt.clone();
+        }
+    }
     if let Some(style) = &selected_output_style {
         system.push_str("\n\n");
         system.push_str(&style.system_prompt_section());
@@ -826,6 +975,9 @@ async fn run(
     if !memory_context.is_empty() {
         system.push_str("\n\n");
         system.push_str(&memory_context);
+    }
+    if let Some(agent) = &startup_main_agent {
+        system.push_str(&render_custom_agent_memory_context(agent, &active_cwd)?);
     }
     let startup_outcome = async {
         let session_start = hooks
@@ -892,6 +1044,7 @@ async fn run(
     let initial_prompt_color = store.color()?;
     ui.set_prompt_color(initial_prompt_color.as_deref())?;
     let memory_extractor = AutoMemoryExtractor::new(memory.clone(), client.clone(), cli.debug);
+    let agent_progress_summaries_enabled = Arc::new(AtomicBool::new(false));
     let mut engine = QueryEngine::new(
         client,
         registry,
@@ -906,23 +1059,9 @@ async fn run(
             compact_config: None,
         },
     );
-    let session_metadata = SessionMetadata {
-        store: &store,
-        command_context: &command_context,
-        commands: &custom_commands,
-        hooks: &hooks,
-        custom_agents: &custom_agent_names,
-        plugin_count,
-        output_style: &output_style,
-        available_output_styles: &available_output_styles,
-        model_options: &model_options,
-        memory: &memory,
-        mcp_control: mcp_control.as_ref(),
-        session_state_root: session_state_root.as_ref(),
-        file_histories: &session_file_histories,
-    };
     let engine_setup = (|| -> Result<()> {
         engine.install_custom_agents(agents.custom_agents)?;
+        sync_agent_mcp_server_names(&engine, mcp_control.as_ref())?;
         let effort = ui_settings
             .reasoning_effort
             .as_deref()
@@ -938,6 +1077,22 @@ async fn run(
             let event_ui = ui.clone();
             let event_sink: QueryEventSink = Arc::new(move |event| event_ui.event(event));
             engine.set_event_sink(Some(event_sink));
+            let task_handle = control_handle.clone();
+            let task_cwd = active_cwd.clone();
+            let task_session_id = store.id;
+            let task_summaries = Arc::clone(&agent_progress_summaries_enabled);
+            let task_sink = Arc::new(move |event: &AgentTaskEvent| {
+                if let Err(error) = emit_agent_task_event(
+                    task_handle.as_ref(),
+                    task_session_id,
+                    event,
+                    task_summaries.load(Ordering::Acquire),
+                    &task_cwd,
+                ) {
+                    eprintln!("stream-json agent task event output failed: {error:#}");
+                }
+            });
+            engine.set_agent_task_event_sink(Some(task_sink))?;
         } else if cli.output_format == OutputFormat::StreamJson {
             let handle = control_handle.clone();
             let session_id = store.id;
@@ -955,7 +1110,22 @@ async fn run(
                 }
             });
             engine.set_event_sink(Some(event_sink));
-            emit_stream_init(control_handle.as_ref(), &engine, &session_metadata)?;
+            let metadata = SessionMetadata {
+                store: &store,
+                command_context: &command_context,
+                commands: &custom_commands,
+                hooks: &hooks,
+                custom_agents: &custom_agent_names,
+                plugin_count,
+                output_style: &output_style,
+                available_output_styles: &available_output_styles,
+                model_options: &model_options,
+                memory: &memory,
+                mcp_control: mcp_control.as_ref(),
+                session_state_root: session_state_root.as_ref(),
+                file_histories: &session_file_histories,
+            };
+            emit_stream_init(control_handle.as_ref(), &engine, &metadata)?;
             if let Some(handle) = &control_handle {
                 handle.activate_command_lifecycle(store.id.to_string())?;
             }
@@ -994,14 +1164,60 @@ async fn run(
 
     if cli.print {
         if let Some(session) = control_session.take() {
-            let control_result = run_control_session(
-                &cli,
-                session,
-                &mut engine,
-                &session_metadata,
-                &memory_extractor,
-            )
-            .await;
+            let control_base_settings = settings.clone();
+            let control_base_user_rules = command_context.permissions.user_rules();
+            let control_base_reasoning_effort = engine.reasoning_effort();
+            let control_base_model = engine.model.clone();
+            let mut runtime = ControlRuntime {
+                store: &store,
+                command_context: &mut command_context,
+                commands: &mut custom_commands,
+                hooks: &mut hooks,
+                custom_agents: &mut custom_agent_names,
+                plugin_count: &mut plugin_count,
+                output_style: &output_style,
+                available_output_styles: &mut available_output_styles,
+                model_options: &model_options,
+                memory: &memory,
+                mcp_control: mcp_control.as_ref(),
+                lsp_control: lsp_control.as_ref(),
+                mcp_hook_invoker: mcp_hook_invoker.clone(),
+                hook_events: hook_events.as_ref(),
+                plugin_commands: &mut plugin_commands,
+                plugin_hooks: &mut plugin_hooks,
+                settings: &mut settings,
+                base_settings: control_base_settings,
+                flag_settings: serde_json::Map::new(),
+                base_user_rules: control_base_user_rules,
+                base_reasoning_effort: control_base_reasoning_effort,
+                base_model: control_base_model,
+                sdk_hooks: Value::Object(serde_json::Map::new()),
+                sdk_hook_invoker: Arc::new(ControlSdkHookInvoker {
+                    handle: control_handle
+                        .as_ref()
+                        .expect("control session requires a control handle")
+                        .clone(),
+                    workspace: store.cwd().to_owned(),
+                }),
+                initialized: false,
+                prompt_suggestions_enabled: cli.prompt_suggestions == Some(true),
+                main_agent_name: requested_main_agent_name.clone(),
+                main_agent_resolved: startup_main_agent.is_some(),
+                main_agent_system_explicit: cli.system_prompt.is_some()
+                    || cli.system_prompt_file.is_some(),
+                main_agent_model_explicit: cli.model.is_some(),
+                pending_initial_prompt: startup_main_agent
+                    .as_ref()
+                    .and_then(|agent| agent.initial_prompt.clone()),
+                agent_progress_summaries_enabled: Arc::clone(&agent_progress_summaries_enabled),
+                plugin_mcp_definitions: &mut plugin_mcp_definitions,
+                plugin_lsp_definitions: &mut plugin_lsp_definitions,
+                session_state_root: session_state_root.as_ref(),
+                file_histories: &session_file_histories,
+            };
+            let control_result =
+                run_control_session(&cli, session, &mut engine, &mut runtime, &memory_extractor)
+                    .await;
             let reason = if control_result.is_ok() {
                 "stream_input_closed"
             } else {
@@ -1020,8 +1236,28 @@ async fn run(
             return control_result;
         }
         let print_outcome = async {
+            let metadata = SessionMetadata {
+                store: &store,
+                command_context: &command_context,
+                commands: &custom_commands,
+                hooks: &hooks,
+                custom_agents: &custom_agent_names,
+                plugin_count,
+                output_style: &output_style,
+                available_output_styles: &available_output_styles,
+                model_options: &model_options,
+                memory: &memory,
+                mcp_control: mcp_control.as_ref(),
+                session_state_root: session_state_root.as_ref(),
+                file_histories: &session_file_histories,
+            };
             let prompt = resolve_extension_input(
-                print_prompt(&cli)?,
+                prepend_initial_prompt(
+                    print_prompt(&cli)?,
+                    startup_main_agent
+                        .as_ref()
+                        .and_then(|agent| agent.initial_prompt.as_deref()),
+                ),
                 &command_context,
                 &custom_commands,
                 &hooks,
@@ -1034,12 +1270,19 @@ async fn run(
                 .ok_or(CliInterrupted)?;
             persist_turn(&store, &engine, &result)?;
             print_result(&cli, &engine, &store, &result, control_handle.as_ref())?;
-            emit_prompt_suggestion(&cli, &mut engine, &store, control_handle.as_ref()).await?;
+            emit_prompt_suggestion(
+                &cli,
+                cli.prompt_suggestions == Some(true),
+                &mut engine,
+                &store,
+                control_handle.as_ref(),
+            )
+            .await?;
             schedule_auto_memory(&memory_extractor, &engine, store.id, cli.debug);
             drain_print_scheduled_prompts(
                 &cli,
                 &mut engine,
-                &session_metadata,
+                &metadata,
                 &memory_extractor,
                 control_handle.as_ref(),
             )
@@ -1067,7 +1310,10 @@ async fn run(
 
     let mut active_store = store.clone();
     let mut active_file_histories = session_file_histories.clone();
-    let interactive_outcome = async {
+    // Keep panel ownership process-local: two terminals may resume the same
+    // conversation and must never share or kill one another's tmux server.
+    let mut terminal_panel = TerminalPanel::new(Uuid::new_v4());
+    let mut interactive_outcome = async {
         let status_line_runner = StatusLineRunner::default();
         ui.set_syntax_highlighting(ui_settings.syntax_highlighting);
         ui.set_trusted_roots(command_context.trusted_roots());
@@ -1089,7 +1335,15 @@ async fn run(
                 engine.model, active_store.id
             );
         }
-        let mut initial = cli.prompt.clone();
+        let mut initial = match (
+            startup_main_agent
+                .as_ref()
+                .and_then(|agent| agent.initial_prompt.as_deref()),
+            cli.prompt.clone(),
+        ) {
+            (Some(initial), prompt) => Some(prepend_initial_prompt(prompt.unwrap_or_default(), Some(initial))),
+            (None, prompt) => prompt,
+        };
         let mut editor = InputEditor::default();
         editor.set_prompt_color(initial_prompt_color.as_deref())?;
         if enhanced_terminal {
@@ -1449,6 +1703,18 @@ async fn run(
                         let mut user_activity = || idle_notifications.record_user_activity();
                         let mut prompt_suggestion_refresh = || prompt_suggestions.poll();
                         let mut prompt_suggestion_activity = || prompt_suggestions.cancel();
+                        let terminal_panel_enabled = ui_settings.terminal_panel_enabled;
+                        let mut terminal_panel_action = || {
+                            if !terminal_panel_enabled {
+                                return Ok(
+                                    "Terminal panel disabled · enable terminalPanelEnabled in /config"
+                                        .to_owned(),
+                                );
+                            }
+                            terminal_panel
+                                .show(&command_context)
+                                .map(|outcome| outcome.message().to_owned())
+                        };
                         let read = editor.read(
                                 initial_mode,
                                 mode_locked,
@@ -1466,6 +1732,7 @@ async fn run(
                                     model_picker: &mut model_picker,
                                     rewind_picker: &mut rewind_picker,
                                     workspace_search: &mut workspace_search,
+                                    terminal_panel: &mut terminal_panel_action,
                                     transcript_viewer: &mut transcript_viewer,
                                     status_line_refresh: &mut status_line_refresh,
                                     task_refresh: &mut task_refresh,
@@ -2956,11 +3223,12 @@ async fn run(
                         let styles = catalog.available_output_style_names();
                         let skills = catalog.skills().clone();
                         let plugin_hooks = catalog.hooks().clone();
+                        let next_plugin_commands = catalog.commands().clone();
                         let monitors = catalog.monitors().to_vec();
                         let monitor_count = monitors.len();
                         let mut commands =
                             CustomCommandCatalog::from_settings(&refreshed_settings)?;
-                        commands.merge(catalog.commands().clone())?;
+                        commands.merge(next_plugin_commands.clone())?;
                         catalog.apply_runtime_contributions(&mut refreshed_settings)?;
                         let agents = configure_agents(&refreshed_settings)?;
                         let agent_names = agents
@@ -2983,6 +3251,8 @@ async fn run(
                         Ok((
                             count,
                             skills,
+                            next_plugin_commands,
+                            plugin_hooks,
                             commands,
                             agents.custom_agents,
                             agent_names,
@@ -2998,6 +3268,8 @@ async fn run(
                         Ok((
                             next_plugin_count,
                             next_skills,
+                            next_plugin_commands,
+                            next_plugin_hooks,
                             next_commands,
                             next_agents,
                             next_agent_names,
@@ -3008,6 +3280,114 @@ async fn run(
                             next_mcp_definitions,
                             next_lsp_definitions,
                         )) => {
+                            let mcp_topology_changed =
+                                next_mcp_definitions != plugin_mcp_definitions;
+                            let mut applied_mcp_definitions = plugin_mcp_definitions.clone();
+                            let mut applied_lsp_definitions = plugin_lsp_definitions.clone();
+                            let mut topology_error_count = 0usize;
+                            if mcp_topology_changed {
+                                let scrubber = command_context.extend_secret_env_scrubber(&Settings {
+                                    raw: json!({"mcpServers":next_mcp_definitions.clone()}),
+                                });
+                                let control = scrubber.and_then(|()| {
+                                    mcp_control
+                                        .as_deref()
+                                        .context("plugin MCP reload requires MCP runtime")
+                                });
+                                match control {
+                                    Ok(control) => match control
+                                        .replace_plugin_servers(&next_mcp_definitions)
+                                        .await
+                                    {
+                                    Ok(report) => {
+                                        for (server, error) in report.errors {
+                                            topology_error_count =
+                                                topology_error_count.saturating_add(1);
+                                            eprintln!(
+                                                "Plugin MCP server {server} was not connected: {error}"
+                                            );
+                                        }
+                                        let refresh = engine
+                                            .execute_command_tool(
+                                                "ToolSearch",
+                                                json!({"query":"mcp"}),
+                                            )
+                                            .await;
+                                        if refresh.is_error {
+                                            topology_error_count =
+                                                topology_error_count.saturating_add(1);
+                                            eprintln!(
+                                                "Plugin MCP topology changed but tool refresh failed: {}",
+                                                refresh.content
+                                            );
+                                        }
+                                        if let Err(error) = sync_agent_mcp_server_names(
+                                            &engine,
+                                            mcp_control.as_ref(),
+                                        ) {
+                                            topology_error_count =
+                                                topology_error_count.saturating_add(1);
+                                            eprintln!(
+                                                "Plugin MCP topology changed but agent catalog refresh failed: {error:#}"
+                                            );
+                                        }
+                                        applied_mcp_definitions = next_mcp_definitions.clone();
+                                    }
+                                    Err(error) => {
+                                        topology_error_count =
+                                            topology_error_count.saturating_add(1);
+                                        eprintln!(
+                                            "Plugin MCP refresh failed; its prior runtime layer remains active: {error:#}"
+                                        );
+                                    }
+                                },
+                                    Err(error) => {
+                                        topology_error_count =
+                                            topology_error_count.saturating_add(1);
+                                        eprintln!(
+                                            "Plugin MCP refresh failed; its prior runtime layer remains active: {error:#}"
+                                        );
+                                    }
+                                }
+                            }
+                            let lsp_topology_changed =
+                                next_lsp_definitions != plugin_lsp_definitions;
+                            let mut lsp_topology_applied = false;
+                            if lsp_topology_changed {
+                                let scrubber = command_context.extend_secret_env_scrubber(&Settings {
+                                    raw: json!({"lspServers":next_lsp_definitions.clone()}),
+                                });
+                                let control = scrubber.and_then(|()| {
+                                    lsp_control
+                                        .as_deref()
+                                        .context("plugin LSP reload requires LSP runtime")
+                                });
+                                match control {
+                                    Ok(control) => match control
+                                        .replace_plugin_servers(&next_lsp_definitions)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            applied_lsp_definitions = next_lsp_definitions.clone();
+                                            lsp_topology_applied = true;
+                                        }
+                                        Err(error) => {
+                                            topology_error_count =
+                                                topology_error_count.saturating_add(1);
+                                            eprintln!(
+                                                "Plugin LSP refresh failed; its prior runtime layer remains active: {error:#}"
+                                            );
+                                        }
+                                    },
+                                    Err(error) => {
+                                        topology_error_count =
+                                            topology_error_count.saturating_add(1);
+                                        eprintln!(
+                                            "Plugin LSP refresh failed; its prior runtime layer remains active: {error:#}"
+                                        );
+                                    }
+                                }
+                            }
                             hooks.finalize_async().await;
                             command_context.shutdown_monitors().await;
                             command_context.set_extension_skills(next_skills);
@@ -3016,14 +3396,16 @@ async fn run(
                             engine.replace_hooks(Arc::clone(&next_hooks));
                             engine.install_custom_agents(next_agents)?;
                             custom_commands = next_commands;
+                            plugin_commands = next_plugin_commands;
+                            plugin_hooks = next_plugin_hooks;
                             custom_agent_names = next_agent_names;
                             hooks = next_hooks;
                             plugin_count = next_plugin_count;
                             available_output_styles = next_styles;
+                            plugin_mcp_definitions = applied_mcp_definitions;
+                            plugin_lsp_definitions = applied_lsp_definitions;
                             let monitor_errors =
                                 command_context.start_always_plugin_monitors().await;
-                            let topology_changed = next_mcp_definitions != plugin_mcp_definitions
-                                || next_lsp_definitions != plugin_lsp_definitions;
                             println!(
                                 "Reloaded: {} plugin{} · {} skill{} · {} agent{} · {} hook configuration · {} plugin monitor{}",
                                 plugin_count,
@@ -3036,9 +3418,12 @@ async fn run(
                                 next_monitor_count,
                                 if next_monitor_count == 1 { "" } else { "s" },
                             );
-                            if topology_changed {
+                            if lsp_topology_applied {
+                                println!("Plugin LSP topology refreshed for this session.");
+                            }
+                            if topology_error_count > 0 {
                                 eprintln!(
-                                    "Plugin MCP/LSP definitions changed. Skills, commands, agents, hooks, and monitors were activated; server topology changes require a new session."
+                                    "Plugin reload completed with {topology_error_count} extension error(s)."
                                 );
                             }
                             for error in monitor_errors {
@@ -3077,6 +3462,9 @@ async fn run(
                     &side_question_active,
                     &side_question_usage,
                     &mut queued_interactive_inputs,
+                    &mut terminal_panel,
+                    &command_context,
+                    ui_settings.terminal_panel_enabled,
                 )
                 .await
             } else {
@@ -3128,6 +3516,13 @@ async fn run(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if let Err(error) = terminal_panel.shutdown(&command_context) {
+        if interactive_outcome.is_ok() {
+            interactive_outcome = Err(error.context("terminal panel cleanup failed"));
+        } else if cli.debug {
+            eprintln!("[debug] terminal panel cleanup failed: {error:#}");
+        }
+    }
     if enhanced_terminal {
         let _ = ui.set_tui_mode(TuiMode::Default);
     }
@@ -3239,7 +3634,14 @@ async fn drain_print_scheduled_prompts(
             .ok_or(CliInterrupted)?;
         persist_turn(store, engine, &result)?;
         print_result(cli, engine, store, &result, control)?;
-        emit_prompt_suggestion(cli, engine, store, control).await?;
+        emit_prompt_suggestion(
+            cli,
+            cli.prompt_suggestions == Some(true),
+            engine,
+            store,
+            control,
+        )
+        .await?;
         schedule_auto_memory(memory_extractor, engine, store.id, cli.debug);
     }
     // The process-wide ready queue is itself bounded. Do not probe it by
@@ -3263,11 +3665,12 @@ fn schedule_auto_memory(
 
 async fn emit_prompt_suggestion(
     cli: &Cli,
+    enabled: bool,
     engine: &mut QueryEngine,
     store: &SessionStore,
     control: Option<&ControlHandle>,
 ) -> Result<()> {
-    if cli.prompt_suggestions != Some(true) {
+    if !enabled {
         return Ok(());
     }
     let suggestion = match engine.generate_prompt_suggestion().await {
@@ -3373,6 +3776,42 @@ struct HookEventEmitter {
     state: Mutex<(bool, Vec<HookExecutionEvent>)>,
 }
 
+struct ControlSdkHookInvoker {
+    handle: ControlHandle,
+    workspace: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SdkHookInvoker for ControlSdkHookInvoker {
+    async fn invoke(&self, call: SdkHookCall) -> Result<Value> {
+        let SdkHookCall {
+            callback_id,
+            input,
+            tool_use_id,
+            timeout,
+        } = call;
+        let input = open_agent_harness::session::sanitize_transport_value(&input, &self.workspace);
+        let handle = self.handle.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            let mut request = json!({
+                "subtype":"hook_callback",
+                "callback_id":callback_id,
+                "input":input,
+            });
+            if let Some(tool_use_id) = tool_use_id {
+                request["tool_use_id"] = Value::String(tool_use_id);
+            }
+            handle.request_with_timeout(request, timeout)
+        })
+        .await
+        .context("SDK hook control worker 失败")??;
+        if !response.is_object() || serde_json::to_vec(&response)?.len() > 256 * 1024 {
+            bail!("SDK hook callback response 无效或超过 256 KiB 限制")
+        }
+        Ok(response)
+    }
+}
+
 impl HookEventEmitter {
     fn new(
         enabled: bool,
@@ -3426,8 +3865,55 @@ impl HookEventEmitter {
     }
 
     fn emit(&self, event: &HookExecutionEvent) -> Result<()> {
-        let mut message = serde_json::to_value(event)?;
-        message["session_id"] = json!(self.session_id);
+        let message = match event {
+            HookExecutionEvent::HookStarted {
+                id,
+                event,
+                asynchronous,
+                status_message,
+            } => json!({
+                "type":"system",
+                "subtype":"hook_started",
+                "hook_id":id.to_string(),
+                "hook_name":status_message.as_deref().unwrap_or(event),
+                "hook_event":event,
+                "asynchronous":asynchronous,
+                "uuid":Uuid::new_v4(),
+                "session_id":self.session_id,
+            }),
+            HookExecutionEvent::HookResponse {
+                id,
+                event,
+                asynchronous,
+                outcome,
+                exit_code,
+                elapsed_ms,
+                truncated,
+            } => {
+                let schema_outcome = if outcome == "completed" {
+                    "success"
+                } else {
+                    "error"
+                };
+                json!({
+                    "type":"system",
+                    "subtype":"hook_response",
+                    "hook_id":id.to_string(),
+                    "hook_name":event,
+                    "hook_event":event,
+                    "output":outcome,
+                    "stdout":"",
+                    "stderr":"",
+                    "exit_code":exit_code,
+                    "outcome":schema_outcome,
+                    "asynchronous":asynchronous,
+                    "elapsed_ms":elapsed_ms,
+                    "truncated":truncated,
+                    "uuid":Uuid::new_v4(),
+                    "session_id":self.session_id,
+                })
+            }
+        };
         let message = open_agent_harness::session::sanitize_transport_value(&message, &self.cwd);
         emit_json_line(self.control.as_ref(), &message)
     }
@@ -3590,6 +4076,17 @@ fn print_prompt(cli: &Cli) -> Result<String> {
     Ok(prompt)
 }
 
+fn prepend_initial_prompt(prompt: String, initial: Option<&str>) -> String {
+    let Some(initial) = initial else {
+        return prompt;
+    };
+    if prompt.trim().is_empty() {
+        initial.to_owned()
+    } else {
+        format!("{initial}\n\n{prompt}")
+    }
+}
+
 fn read_prompt() -> Result<String> {
     print!("> ");
     io::stdout().flush()?;
@@ -3613,14 +4110,23 @@ fn output_sink(
 ) -> Option<TextDeltaSink> {
     match (cli.print, cli.output_format) {
         (true, OutputFormat::Json) => None,
-        (true, OutputFormat::StreamJson) => Some(Arc::new(move |delta| {
-            let event = json!({
-                "type": "content_block_delta",
-                "delta": {"type": "text_delta", "text": delta},
-                "session_id": session_id,
-            });
-            let _ = emit_json_line(control.as_ref(), &event);
-        })),
+        (true, OutputFormat::StreamJson) if cli.include_partial_messages => {
+            Some(Arc::new(move |delta| {
+                let event = json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta},
+                    },
+                    "parent_tool_use_id": Value::Null,
+                    "uuid": Uuid::new_v4(),
+                    "session_id": session_id,
+                });
+                let _ = emit_json_line(control.as_ref(), &event);
+            }))
+        }
+        (true, OutputFormat::StreamJson) => None,
         _ if interactive_ui.is_some() => {
             let ui = interactive_ui.expect("interactive UI was checked above");
             Some(Arc::new(move |delta| ui.text_delta(delta)))
@@ -3709,6 +4215,7 @@ fn result_message(
         "subtype": "success",
         "is_error": false,
         "result": result.text,
+        "uuid": Uuid::new_v4(),
         "session_id": store.id,
         "model": engine.model,
         "usage": engine.usage,
@@ -3744,6 +4251,7 @@ fn emit_stream_init(
         &json!({
             "type":"system",
             "subtype":"init",
+            "uuid":Uuid::new_v4(),
             "version":env!("CARGO_PKG_VERSION"),
             "session_id":metadata.store.id,
             "model":engine.model,
@@ -3758,17 +4266,7 @@ fn emit_stream_init(
             "plugin_count":metadata.plugin_count,
             "output_style":metadata.output_style,
             "available_output_styles":metadata.available_output_styles,
-            "capabilities":[
-                "cancel_async_message_v1",
-                "command_lifecycle_v1",
-                "interrupt_receipt_v1",
-                "mcp_reconnect_v1",
-                "queue_priority_v1",
-                "replay_user_messages_v1",
-                "rewind_conversation_v1",
-                "side_question_v1",
-                "stop_task_v1"
-            ],
+            "capabilities":STREAM_CAPABILITIES,
         }),
     )
 }
@@ -3782,10 +4280,12 @@ fn emit_query_event(
 ) -> Result<()> {
     let message = match event {
         QueryEvent::TurnStarted if include_partial => Some(json!({
-            "type":"system", "subtype":"status", "status":"running", "session_id":session_id
+            "type":"system", "subtype":"status", "status":"running",
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::RequestStarted { round } if include_partial => Some(json!({
-            "type":"system", "subtype":"request_started", "round":round, "session_id":session_id
+            "type":"system", "subtype":"request_started", "round":round,
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::RequestRetry {
             attempt,
@@ -3794,12 +4294,14 @@ fn emit_query_event(
             reason,
         } if include_partial => Some(json!({
             "type":"system",
-            "subtype":"status",
-            "status":"retrying",
+            "subtype":"api_retry",
             "attempt":attempt,
-            "max_attempts":max_attempts,
-            "delay_ms":delay_ms,
+            "max_retries":max_attempts.saturating_sub(1),
+            "retry_delay_ms":delay_ms,
+            "error_status":Value::Null,
+            "error":"unknown",
             "reason":open_agent_harness::session::sanitize_transport_text(reason, cwd),
+            "uuid":Uuid::new_v4(),
             "session_id":session_id
         })),
         QueryEvent::AssistantMessage { content, .. } => Some(json!({
@@ -3811,11 +4313,12 @@ fn emit_query_event(
         })),
         QueryEvent::CheckpointCreated { id, message_count } => Some(json!({
             "type":"system", "subtype":"file_checkpoint", "checkpoint_id":id,
-            "message_count":message_count, "session_id":session_id
+            "message_count":message_count, "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::ToolStarted { id, name, .. } => Some(json!({
             "type":"tool_progress", "subtype":"started", "tool_use_id":id,
-            "tool_name":name, "session_id":session_id
+            "tool_name":name, "parent_tool_use_id":Value::Null,
+            "elapsed_time_seconds":0.0, "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::ToolFinished {
             id,
@@ -3825,29 +4328,37 @@ fn emit_query_event(
             ..
         } => Some(json!({
             "type":"tool_progress", "subtype":"finished", "tool_use_id":id,
-            "tool_name":name, "is_error":is_error, "elapsed_ms":elapsed_ms,
-            "session_id":session_id
+            "tool_name":name, "parent_tool_use_id":Value::Null,
+            "is_error":is_error, "elapsed_ms":elapsed_ms,
+            "elapsed_time_seconds":*elapsed_ms as f64 / 1000.0,
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
-        QueryEvent::CompactStarted => Some(json!({
-            "type":"system", "subtype":"status", "status":"compacting", "session_id":session_id
+        QueryEvent::CompactStarted { .. } => Some(json!({
+            "type":"system", "subtype":"status", "status":"compacting",
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::CompactFinished {
+            trigger,
             before_tokens,
             after_tokens,
         } => Some(json!({
-            "type":"system", "subtype":"compact_boundary", "before_tokens":before_tokens,
-            "after_tokens":after_tokens, "session_id":session_id
+            "type":"system", "subtype":"compact_boundary",
+            "compact_metadata":{"trigger":trigger.as_str(), "pre_tokens":before_tokens},
+            "after_tokens":after_tokens, "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::TurnInterrupted => Some(json!({
-            "type":"system", "subtype":"status", "status":"interrupted", "session_id":session_id
+            "type":"system", "subtype":"status", "status":"interrupted",
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::TurnFailed { message } => Some(json!({
             "type":"system", "subtype":"status", "status":"failed",
             "error":open_agent_harness::session::sanitize_transport_text(message, cwd),
+            "uuid":Uuid::new_v4(),
             "session_id":session_id
         })),
         QueryEvent::TurnFinished if include_partial => Some(json!({
-            "type":"system", "subtype":"status", "status":Value::Null, "session_id":session_id
+            "type":"system", "subtype":"status", "status":Value::Null,
+            "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::TurnStarted
         | QueryEvent::RequestStarted { .. }
@@ -3861,11 +4372,96 @@ fn emit_query_event(
     Ok(())
 }
 
+fn emit_agent_task_event(
+    control: Option<&ControlHandle>,
+    session_id: Uuid,
+    event: &AgentTaskEvent,
+    include_summary: bool,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    let mut message = match event {
+        AgentTaskEvent::Started {
+            task_id,
+            description,
+        } => json!({
+            "type":"system",
+            "subtype":"task_started",
+            "task_id":task_id,
+            "description":bounded_single_line(description, 512),
+            "task_type":"local_agent",
+            "uuid":Uuid::new_v4(),
+            "session_id":session_id,
+        }),
+        AgentTaskEvent::Progress {
+            task_id,
+            description,
+            progress,
+            usage,
+            last_tool_name,
+        } => json!({
+            "type":"system",
+            "subtype":"task_progress",
+            "task_id":task_id,
+            "description":bounded_single_line(description, 512),
+            "usage":{
+                "total_tokens":usage.total_tokens,
+                "tool_uses":usage.tool_uses,
+                "duration_ms":usage.duration_ms,
+            },
+            "last_tool_name":last_tool_name,
+            "uuid":Uuid::new_v4(),
+            "session_id":session_id,
+            "_progress":bounded_single_line(progress, 512),
+        }),
+        AgentTaskEvent::Finished {
+            task_id,
+            description,
+            success,
+            summary,
+            usage,
+        } => json!({
+            "type":"system",
+            "subtype":"task_notification",
+            "task_id":task_id,
+            "status":if *success { "completed" } else { "failed" },
+            "output_file":"",
+            "summary":bounded_single_line(
+                if summary.trim().is_empty() { description } else { summary },
+                512,
+            ),
+            "usage":{
+                "total_tokens":usage.total_tokens,
+                "tool_uses":usage.tool_uses,
+                "duration_ms":usage.duration_ms,
+            },
+            "uuid":Uuid::new_v4(),
+            "session_id":session_id,
+        }),
+    };
+    if let AgentTaskEvent::Progress { progress, .. } = event {
+        let object = message
+            .as_object_mut()
+            .expect("agent task event message is an object");
+        object.remove("_progress");
+        if object.get("last_tool_name").is_some_and(Value::is_null) {
+            object.remove("last_tool_name");
+        }
+        if include_summary {
+            object.insert(
+                "summary".to_owned(),
+                Value::String(bounded_single_line(progress, 512)),
+            );
+        }
+    }
+    let message = open_agent_harness::session::sanitize_transport_value(&message, cwd);
+    emit_json_line(control, &message)
+}
+
 async fn run_control_session(
     cli: &Cli,
     mut session: ControlSession,
     engine: &mut QueryEngine,
-    metadata: &SessionMetadata<'_>,
+    runtime: &mut ControlRuntime<'_>,
     memory_extractor: &AutoMemoryExtractor,
 ) -> Result<()> {
     let mut side_questions = ControlSideQuestions::new();
@@ -3873,7 +4469,7 @@ async fn run_control_session(
         cli,
         &mut session,
         engine,
-        metadata,
+        runtime,
         memory_extractor,
         &mut side_questions,
     )
@@ -3887,45 +4483,57 @@ async fn run_control_session_loop(
     cli: &Cli,
     session: &mut ControlSession,
     engine: &mut QueryEngine,
-    metadata: &SessionMetadata<'_>,
+    runtime: &mut ControlRuntime<'_>,
     memory_extractor: &AutoMemoryExtractor,
     side_questions: &mut ControlSideQuestions,
 ) -> Result<()> {
     let handle = session.handle();
-    let store = metadata.store;
-    let command_context = metadata.command_context;
-    let commands = metadata.commands;
+    let store = runtime.store;
     loop {
         side_questions.merge_usage(engine);
-        let message =
-            match next_control_wake(session.recv(), command_context.wait_scheduled_prompt()).await?
-            {
-                ControlWake::Inbound(Some(message)) => message,
-                ControlWake::Inbound(None) => break,
-                ControlWake::Scheduled(prompt) => {
-                    let prompt =
-                        resolve_extension_input(prompt, command_context, commands, metadata.hooks)
-                            .await?;
-                    let cancel_generation = handle.current_cancellation_generation();
-                    handle.acknowledge_cancellation(cancel_generation);
-                    execute_control_turn(
-                        cli,
-                        &handle,
-                        engine,
-                        store,
-                        memory_extractor,
-                        Value::String(prompt),
-                        Uuid::new_v4(),
-                        cancel_generation,
-                        session,
-                        side_questions,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
+        refresh_pending_sdk_mcp(cli, engine, runtime.mcp_control).await;
+        let message = match next_control_wake(
+            session.recv(),
+            runtime.command_context.wait_scheduled_prompt(),
+        )
+        .await?
+        {
+            ControlWake::Inbound(Some(message)) => message,
+            ControlWake::Inbound(None) => break,
+            ControlWake::Scheduled(prompt) => {
+                let prompt = resolve_extension_input(
+                    prompt,
+                    &*runtime.command_context,
+                    runtime.commands,
+                    runtime.hooks,
+                )
+                .await?;
+                let cancel_generation = handle.current_cancellation_generation();
+                handle.acknowledge_cancellation(cancel_generation);
+                execute_control_turn(
+                    cli,
+                    runtime.prompt_suggestions_enabled,
+                    &handle,
+                    engine,
+                    store,
+                    memory_extractor,
+                    Value::String(prompt),
+                    Uuid::new_v4(),
+                    cancel_generation,
+                    session,
+                    side_questions,
+                )
+                .await?;
+                continue;
+            }
+        };
         match message {
-            InboundMessage::User { uuid, content, .. } => {
+            InboundMessage::User {
+                uuid, mut content, ..
+            } => {
+                if let Some(initial) = runtime.pending_initial_prompt.take() {
+                    content = prepend_initial_content(content, &initial);
+                }
                 // Cancellation generations identify the turn that is executing, not the
                 // time a queued message was read. Messages reported as still queued after
                 // an interrupt must start against the latest generation when dispatched.
@@ -3935,14 +4543,15 @@ async fn run_control_session_loop(
                     Value::String(input) => {
                         match resolve_extension_input(
                             input,
-                            command_context,
-                            commands,
-                            metadata.hooks,
+                            &*runtime.command_context,
+                            runtime.commands,
+                            runtime.hooks,
                         )
                         .await
                         {
                             Ok(resolved) => {
-                                match handle_control_slash_command(&resolved, engine, metadata)
+                                let metadata = runtime.metadata();
+                                match handle_control_slash_command(&resolved, engine, &metadata)
                                     .await
                                 {
                                     Ok(ControlSlashOutcome::NotCommand) => Value::String(resolved),
@@ -3994,6 +4603,7 @@ async fn run_control_session_loop(
                 };
                 execute_control_turn(
                     cli,
+                    runtime.prompt_suggestions_enabled,
                     &handle,
                     engine,
                     store,
@@ -4010,7 +4620,11 @@ async fn run_control_session_loop(
                 request_id,
                 request,
             } => {
-                if request.get("subtype").and_then(Value::as_str) == Some("side_question") {
+                let subtype = request.get("subtype").and_then(Value::as_str);
+                if subtype == Some("end_session") {
+                    handle.respond_success(&request_id, json!({"ended":true}))?;
+                    break;
+                } else if subtype == Some("side_question") {
                     let question = request
                         .get("question")
                         .and_then(Value::as_str)
@@ -4024,8 +4638,26 @@ async fn run_control_session_loop(
                         store.cwd().to_owned(),
                     )?;
                 } else {
-                    handle_control_request(&handle, &request_id, &request, engine, metadata)
+                    handle_control_request(&handle, &request_id, &request, engine, runtime, cli)
                         .await?;
+                    if subtype == Some("initialize") && runtime.initialized {
+                        if let Some(prompt) = runtime.pending_initial_prompt.take() {
+                            if execute_control_initial_prompt(
+                                cli,
+                                &handle,
+                                engine,
+                                runtime,
+                                memory_extractor,
+                                session,
+                                side_questions,
+                                prompt,
+                            )
+                            .await?
+                            {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             InboundMessage::UpdateEnvironmentVariables { variables } => {
@@ -4053,6 +4685,118 @@ async fn run_control_session_loop(
     Ok(())
 }
 
+fn prepend_initial_content(content: Value, initial: &str) -> Value {
+    match content {
+        Value::String(prompt) => Value::String(prepend_initial_prompt(prompt, Some(initial))),
+        Value::Array(mut blocks) => {
+            blocks.insert(0, json!({"type":"text", "text":format!("{initial}\n\n")}));
+            Value::Array(blocks)
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_control_initial_prompt(
+    cli: &Cli,
+    handle: &ControlHandle,
+    engine: &mut QueryEngine,
+    runtime: &mut ControlRuntime<'_>,
+    memory_extractor: &AutoMemoryExtractor,
+    session: &mut ControlSession,
+    side_questions: &mut ControlSideQuestions,
+    prompt: String,
+) -> Result<bool> {
+    let uuid = Uuid::new_v4();
+    let prompt = match resolve_extension_input(
+        prompt,
+        &*runtime.command_context,
+        runtime.commands,
+        runtime.hooks,
+    )
+    .await
+    {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            emit_control_slash_result(
+                handle,
+                runtime.store,
+                uuid,
+                json!({"error":format!("{error:#}")}),
+                true,
+            )?;
+            return Ok(false);
+        }
+    };
+    let content = match handle_control_slash_command(&prompt, engine, &runtime.metadata()).await {
+        Ok(ControlSlashOutcome::NotCommand) => Value::String(prompt),
+        Ok(ControlSlashOutcome::Submit(prompt)) => Value::String(prompt),
+        Ok(ControlSlashOutcome::Handled(result)) => {
+            emit_control_slash_result(handle, runtime.store, uuid, result, false)?;
+            return Ok(false);
+        }
+        Ok(ControlSlashOutcome::Exit(result)) => {
+            emit_control_slash_result(handle, runtime.store, uuid, result, false)?;
+            return Ok(true);
+        }
+        Err(error) => {
+            emit_control_slash_result(
+                handle,
+                runtime.store,
+                uuid,
+                json!({"error":format!("{error:#}")}),
+                true,
+            )?;
+            return Ok(false);
+        }
+    };
+    let cancel_generation = handle.current_cancellation_generation();
+    handle.acknowledge_cancellation(cancel_generation);
+    execute_control_turn(
+        cli,
+        runtime.prompt_suggestions_enabled,
+        handle,
+        engine,
+        runtime.store,
+        memory_extractor,
+        content,
+        uuid,
+        cancel_generation,
+        session,
+        side_questions,
+    )
+    .await?;
+    Ok(false)
+}
+
+async fn refresh_pending_sdk_mcp(
+    cli: &Cli,
+    engine: &mut QueryEngine,
+    mcp_control: Option<&Arc<dyn McpControl>>,
+) {
+    let Some(control) = mcp_control else {
+        return;
+    };
+    if !control
+        .status()
+        .iter()
+        .any(|server| server.status == McpServerStatusKind::Pending)
+    {
+        return;
+    }
+    if let Err(error) = control.connect_pending_sdk_servers().await {
+        if cli.debug {
+            eprintln!("[debug] pending SDK MCP connection failed: {error:#}");
+        }
+    }
+    let refresh = engine
+        .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+        .await;
+    if refresh.is_error && cli.debug {
+        eprintln!("[debug] SDK MCP tool refresh failed: {}", refresh.content);
+    }
+}
+
 enum ControlSlashOutcome {
     NotCommand,
     Submit(String),
@@ -4068,6 +4812,7 @@ fn emit_control_slash_result(
     is_error: bool,
 ) -> Result<()> {
     handle.command_lifecycle(uuid, "started")?;
+    emit_session_state_changed(handle, store.id, "running")?;
     let result = open_agent_harness::session::sanitize_transport_value(&result, store.cwd());
     emit_json_line(
         Some(handle),
@@ -4479,6 +5224,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn execute_control_turn(
     cli: &Cli,
+    prompt_suggestions_enabled: bool,
     handle: &ControlHandle,
     engine: &mut QueryEngine,
     store: &SessionStore,
@@ -4529,11 +5275,14 @@ async fn execute_control_turn(
                 .and_then(|_| print_result(cli, engine, store, &result, Some(handle)))
             {
                 let _ = handle.command_lifecycle(uuid, "cancelled");
+                let _ = emit_session_state_changed(handle, store.id, "idle");
                 return Err(error);
             }
             handle.command_lifecycle(uuid, "completed")?;
-            emit_prompt_suggestion(cli, engine, store, Some(handle)).await?;
+            emit_prompt_suggestion(cli, prompt_suggestions_enabled, engine, store, Some(handle))
+                .await?;
             schedule_auto_memory(memory_extractor, engine, store.id, cli.debug);
+            emit_session_state_changed(handle, store.id, "idle")?;
             return Ok(());
         }
         Ok(None) => {
@@ -4562,7 +5311,22 @@ async fn execute_control_turn(
         }
     };
     handle.command_lifecycle(uuid, outcome)?;
+    emit_session_state_changed(handle, store.id, "idle")?;
     Ok(())
+}
+
+fn emit_session_state_changed(
+    handle: &ControlHandle,
+    session_id: Uuid,
+    state: &'static str,
+) -> Result<()> {
+    handle.emit(&json!({
+        "type":"system",
+        "subtype":"session_state_changed",
+        "state":state,
+        "uuid":Uuid::new_v4(),
+        "session_id":session_id,
+    }))
 }
 
 struct SessionMetadata<'a> {
@@ -4579,6 +5343,736 @@ struct SessionMetadata<'a> {
     mcp_control: Option<&'a Arc<dyn McpControl>>,
     session_state_root: Option<&'a SessionStateRoot>,
     file_histories: &'a [FileHistory],
+}
+
+struct ControlRuntime<'a> {
+    store: &'a SessionStore,
+    command_context: &'a mut ToolContext,
+    commands: &'a mut CustomCommandCatalog,
+    hooks: &'a mut Arc<HookRunner>,
+    custom_agents: &'a mut Vec<Value>,
+    plugin_count: &'a mut usize,
+    output_style: &'a str,
+    available_output_styles: &'a mut Vec<String>,
+    model_options: &'a [ModelOption],
+    memory: &'a AutoMemory,
+    mcp_control: Option<&'a Arc<dyn McpControl>>,
+    lsp_control: Option<&'a Arc<dyn LspControl>>,
+    mcp_hook_invoker: Option<Arc<dyn McpHookInvoker>>,
+    hook_events: Option<&'a Arc<HookEventEmitter>>,
+    plugin_commands: &'a mut CustomCommandCatalog,
+    plugin_hooks: &'a mut Value,
+    settings: &'a mut Settings,
+    base_settings: Settings,
+    flag_settings: serde_json::Map<String, Value>,
+    base_user_rules: UserPermissionRules,
+    base_reasoning_effort: Option<ReasoningEffort>,
+    base_model: String,
+    sdk_hooks: Value,
+    sdk_hook_invoker: Arc<dyn SdkHookInvoker>,
+    initialized: bool,
+    prompt_suggestions_enabled: bool,
+    main_agent_name: Option<String>,
+    main_agent_resolved: bool,
+    main_agent_system_explicit: bool,
+    main_agent_model_explicit: bool,
+    pending_initial_prompt: Option<String>,
+    agent_progress_summaries_enabled: Arc<AtomicBool>,
+    plugin_mcp_definitions: &'a mut BTreeMap<String, Value>,
+    plugin_lsp_definitions: &'a mut BTreeMap<String, Value>,
+    session_state_root: Option<&'a SessionStateRoot>,
+    file_histories: &'a [FileHistory],
+}
+
+impl ControlRuntime<'_> {
+    fn metadata(&self) -> SessionMetadata<'_> {
+        SessionMetadata {
+            store: self.store,
+            command_context: &*self.command_context,
+            commands: self.commands,
+            hooks: self.hooks,
+            custom_agents: self.custom_agents,
+            plugin_count: *self.plugin_count,
+            output_style: self.output_style,
+            available_output_styles: self.available_output_styles,
+            model_options: self.model_options,
+            memory: self.memory,
+            mcp_control: self.mcp_control,
+            session_state_root: self.session_state_root,
+            file_histories: self.file_histories,
+        }
+    }
+
+    fn build_hooks(&self, settings: &Settings, plugin_hooks: &Value) -> Result<HookRunner> {
+        self.build_hooks_with_sdk(settings, plugin_hooks, &self.sdk_hooks)
+    }
+
+    fn build_hooks_with_sdk(
+        &self,
+        settings: &Settings,
+        plugin_hooks: &Value,
+        sdk_hooks: &Value,
+    ) -> Result<HookRunner> {
+        let hooks = HookRunner::from_settings_and_plugins(settings, plugin_hooks)?
+            .with_mcp_invoker(self.mcp_hook_invoker.clone())
+            .with_observer(self.hook_events.map(HookEventEmitter::observer));
+        if sdk_hooks.as_object().is_some_and(|hooks| !hooks.is_empty()) {
+            hooks.with_sdk_callbacks(sdk_hooks, Arc::clone(&self.sdk_hook_invoker))
+        } else {
+            Ok(hooks)
+        }
+    }
+
+    async fn initialize_from_sdk(
+        &mut self,
+        request: &Value,
+        engine: &mut QueryEngine,
+    ) -> Result<()> {
+        if self.initialized {
+            bail!("stream-json session 已初始化")
+        }
+        let requested_system = request
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let requested_append = request
+            .get("appendSystemPrompt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let structured_output = request
+            .get("jsonSchema")
+            .cloned()
+            .map(StructuredOutputTool::new)
+            .transpose()?
+            .map(StructuredOutputTool::into_tool);
+        let next_sdk_hooks = request
+            .get("hooks")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        self.build_hooks_with_sdk(self.settings, self.plugin_hooks, &next_sdk_hooks)?;
+        let agent_settings = request.get("agents").map(sdk_agent_settings).transpose()?;
+        let sdk_servers = request
+            .get("sdkMcpServers")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let name = name
+                            .as_str()
+                            .context("initialize.sdkMcpServers 只能包含 string")?;
+                        Ok((name.to_owned(), json!({"type":"sdk", "name":name})))
+                    })
+                    .collect::<Result<serde_json::Map<_, _>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        if let Some(agent_settings) = agent_settings {
+            let incoming = serde_json::Map::from_iter([("agents".to_owned(), agent_settings)]);
+            self.apply_flag_settings(&incoming, engine).await?;
+        }
+        let resolved_main_agent = if !self.main_agent_resolved {
+            self.main_agent_name
+                .as_deref()
+                .map(|name| {
+                    configure_agents(self.settings)?
+                        .custom_agents
+                        .get(name)
+                        .cloned()
+                        .with_context(|| format!("main custom agent 不存在: {name}"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let main_agent_memory = resolved_main_agent
+            .as_ref()
+            .map(|agent| render_custom_agent_memory_context(agent, self.store.cwd()))
+            .transpose()?
+            .unwrap_or_default();
+        let next_main_model = resolved_main_agent.as_ref().and_then(|agent| {
+            (!self.main_agent_model_explicit)
+                .then(|| agent.model.as_deref().filter(|model| *model != "inherit"))
+                .flatten()
+                .map(ToOwned::to_owned)
+        });
+        if let Some(model) = &next_main_model {
+            self.settings.model_options(model)?;
+        }
+        let next_system = if requested_system.is_some()
+            || requested_append.is_some()
+            || resolved_main_agent.is_some()
+        {
+            let mut system = requested_system.unwrap_or_else(|| {
+                resolved_main_agent
+                    .as_ref()
+                    .filter(|_| !self.main_agent_system_explicit)
+                    .map_or_else(
+                        || engine.system_prompt().to_owned(),
+                        |agent| agent.prompt.clone(),
+                    )
+            });
+            if !main_agent_memory.is_empty() {
+                system.push_str(&main_agent_memory);
+            }
+            if let Some(append) = requested_append {
+                if !system.is_empty() && !append.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&append);
+            }
+            if system.len() > MAX_SYSTEM_CONTEXT_BYTES || system.contains('\0') {
+                bail!("initialize system prompt 超过资源限制或包含 NUL")
+            }
+            Some(system)
+        } else {
+            None
+        };
+        let next_hooks = Arc::new(self.build_hooks_with_sdk(
+            self.settings,
+            self.plugin_hooks,
+            &next_sdk_hooks,
+        )?);
+        self.hooks.finalize_async().await;
+        self.command_context.set_hooks(Arc::clone(&next_hooks));
+        engine.replace_hooks(Arc::clone(&next_hooks));
+        *self.hooks = next_hooks;
+        self.sdk_hooks = next_sdk_hooks;
+        if let Some(model) = next_main_model {
+            engine.set_model(model);
+        }
+        if let Some(system) = next_system {
+            engine.set_system_prompt(system)?;
+        }
+        if let Some(tool) = structured_output {
+            engine.install_runtime_structured_output(tool)?;
+        }
+        if !sdk_servers.is_empty() {
+            self.command_context.extend_secret_env_scrubber(&Settings {
+                raw: json!({"mcpServers":sdk_servers.clone()}),
+            })?;
+            self.mcp_control
+                .context("stream-json MCP control 未初始化")?
+                .replace_dynamic_servers(&sdk_servers)
+                .await?;
+            sync_agent_mcp_server_names(engine, self.mcp_control)?;
+        }
+        if let Some(enabled) = request.get("promptSuggestions").and_then(Value::as_bool) {
+            self.prompt_suggestions_enabled = enabled;
+        }
+        if let Some(enabled) = request
+            .get("agentProgressSummaries")
+            .and_then(Value::as_bool)
+        {
+            self.agent_progress_summaries_enabled
+                .store(enabled, Ordering::Release);
+        }
+        if let Some(agent) = resolved_main_agent {
+            self.store.set_agent_setting(Some(&agent.name))?;
+            self.pending_initial_prompt = agent.initial_prompt;
+            self.main_agent_resolved = true;
+        }
+        self.initialized = true;
+        Ok(())
+    }
+
+    async fn apply_flag_settings(
+        &mut self,
+        incoming: &serde_json::Map<String, Value>,
+        engine: &mut QueryEngine,
+    ) -> Result<Value> {
+        let mut next_flags = self.flag_settings.clone();
+        for (key, value) in incoming {
+            if key.is_empty()
+                || key.len() > 256
+                || key.contains(['\0', '\n', '\r'])
+                || key.chars().any(char::is_control)
+            {
+                bail!("runtime flag setting key 无效")
+            }
+            if value.is_null() {
+                next_flags.remove(key);
+            } else {
+                next_flags.insert(key.clone(), value.clone());
+            }
+        }
+        if next_flags.len() > 256 || serde_json::to_vec(&next_flags)?.len() > 512 * 1024 {
+            bail!("runtime flag settings 超过资源限制")
+        }
+        let candidate = settings_with_flag_layer(&self.base_settings, &next_flags)?;
+        if let Some(model) = candidate.model() {
+            candidate.model_options(model)?;
+        }
+        candidate.output_style()?;
+        candidate.plugin_directories()?;
+        candidate.auto_memory_settings()?;
+        let sandbox = candidate
+            .sandbox_runtime()?
+            .with_session_workspaces(&self.command_context.trusted_roots())?;
+        let next_user_rules = merged_flag_permission_rules(&self.base_user_rules, &next_flags)?;
+        let next_hooks = Arc::new(self.build_hooks(&candidate, self.plugin_hooks)?);
+        let mut next_commands = CustomCommandCatalog::from_settings(&candidate)?;
+        next_commands.merge(self.plugin_commands.clone())?;
+        let agents = configure_agents(&candidate)?;
+        let next_agent_names = agents
+            .custom_agents
+            .iter()
+            .map(|(name, definition)| json!({"name":name,"description":definition.description}))
+            .collect::<Vec<_>>();
+        let next_flag_mcp_servers = if incoming.contains_key("mcpServers") {
+            Some(
+                next_flags
+                    .get("mcpServers")
+                    .map(|servers| {
+                        servers
+                            .as_object()
+                            .cloned()
+                            .context("mcpServers flag setting 必须是 object")
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+
+        let next_mode = if incoming.contains_key("permissions") {
+            next_flags
+                .get("permissions")
+                .and_then(Value::as_object)
+                .and_then(|permissions| permissions.get("defaultMode"))
+                .map(|mode| {
+                    mode.as_str()
+                        .and_then(PermissionMode::from_setting)
+                        .context("permissions.defaultMode 无效")
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let next_model = incoming.contains_key("model").then(|| {
+            next_flags
+                .get("model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| self.base_model.clone())
+        });
+        let effort_touched =
+            incoming.contains_key("effortLevel") || incoming.contains_key("reasoningEffort");
+        let next_effort = if effort_touched {
+            let value = next_flags
+                .get("reasoningEffort")
+                .or_else(|| next_flags.get("effortLevel"));
+            match value {
+                Some(value) => Some(ReasoningEffort::parse(
+                    value.as_str().context("reasoning effort 必须是 string")?,
+                )?),
+                None => Some(self.base_reasoning_effort),
+            }
+        } else {
+            None
+        };
+        if next_mode.is_some_and(|mode| {
+            engine.permission_mode() == PermissionMode::Plan && mode != PermissionMode::Plan
+        }) {
+            bail!("runtime flag settings 不能绕过当前 plan permission mode")
+        }
+
+        // Credential-name expansion is monotonic and safe to perform before
+        // any fallible live-state mutation. A limit failure therefore leaves
+        // the effective runtime unchanged.
+        self.command_context
+            .extend_secret_env_scrubber(&candidate)?;
+        if let Some(servers) = &next_flag_mcp_servers {
+            let control = self
+                .mcp_control
+                .context("runtime MCP flag settings require the registered MCP runtime")?;
+            control.replace_flag_servers(servers).await?;
+            let _refresh = engine
+                .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                .await;
+            sync_agent_mcp_server_names(engine, self.mcp_control)?;
+        }
+        if let Some(mode) = next_mode {
+            engine.set_permission_mode(mode)?;
+        }
+        self.command_context
+            .permissions
+            .set_user_rules(next_user_rules)?;
+        if let Some(model) = next_model {
+            engine.set_model(model);
+        }
+        if let Some(effort) = next_effort {
+            engine.set_reasoning_effort(effort);
+        }
+        engine.install_custom_agents(agents.custom_agents)?;
+        self.hooks.finalize_async().await;
+        self.command_context.set_sandbox_runtime(sandbox);
+        self.command_context.set_hooks(Arc::clone(&next_hooks));
+        engine.replace_hooks(Arc::clone(&next_hooks));
+        *self.hooks = next_hooks;
+        *self.commands = next_commands;
+        *self.custom_agents = next_agent_names;
+        *self.settings = candidate;
+        self.flag_settings = next_flags;
+        Ok(json!({}))
+    }
+
+    fn settings_snapshot(&self, engine: &QueryEngine) -> Result<Value> {
+        let sandbox = self.command_context.sandbox_runtime();
+        let mut flags = Value::Object(self.flag_settings.clone());
+        redact_runtime_setting_secrets(&mut flags);
+        Ok(json!({
+            "effective":{
+                "model":engine.model,
+                "reasoningEffort":engine.reasoning_effort().map(ReasoningEffort::as_str),
+                "permissionMode":permission_mode_name(engine.permission_mode()),
+                "outputStyle":self.output_style,
+                "availableOutputStyles":self.available_output_styles,
+                "pluginCount":*self.plugin_count,
+                "memoryEnabled":self.memory.enabled(),
+                "hooksConfigured":!self.hooks.is_empty(),
+                "sandbox":{"enabled":sandbox.enabled(), "available":sandbox.available()},
+                "trustedRootCount":self.command_context.trusted_roots().len(),
+                "mcpServers":self.mcp_control.map(|control| control.status()).unwrap_or_default(),
+            },
+            "sources":[{"source":"flagSettings", "settings":flags}],
+            "applied":{
+                "model":engine.model,
+                "effort":engine.reasoning_effort().map(ReasoningEffort::as_str),
+            },
+        }))
+    }
+
+    async fn reload_plugins(&mut self, cli: &Cli, engine: &mut QueryEngine) -> Result<Value> {
+        if cli.bare || cli.safe_mode {
+            return Ok(json!({
+                "commands":command_descriptors(self.command_context, self.commands),
+                "agents":self.custom_agents,
+                "plugins":[],
+                "mcpServers":self.mcp_control.map_or_else(Vec::new, |control| control.status()),
+                "error_count":0,
+            }));
+        }
+        if !self.command_context.background_task_ids().await.is_empty() {
+            bail!("plugin reload unavailable while background tasks are running")
+        }
+
+        let cwd = self.store.cwd();
+        let mut refreshed_base = Settings::load(cwd, cli.settings.as_deref(), cli.bare)?;
+        let discovery_settings = settings_with_flag_layer(&refreshed_base, &self.flag_settings)?;
+        let catalog = PluginCatalog::discover(&discovery_settings, cwd, false)?;
+        let plugin_count = catalog.plugins().len();
+        let plugins = catalog
+            .plugins()
+            .iter()
+            .map(|plugin| {
+                let path = plugin
+                    .root
+                    .strip_prefix(cwd)
+                    .ok()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|path| path.display().to_string())
+                    .or_else(|| {
+                        plugin
+                            .root
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_else(|| "plugin".to_owned());
+                json!({"name":plugin.name, "path":path, "source":"trusted-local"})
+            })
+            .collect::<Vec<_>>();
+        let next_mcp_definitions = catalog.mcp_servers().clone();
+        let next_lsp_definitions = catalog.lsp_servers().clone();
+        let styles = catalog.available_output_style_names();
+        let skills = catalog.skills().clone();
+        let plugin_hooks = catalog.hooks().clone();
+        let plugin_commands = catalog.commands().clone();
+        let monitors = catalog.monitors().to_vec();
+        catalog.apply_runtime_contributions(&mut refreshed_base)?;
+        let refreshed_settings = settings_with_flag_layer(&refreshed_base, &self.flag_settings)?;
+        let mut commands = CustomCommandCatalog::from_settings(&refreshed_settings)?;
+        commands.merge(plugin_commands.clone())?;
+        let agents = configure_agents(&refreshed_settings)?;
+        let agent_names = agents
+            .custom_agents
+            .iter()
+            .map(|(name, definition)| json!({"name":name,"description":definition.description}))
+            .collect::<Vec<_>>();
+        let next_hooks = Arc::new(self.build_hooks(&refreshed_settings, &plugin_hooks)?);
+
+        let mut error_count = 0usize;
+        let mut applied_mcp_definitions = self.plugin_mcp_definitions.clone();
+        let mut applied_lsp_definitions = self.plugin_lsp_definitions.clone();
+        if next_mcp_definitions != *self.plugin_mcp_definitions {
+            let update = async {
+                self.command_context.extend_secret_env_scrubber(&Settings {
+                    raw: json!({"mcpServers":next_mcp_definitions.clone()}),
+                })?;
+                let control = self
+                    .mcp_control
+                    .context("plugin MCP reload requires the registered MCP runtime")?;
+                let report = control
+                    .replace_plugin_servers(&next_mcp_definitions)
+                    .await?;
+                Ok::<_, anyhow::Error>(report)
+            }
+            .await;
+            match update {
+                Ok(report) => {
+                    applied_mcp_definitions = next_mcp_definitions.clone();
+                    error_count = error_count.saturating_add(report.errors.len());
+                    if let Err(error) = sync_agent_mcp_server_names(engine, self.mcp_control) {
+                        if cli.debug {
+                            eprintln!("[debug] plugin MCP agent catalog refresh failed: {error:#}");
+                        }
+                        error_count = error_count.saturating_add(1);
+                    }
+                    let refresh = engine
+                        .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                        .await;
+                    if refresh.is_error {
+                        error_count = error_count.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    if cli.debug {
+                        eprintln!("[debug] plugin MCP refresh kept its prior layer: {error:#}");
+                    }
+                    error_count = error_count.saturating_add(1);
+                }
+            }
+        }
+        if next_lsp_definitions != *self.plugin_lsp_definitions {
+            let update = async {
+                self.command_context.extend_secret_env_scrubber(&Settings {
+                    raw: json!({"lspServers":next_lsp_definitions.clone()}),
+                })?;
+                self.lsp_control
+                    .context("plugin LSP reload requires the registered LSP runtime")?
+                    .replace_plugin_servers(&next_lsp_definitions)
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match update {
+                Ok(()) => applied_lsp_definitions = next_lsp_definitions.clone(),
+                Err(error) => {
+                    if cli.debug {
+                        eprintln!("[debug] plugin LSP refresh kept its prior layer: {error:#}");
+                    }
+                    error_count = error_count.saturating_add(1);
+                }
+            }
+        }
+
+        engine.install_custom_agents(agents.custom_agents)?;
+        self.hooks.finalize_async().await;
+        self.command_context.shutdown_monitors().await;
+        self.command_context.set_extension_skills(skills);
+        self.command_context.configure_plugin_monitors(monitors);
+        self.command_context.set_hooks(Arc::clone(&next_hooks));
+        engine.replace_hooks(Arc::clone(&next_hooks));
+        *self.commands = commands;
+        *self.custom_agents = agent_names;
+        *self.hooks = next_hooks;
+        *self.plugin_count = plugin_count;
+        *self.available_output_styles = styles;
+        *self.plugin_commands = plugin_commands;
+        *self.plugin_hooks = plugin_hooks;
+        self.base_settings = refreshed_base;
+        *self.settings = refreshed_settings;
+        *self.plugin_mcp_definitions = applied_mcp_definitions;
+        *self.plugin_lsp_definitions = applied_lsp_definitions;
+        let monitor_errors = self.command_context.start_always_plugin_monitors().await;
+        error_count = error_count.saturating_add(monitor_errors.len());
+
+        Ok(json!({
+            "commands":command_descriptors(self.command_context, self.commands),
+            "agents":self.custom_agents,
+            "plugins":plugins,
+            "mcpServers":self.mcp_control.map_or_else(Vec::new, |control| control.status()),
+            "error_count":error_count,
+        }))
+    }
+}
+
+fn settings_with_flag_layer(
+    base: &Settings,
+    flags: &serde_json::Map<String, Value>,
+) -> Result<Settings> {
+    let mut raw = base.raw.clone();
+    let root = raw
+        .as_object_mut()
+        .context("runtime settings root 不是 object")?;
+    for (key, value) in flags {
+        match root.get_mut(key) {
+            Some(existing) => merge_runtime_setting(existing, value),
+            None => {
+                root.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if serde_json::to_vec(&raw)?.len() > 1024 * 1024 {
+        bail!("runtime flag settings 合并后超过 1 MiB 限制")
+    }
+    Ok(Settings { raw })
+}
+
+fn merge_runtime_setting(target: &mut Value, incoming: &Value) {
+    match (target, incoming) {
+        (Value::Object(target), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                match target.get_mut(key) {
+                    Some(existing) => merge_runtime_setting(existing, value),
+                    None => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, incoming) => *target = incoming.clone(),
+    }
+}
+
+fn sdk_agent_settings(value: &Value) -> Result<Value> {
+    let agents = value
+        .as_object()
+        .context("initialize.agents 必须是 object")?;
+    let mut definitions = serde_json::Map::new();
+    for (name, value) in agents {
+        let source = value
+            .as_object()
+            .with_context(|| format!("initialize.agents.{name} 必须是 object"))?;
+        if let Some(field) = source.keys().find(|field| {
+            !matches!(
+                field.as_str(),
+                "description"
+                    | "prompt"
+                    | "tools"
+                    | "disallowedTools"
+                    | "model"
+                    | "criticalSystemReminder_EXPERIMENTAL"
+                    | "skills"
+                    | "maxTurns"
+                    | "background"
+                    | "effort"
+                    | "mcpServers"
+                    | "initialPrompt"
+                    | "memory"
+                    | "permissionMode"
+            )
+        }) {
+            bail!("initialize.agents.{name} 包含未知字段 {field}")
+        }
+        let mut target = serde_json::Map::new();
+        for field in [
+            "description",
+            "disallowedTools",
+            "model",
+            "skills",
+            "maxTurns",
+            "background",
+            "effort",
+            "mcpServers",
+            "initialPrompt",
+            "memory",
+            "permissionMode",
+        ] {
+            if let Some(value) = source.get(field) {
+                if field == "effort" && value.is_number() {
+                    bail!("initialize.agents.{name}.effort 必须使用命名级别")
+                }
+                target.insert(field.to_owned(), value.clone());
+            }
+        }
+        if let Some(tools) = source.get("tools") {
+            target.insert("allowedTools".to_owned(), tools.clone());
+        }
+        let mut prompt = source
+            .get("prompt")
+            .and_then(Value::as_str)
+            .context("initialize agent prompt 缺失")?
+            .to_owned();
+        if let Some(reminder) = source
+            .get("criticalSystemReminder_EXPERIMENTAL")
+            .and_then(Value::as_str)
+        {
+            prompt.push_str("\n\n<critical-system-reminder>\n");
+            prompt.push_str(reminder);
+            prompt.push_str("\n</critical-system-reminder>");
+        }
+        target.insert("prompt".to_owned(), Value::String(prompt));
+        definitions.insert(name.clone(), Value::Object(target));
+    }
+    Ok(json!({"definitions":definitions}))
+}
+
+fn merged_flag_permission_rules(
+    base: &UserPermissionRules,
+    flags: &serde_json::Map<String, Value>,
+) -> Result<UserPermissionRules> {
+    let mut merged = base.clone();
+    let Some(permissions) = flags.get("permissions") else {
+        return Ok(merged);
+    };
+    let permissions = permissions
+        .as_object()
+        .context("permissions flag setting 必须是 object")?;
+    if let Some(key) = permissions
+        .keys()
+        .find(|key| !matches!(key.as_str(), "allow" | "ask" | "deny" | "defaultMode"))
+    {
+        bail!("permissions flag setting 包含未知字段 {key}")
+    }
+    let append = |field: &str, target: &mut Vec<String>| -> Result<()> {
+        let Some(values) = permissions.get(field) else {
+            return Ok(());
+        };
+        let values = values
+            .as_array()
+            .with_context(|| format!("permissions.{field} 必须是 array"))?;
+        for value in values {
+            let value = value
+                .as_str()
+                .with_context(|| format!("permissions.{field} 只能包含 string"))?;
+            if !target.iter().any(|existing| existing == value) {
+                target.push(value.to_owned());
+            }
+        }
+        Ok(())
+    };
+    append("allow", &mut merged.allow)?;
+    append("ask", &mut merged.ask)?;
+    append("deny", &mut merged.deny)?;
+    merged.validate()?;
+    Ok(merged)
+}
+
+fn redact_runtime_setting_secrets(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "env" | "headers" | "token" | "apikey" | "api_key" | "authorization"
+                ) {
+                    *value = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_runtime_setting_secrets(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_runtime_setting_secrets(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 #[derive(Clone)]
@@ -4621,50 +6115,160 @@ async fn handle_control_request(
     request_id: &str,
     request: &Value,
     engine: &mut QueryEngine,
-    metadata: &SessionMetadata<'_>,
+    runtime: &mut ControlRuntime<'_>,
+    cli: &Cli,
 ) -> Result<()> {
-    let store = metadata.store;
+    let store = runtime.store;
     let subtype = request
         .get("subtype")
         .and_then(Value::as_str)
         .context("control request 缺少 subtype")?;
-    if matches!(subtype, "mcp_set_servers" | "mcp_toggle" | "reload_plugins") {
+    if subtype == "reload_plugins" {
+        let response = runtime.reload_plugins(cli, engine).await;
+        return match response {
+            Ok(response) => handle.respond_success(
+                request_id,
+                open_agent_harness::session::sanitize_transport_value(&response, store.cwd()),
+            ),
+            Err(error) => handle.respond_error(
+                request_id,
+                open_agent_harness::session::sanitize_transport_text(
+                    &format!("{error:#}"),
+                    store.cwd(),
+                ),
+            ),
+        };
+    }
+    if subtype == "apply_flag_settings" {
+        let response = request
+            .get("settings")
+            .and_then(Value::as_object)
+            .context("apply_flag_settings 需要 settings object")
+            .and_then(|settings| {
+                // Keep validation synchronous; mutation happens only after the
+                // complete candidate has been prepared below.
+                if settings.len() > 256 {
+                    bail!("apply_flag_settings.settings 超过资源限制")
+                }
+                Ok(settings.clone())
+            });
+        let response = match response {
+            Ok(settings) => runtime.apply_flag_settings(&settings, engine).await,
+            Err(error) => Err(error),
+        };
+        return match response {
+            Ok(response) => handle.respond_success(request_id, response),
+            Err(error) => handle.respond_error(
+                request_id,
+                open_agent_harness::session::sanitize_transport_text(
+                    &format!("{error:#}"),
+                    store.cwd(),
+                ),
+            ),
+        };
+    }
+    if subtype == "get_settings" {
+        let response = runtime.settings_snapshot(engine);
+        return match response {
+            Ok(response) => handle.respond_success(
+                request_id,
+                open_agent_harness::session::sanitize_transport_value(&response, store.cwd()),
+            ),
+            Err(error) => handle.respond_error(
+                request_id,
+                open_agent_harness::session::sanitize_transport_text(
+                    &format!("{error:#}"),
+                    store.cwd(),
+                ),
+            ),
+        };
+    }
+    if subtype == "initialize" {
+        let response = runtime.initialize_from_sdk(request, engine).await;
+        return match response {
+            Ok(()) => {
+                let metadata = runtime.metadata();
+                let response = json!({
+                    "session_id":store.id,
+                    "commands":command_descriptors(metadata.command_context, metadata.commands),
+                    "command_names":available_command_names(metadata.command_context, metadata.commands),
+                    "command_descriptors":command_descriptors(metadata.command_context, metadata.commands),
+                    "commandDescriptors":command_descriptors(metadata.command_context, metadata.commands),
+                    "agents":metadata.custom_agents,
+                    "models":metadata.model_options.iter().map(|option| json!({
+                        "value":option.value,
+                        "displayName":option.display_name,
+                        "description":option.description,
+                    })).collect::<Vec<_>>(),
+                    "tools":engine.registered_tool_names(),
+                    "output_style":metadata.output_style,
+                    "available_output_styles":metadata.available_output_styles,
+                    "account":{},
+                    "pid":std::process::id(),
+                    "capabilities":STREAM_CAPABILITIES,
+                });
+                handle.respond_success(
+                    request_id,
+                    open_agent_harness::session::sanitize_transport_value(&response, store.cwd()),
+                )
+            }
+            Err(error) => handle.respond_error(
+                request_id,
+                open_agent_harness::session::sanitize_transport_text(
+                    &format!("{error:#}"),
+                    store.cwd(),
+                ),
+            ),
+        };
+    }
+    if subtype == "set_model" {
+        let model = request
+            .get("model")
+            .map(|value| value.as_str().context("set_model.model 必须是 string"))
+            .transpose()?
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| runtime.base_model.clone());
+        let response = runtime.settings.model_options(&model).map(|_| {
+            engine.set_model(model.clone());
+            json!({"model":model})
+        });
+        return match response {
+            Ok(response) => handle.respond_success(request_id, response),
+            Err(error) => handle.respond_error(request_id, format!("{error:#}")),
+        };
+    }
+    if subtype == "set_max_thinking_tokens" {
         return handle.respond_unsupported(
             request_id,
             subtype,
-            "This provider-neutral harness does not safely support mutating MCP server or plugin configuration at runtime.",
+            "Exact provider-specific thinking-token budgets are not portable across Messages, Chat Completions, and Responses; use named reasoning effort instead.",
         );
     }
+    if subtype == "generate_session_title" {
+        let description = request
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty());
+        let title = description
+            .map(|description| bounded_single_line(description, 480))
+            .unwrap_or_else(|| suggested_session_title(&engine.messages));
+        let response = if request.get("persist").and_then(Value::as_bool) == Some(true) {
+            runtime
+                .store
+                .rename(&title)
+                .map(|()| json!({"title":title}))
+        } else {
+            Ok(json!({"title":title}))
+        };
+        return match response {
+            Ok(response) => handle.respond_success(request_id, response),
+            Err(error) => handle.respond_error(request_id, format!("{error:#}")),
+        };
+    }
+    let metadata = runtime.metadata();
     let response = match subtype {
-        "initialize" => Ok(json!({
-            "session_id":store.id,
-            "commands":command_descriptors(metadata.command_context, metadata.commands),
-            "command_names":available_command_names(metadata.command_context, metadata.commands),
-            "command_descriptors":command_descriptors(metadata.command_context, metadata.commands),
-            "commandDescriptors":command_descriptors(metadata.command_context, metadata.commands),
-            "agents":metadata.custom_agents,
-            "models":metadata.model_options.iter().map(|option| json!({
-                "value":option.value,
-                "displayName":option.display_name,
-                "description":option.description,
-            })).collect::<Vec<_>>(),
-            "tools":engine.registered_tool_names(),
-            "output_style":metadata.output_style,
-            "available_output_styles":metadata.available_output_styles,
-            "account":{},
-            "pid":std::process::id(),
-            "capabilities":[
-                "cancel_async_message_v1",
-                "command_lifecycle_v1",
-                "interrupt_receipt_v1",
-                "mcp_reconnect_v1",
-                "queue_priority_v1",
-                "replay_user_messages_v1",
-                "rewind_conversation_v1",
-                "side_question_v1",
-                "stop_task_v1"
-            ],
-        })),
+        "initialize" => unreachable!("initialize is handled before metadata borrowing"),
         "interrupt" => Ok(json!({
             "interrupted":true,
             "cancelled_wakeups":metadata.command_context.cron_service().stop_wakeups(),
@@ -4678,18 +6282,8 @@ async fn handle_control_request(
                 engine.set_permission_mode(mode)?;
                 Ok(json!({"mode":permission_mode_name(engine.permission_mode())}))
             }),
-        "set_model" => {
-            let model = request.get("model").and_then(Value::as_str);
-            if let Some(model) = model {
-                if model.is_empty() || model.len() > 512 {
-                    Err(anyhow::anyhow!("model 长度必须为 1..=512 字节"))
-                } else {
-                    engine.set_model(model.to_owned());
-                    Ok(json!({"model":engine.model}))
-                }
-            } else {
-                Ok(json!({"model":engine.model}))
-            }
+        "set_model" | "set_max_thinking_tokens" => {
+            unreachable!("model controls are handled before metadata borrowing")
         }
         "get_context_usage" => context_report_json(engine, metadata.memory),
         "mcp_status" => Ok(json!({
@@ -4717,6 +6311,79 @@ async fn handle_control_request(
                     "reconnected":true,
                     "mcpServers":control.status()
                 }))
+            }
+            .await
+        }
+        "mcp_toggle" => {
+            async {
+                let server = request
+                    .get("serverName")
+                    .and_then(Value::as_str)
+                    .context("mcp_toggle 需要 serverName")?;
+                let enabled = request
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .context("mcp_toggle 需要 enabled")?;
+                let control = metadata.mcp_control.context("当前没有配置 MCP control")?;
+                if enabled {
+                    control.enable(server).await?;
+                } else {
+                    control.disable(server).await?;
+                }
+                let refresh = engine
+                    .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                    .await;
+                if refresh.is_error {
+                    bail!("MCP 状态已切换但工具刷新失败: {}", refresh.content)
+                }
+                Ok(json!({
+                    "serverName":server,
+                    "enabled":enabled,
+                    "mcpServers":control.status(),
+                }))
+            }
+            .await
+        }
+        "mcp_set_servers" => {
+            async {
+                let servers = request
+                    .get("servers")
+                    .and_then(Value::as_object)
+                    .context("mcp_set_servers 需要 servers object")?;
+                metadata
+                    .command_context
+                    .extend_secret_env_scrubber(&Settings {
+                        raw: json!({"mcpServers":servers.clone()}),
+                    })?;
+                let control = metadata.mcp_control.context("当前没有配置 MCP control")?;
+                let report = control.replace_dynamic_servers(servers).await?;
+                sync_agent_mcp_server_names(engine, metadata.mcp_control)?;
+                let refresh = engine
+                    .execute_command_tool("ToolSearch", json!({"query":"mcp"}))
+                    .await;
+                if refresh.is_error {
+                    bail!("动态 MCP 拓扑已更新但工具刷新失败: {}", refresh.content)
+                }
+                Ok(serde_json::to_value(report)?)
+            }
+            .await
+        }
+        "mcp_message" => {
+            async {
+                let server = request
+                    .get("server_name")
+                    .and_then(Value::as_str)
+                    .context("mcp_message 需要 server_name")?;
+                let message = request
+                    .get("message")
+                    .cloned()
+                    .context("mcp_message 需要 message")?;
+                metadata
+                    .mcp_control
+                    .context("当前没有配置 MCP control")?
+                    .deliver_sdk_message(server, message)
+                    .await?;
+                Ok(json!({}))
             }
             .await
         }
@@ -4806,27 +6473,6 @@ async fn handle_control_request(
                 Ok(json!({"task_id":task_id, "stopped":true, "result":output.content}))
             }
             .await
-        }
-        "get_settings" => {
-            let sandbox = metadata.command_context.sandbox_runtime();
-            let effective = json!({
-                "model":engine.model,
-                "reasoningEffort":engine.reasoning_effort().map(ReasoningEffort::as_str),
-                "permissionMode":permission_mode_name(engine.permission_mode()),
-                "outputStyle":metadata.output_style,
-                "availableOutputStyles":metadata.available_output_styles,
-                "pluginCount":metadata.plugin_count,
-                "memoryEnabled":metadata.memory.enabled(),
-                "hooksConfigured":!metadata.hooks.is_empty(),
-                "sandbox":{"enabled":sandbox.enabled(), "available":sandbox.available()},
-                "trustedRootCount":metadata.command_context.trusted_roots().len(),
-                "mcpServers":metadata.mcp_control.map(|control| control.status()).unwrap_or_default(),
-            });
-            Ok(json!({
-                "effective":effective,
-                "sources":[],
-                "applied":{"model":engine.model, "effort":engine.reasoning_effort().map(ReasoningEffort::as_str)},
-            }))
         }
         "rewind" => (|| -> Result<Value> {
             let checkpoint = request
@@ -4920,7 +6566,10 @@ async fn handle_control_request(
         other => Err(anyhow::anyhow!("不支持的 control request subtype: {other}")),
     };
     match response {
-        Ok(response) => handle.respond_success(request_id, response),
+        Ok(response) => handle.respond_success(
+            request_id,
+            open_agent_harness::session::sanitize_transport_value(&response, store.cwd()),
+        ),
         Err(error) => handle.respond_error(
             request_id,
             open_agent_harness::session::sanitize_transport_text(
@@ -7063,6 +8712,12 @@ fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> Sett
             description: "Predict one tool-free next prompt after completed turns".to_owned(),
             value: SettingValue::Boolean(settings.prompt_suggestion_enabled),
         },
+        SettingItem {
+            key: "terminalPanelEnabled".to_owned(),
+            label: "Terminal panel".to_owned(),
+            description: "Open a private persistent shell with Alt+J".to_owned(),
+            value: SettingValue::Boolean(settings.terminal_panel_enabled),
+        },
     ];
     items.push(SettingItem {
         key: "preferredNotifChannel".to_owned(),
@@ -7274,6 +8929,19 @@ fn print_doctor(
             println!("  MCP {}: {:?}", status.name, status.status);
         }
     }
+}
+
+fn sync_agent_mcp_server_names(
+    engine: &QueryEngine,
+    control: Option<&Arc<dyn McpControl>>,
+) -> Result<()> {
+    engine.set_agent_mcp_server_names(
+        control
+            .map(|control| control.status())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|server| server.name),
+    )
 }
 
 fn print_terminal_setup() {
@@ -7925,6 +9593,23 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn png_fixture(width: u32, height: u32) -> Vec<u8> {
         let image = ImageBuffer::from_fn(width, height, |x, y| {
             Rgba([(x % 251) as u8, (y % 239) as u8, 127, 255])
@@ -7934,6 +9619,67 @@ mod tests {
             .write_to(&mut output, ImageFormat::Png)
             .unwrap();
         output.into_inner()
+    }
+
+    #[test]
+    fn sdk_agent_progress_summary_flag_controls_only_the_optional_summary_field() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let session = ControlSession::with_io(
+            Cursor::new(Vec::<u8>::new()),
+            SharedWriter(Arc::clone(&output)),
+        );
+        let handle = session.handle();
+        let event = AgentTaskEvent::Progress {
+            task_id: Uuid::new_v4(),
+            description: "Review".to_owned(),
+            progress: format!("Reading {}", workspace.path().join("private.rs").display()),
+            usage: open_agent_harness::agents::AgentTaskUsage {
+                total_tokens: 12,
+                tool_uses: 1,
+                duration_ms: 34,
+            },
+            last_tool_name: Some("Read".to_owned()),
+        };
+        emit_agent_task_event(
+            Some(&handle),
+            Uuid::new_v4(),
+            &event,
+            false,
+            workspace.path(),
+        )
+        .unwrap();
+        emit_agent_task_event(
+            Some(&handle),
+            Uuid::new_v4(),
+            &event,
+            true,
+            workspace.path(),
+        )
+        .unwrap();
+        let encoded = String::from_utf8(
+            output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .unwrap();
+        let messages = encoded
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].get("summary").is_none());
+        assert_eq!(messages[0]["usage"]["total_tokens"], 12);
+        assert_eq!(messages[0]["usage"]["tool_uses"], 1);
+        assert_eq!(messages[0]["usage"]["duration_ms"], 34);
+        assert_eq!(messages[0]["last_tool_name"], "Read");
+        assert!(
+            messages[1]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.ends_with("private.rs"))
+        );
+        assert!(!encoded.contains(workspace.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
