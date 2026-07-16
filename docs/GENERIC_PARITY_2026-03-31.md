@@ -188,8 +188,10 @@ is accurate; “complete parity with the proprietary product” is not.
 - SDK initialization applies bounded system replacement/append, structured
   output, hooks, MCP transports, prompt suggestions, agent progress summaries,
   and full trusted custom-agent definitions. An explicitly selected main agent
-  can contribute model, prompt, initial input, permission mode, isolated MCP,
-  and private user/project/local memory without widening the parent authority.
+  can contribute model, prompt, initial input, tool restrictions, and private
+  user/project/local memory. Agent-specific `permissionMode` and `mcpServers`
+  remain invocation-local delegated-agent options, so selecting a main agent
+  cannot silently replace root permission or MCP authority.
   Stream output uses one capability list before and after initialization,
   source-shaped replay/partial/compact/hook/tool/task envelopes, and explicit
   equivalents where vendor account, billing, or provider-state fields are not
@@ -216,9 +218,11 @@ is accurate; “complete parity with the proprietary product” is not.
 - Stream control keeps configured, plugin, and SDK-requested MCP ownership in
   separate collision-checked layers. Process transports reconnect in the CLI;
   SDK transports use correlated bounded control requests and connect only
-  after the topology response to avoid deadlock. Plugin reload and dynamic
-  replacement refresh the existing tool discovery registry without rebuilding
-  the model client, while invalid candidates leave the prior layer intact.
+  after the topology response to avoid deadlock. Plugin reload applies valid
+  command, agent, hook, MCP, and LSP components independently and reports
+  component failures; an invalid topology candidate leaves only that prior
+  layer intact. Dynamic replacement refreshes the existing tool discovery
+  registry without rebuilding the model client.
 - Every model-bound PNG/JPEG/GIF/WebP path uses one bounded Rust normalizer:
   `Read` and explicit file mentions, clipboard attachments, exact shell data
   URIs, MCP image blocks/resources, and direct SDK/stream user blocks. It
