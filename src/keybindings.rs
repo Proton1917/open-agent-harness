@@ -58,6 +58,8 @@ const KEYBINDING_ACTIONS: &[&str] = &[
     "app:toggleTerminal",
     "app:redraw",
     "app:openArtifact",
+    "app:quickOpen",
+    "app:globalSearch",
     "history:search",
     "history:previous",
     "history:next",
@@ -762,6 +764,14 @@ fn default_bindings() -> Vec<Binding> {
         ("Global", "ctrl+o", "app:toggleTranscript"),
         ("Global", "ctrl+l", "app:redraw"),
         ("Global", "ctrl+r", "history:search"),
+        ("Global", "ctrl+shift+p", "app:quickOpen"),
+        ("Global", "cmd+shift+p", "app:quickOpen"),
+        ("Global", "ctrl+shift+f", "app:globalSearch"),
+        ("Global", "cmd+shift+f", "app:globalSearch"),
+        // Classic PTYs collapse Ctrl-Shift-letter into Ctrl-letter. These
+        // chords keep both dialogs reachable without shadowing readline keys.
+        ("Global", "ctrl+x ctrl+p", "app:quickOpen"),
+        ("Global", "ctrl+x ctrl+f", "app:globalSearch"),
         ("Chat", "escape", "chat:cancel"),
         ("Chat", "cmd+k", "chat:clearScreen"),
         ("Chat", "ctrl+x ctrl+k", "chat:killAgents"),
@@ -1014,6 +1024,35 @@ mod tests {
                 &["Chat", "Global"]
             ),
             KeyResolution::Match("chat:undo".to_owned())
+        );
+    }
+
+    #[test]
+    fn workspace_search_defaults_include_source_shortcuts_and_pty_fallbacks() {
+        let mut manager = KeybindingManager::new(None);
+        assert_eq!(
+            manager.resolve(
+                key(
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                &["Chat", "Global"]
+            ),
+            KeyResolution::Match("app:quickOpen".to_owned())
+        );
+        assert_eq!(
+            manager.resolve(
+                key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &["Chat", "Global"]
+            ),
+            KeyResolution::ChordStarted
+        );
+        assert_eq!(
+            manager.resolve(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                &["Chat", "Global"]
+            ),
+            KeyResolution::Match("app:globalSearch".to_owned())
         );
     }
 

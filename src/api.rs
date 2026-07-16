@@ -11,6 +11,7 @@ use tokio::time::sleep;
 
 use crate::{
     config::EndpointConfig,
+    network_trust::process_network_trust,
     protocol::{
         ApiFormat, ReasoningEffort, RequestParts, StreamDecoder, encode_request_with_effort,
         parse_response,
@@ -146,6 +147,7 @@ impl ModelClient {
         if !endpoint.allow_env_proxy {
             builder = builder.no_proxy();
         }
+        builder = process_network_trust().apply_reqwest(builder)?;
         let http = builder.build().context("无法创建 HTTP client")?;
         Ok(Self {
             http,

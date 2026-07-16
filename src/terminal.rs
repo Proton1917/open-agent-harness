@@ -51,6 +51,10 @@ use crate::{
     },
     ui_settings::ThemePreset,
     vim::{VimAction, VimEvent, VimKey, VimMode, VimState},
+    workspace_search::{
+        WorkspacePreview, WorkspaceSearchItem, WorkspaceSearchKind, WorkspaceSearchProvider,
+        WorkspaceSearchUpdate,
+    },
 };
 
 const EXIT_WINDOW: Duration = Duration::from_millis(800);
@@ -65,6 +69,7 @@ const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 const KILL_RING_LIMIT: usize = 10;
 const MAX_HISTORY_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_HISTORY_SEARCH_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_CLIPBOARD_ATTACHMENTS: usize = 8;
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FULLSCREEN_STREAM_BYTES: usize = 64 * 1024;
@@ -1539,6 +1544,7 @@ enum BindingDispatch {
     ClearInput,
     ClearScreen,
     PasteImage,
+    WorkspaceSearch(WorkspaceSearchKind),
     Unsupported(String),
 }
 
@@ -1581,6 +1587,12 @@ fn dispatch_binding(action: String) -> BindingDispatch {
         "chat:clearInput" => return BindingDispatch::ClearInput,
         "chat:clearScreen" => return BindingDispatch::ClearScreen,
         "chat:imagePaste" => return BindingDispatch::PasteImage,
+        "app:quickOpen" => {
+            return BindingDispatch::WorkspaceSearch(WorkspaceSearchKind::QuickOpen);
+        }
+        "app:globalSearch" => {
+            return BindingDispatch::WorkspaceSearch(WorkspaceSearchKind::GlobalSearch);
+        }
         "attachments:next" => canonical_key(KeyCode::Right, KeyModifiers::NONE),
         "attachments:previous" => canonical_key(KeyCode::Left, KeyModifiers::NONE),
         "attachments:remove" => canonical_key(KeyCode::Backspace, KeyModifiers::NONE),
@@ -1789,6 +1801,13 @@ impl Drop for TemporaryPromptFile {
 }
 
 pub fn open_file_in_external_editor(path: &std::path::Path) -> Result<()> {
+    open_file_in_external_editor_at(path, None)
+}
+
+pub fn open_file_in_external_editor_at(path: &std::path::Path, line: Option<usize>) -> Result<()> {
+    if line.is_some_and(|line| line == 0 || line > 10_000_000) {
+        anyhow::bail!("external editor line must be between 1 and 10000000")
+    }
     let editor = std::env::var("VISUAL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -1824,9 +1843,32 @@ pub fn open_file_in_external_editor(path: &std::path::Path) -> Result<()> {
     {
         arguments.push("--wait".to_owned());
     }
-    let status = std::process::Command::new(executable)
-        .args(arguments)
-        .arg(path)
+    let mut command = std::process::Command::new(executable);
+    command.args(arguments);
+    match (editor_name.as_str(), line) {
+        ("code" | "code-insiders" | "codium" | "cursor" | "windsurf", Some(line)) => {
+            let path = path
+                .to_str()
+                .context("line-aware editor navigation requires a UTF-8 path")?;
+            command.arg("--goto").arg(format!("{path}:{line}:1"));
+        }
+        ("subl", Some(line)) => {
+            let path = path
+                .to_str()
+                .context("line-aware editor navigation requires a UTF-8 path")?;
+            command.arg(format!("{path}:{line}"));
+        }
+        ("vi" | "vim" | "nvim", Some(line)) => {
+            command.arg(format!("+{line}")).arg(path);
+        }
+        ("emacs" | "emacsclient", Some(line)) => {
+            command.arg(format!("+{line}:1")).arg(path);
+        }
+        (_, _) => {
+            command.arg(path);
+        }
+    }
+    let status = command
         .status()
         .map_err(|error| anyhow::anyhow!("cannot launch external editor: {error}"))?;
     if !status.success() {
@@ -2223,6 +2265,7 @@ pub struct InputReadActions<'a> {
     pub scheduled_prompt: &'a mut dyn FnMut() -> Result<Option<String>>,
     pub model_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
     pub rewind_picker: &'a mut dyn FnMut() -> Result<ModelPickerOutcome>,
+    pub workspace_search: &'a mut dyn FnMut(WorkspaceSearchKind) -> Result<WorkspaceSearchOutcome>,
     pub transcript_viewer: &'a mut dyn FnMut() -> Result<()>,
     /// Returns `Some(new_value)` only when an asynchronous refresh completed.
     /// The inner `None` clears an existing status line.
@@ -3077,6 +3120,487 @@ pub enum ModelPickerOutcome {
     Exit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSearchSelection {
+    Open(WorkspaceSearchItem),
+    Mention(WorkspaceSearchItem),
+    InsertPath(WorkspaceSearchItem),
+    Cancelled,
+    Exit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSearchOutcome {
+    Inserted(String),
+    Opened(String),
+    Cancelled,
+    Exit,
+}
+
+struct WorkspaceSearchDialogState {
+    kind: WorkspaceSearchKind,
+    query: String,
+    items: Vec<WorkspaceSearchItem>,
+    focused: usize,
+    visible_from: usize,
+    visible_count: usize,
+    searching: bool,
+    truncated: bool,
+    error: Option<String>,
+    preview: Option<WorkspacePreview>,
+    hint: String,
+}
+
+impl WorkspaceSearchDialogState {
+    fn new(kind: WorkspaceSearchKind, items: Vec<WorkspaceSearchItem>) -> Self {
+        Self {
+            kind,
+            query: String::new(),
+            items,
+            focused: 0,
+            visible_from: 0,
+            visible_count: 1,
+            searching: false,
+            truncated: false,
+            error: None,
+            preview: None,
+            hint: String::new(),
+        }
+    }
+
+    fn focused_item(&self) -> Option<&WorkspaceSearchItem> {
+        self.items.get(self.focused)
+    }
+
+    fn replace_items(&mut self, items: Vec<WorkspaceSearchItem>, truncated: bool) {
+        self.items = items;
+        self.focused = self.focused.min(self.items.len().saturating_sub(1));
+        self.truncated = truncated;
+        self.error = None;
+        self.keep_visible();
+    }
+
+    fn fit_terminal(&mut self, width: u16, height: u16) {
+        let cap = match self.kind {
+            WorkspaceSearchKind::QuickOpen => 8,
+            WorkspaceSearchKind::GlobalSearch => 12,
+        };
+        let reserve = if width >= 120 { 7 } else { 13 };
+        self.visible_count = usize::from(height)
+            .saturating_sub(reserve)
+            .clamp(1, cap)
+            .min(self.items.len().max(1));
+        self.keep_visible();
+    }
+
+    fn keep_visible(&mut self) {
+        if self.items.is_empty() {
+            self.focused = 0;
+            self.visible_from = 0;
+            return;
+        }
+        self.focused = self.focused.min(self.items.len() - 1);
+        if self.focused < self.visible_from {
+            self.visible_from = self.focused;
+        } else if self.focused >= self.visible_from + self.visible_count {
+            self.visible_from = self.focused + 1 - self.visible_count;
+        }
+        self.visible_from = self
+            .visible_from
+            .min(self.items.len().saturating_sub(self.visible_count));
+    }
+
+    fn next(&mut self) {
+        if !self.items.is_empty() {
+            self.focused = (self.focused + 1) % self.items.len();
+            self.keep_visible();
+        }
+    }
+
+    fn previous(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.focused = if self.focused == 0 {
+            self.items.len() - 1
+        } else {
+            self.focused - 1
+        };
+        self.keep_visible();
+    }
+
+    fn page_down(&mut self) {
+        if !self.items.is_empty() {
+            self.focused = (self.focused + self.visible_count).min(self.items.len() - 1);
+            self.keep_visible();
+        }
+    }
+
+    fn page_up(&mut self) {
+        self.focused = self.focused.saturating_sub(self.visible_count);
+        self.keep_visible();
+    }
+
+    fn refresh_preview(&mut self, provider: &WorkspaceSearchProvider) {
+        self.preview = self.focused_item().map(|item| {
+            provider.preview(item).unwrap_or_else(|_| WorkspacePreview {
+                title: workspace_item_label(item),
+                lines: vec!["Preview unavailable".to_owned()],
+                truncated: false,
+            })
+        });
+    }
+}
+
+pub fn select_workspace_search(
+    kind: WorkspaceSearchKind,
+    provider: &mut WorkspaceSearchProvider,
+) -> Result<WorkspaceSearchSelection> {
+    let _modal = TerminalModalGuard::acquire();
+    let _raw = RawModeGuard::enter()?;
+    let _fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
+    let mut screen = DialogScreenGuard::enter()?;
+    let initial = match kind {
+        WorkspaceSearchKind::QuickOpen => provider.quick_open(""),
+        WorkspaceSearchKind::GlobalSearch => Vec::new(),
+    };
+    let mut state = WorkspaceSearchDialogState::new(kind, initial);
+    if kind == WorkspaceSearchKind::GlobalSearch {
+        provider.request_global("")?;
+        let _ = provider.poll_global();
+    }
+    state.refresh_preview(provider);
+    let mut exit_pending = None;
+
+    loop {
+        if kind == WorkspaceSearchKind::GlobalSearch {
+            if let Some(update) = provider.poll_global() {
+                state.searching = false;
+                match update {
+                    WorkspaceSearchUpdate::Ready {
+                        items, truncated, ..
+                    } => state.replace_items(items, truncated),
+                    WorkspaceSearchUpdate::Failed { message, .. } => {
+                        state.items.clear();
+                        state.focused = 0;
+                        state.visible_from = 0;
+                        state.error = Some(single_line(&message, 160));
+                    }
+                }
+                state.refresh_preview(provider);
+            }
+        }
+        if exit_pending
+            .is_some_and(|pending: ExitPending| pending.remaining(Instant::now()).is_none())
+        {
+            exit_pending = None;
+            state.hint.clear();
+        }
+        let (width, height) = screen.renderer.size();
+        state.fit_terminal(width, height);
+        let frame = render_workspace_search_frame(&state, width, height);
+        screen.renderer.draw(&mut io::stdout(), &frame)?;
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        let event = event::read()?;
+        match event {
+            Event::Resize(width, height) => screen.renderer.resize(width, height),
+            Event::Paste(value) => {
+                let changed = append_workspace_query(&mut state.query, &value);
+                if changed {
+                    refresh_workspace_search(&mut state, provider)?;
+                }
+            }
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let plain_modifiers = !key.modifiers.intersects(
+                    KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::HYPER,
+                );
+                match key {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Ok(WorkspaceSearchSelection::Cancelled),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if arm_or_confirm_exit(&mut exit_pending, ExitKey::CtrlC, Instant::now()) {
+                            return Ok(WorkspaceSearchSelection::Exit);
+                        }
+                        state.hint = exit_pending.expect("exit was armed").hint().to_owned();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('d'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if arm_or_confirm_exit(&mut exit_pending, ExitKey::CtrlD, Instant::now()) {
+                            return Ok(WorkspaceSearchSelection::Exit);
+                        }
+                        state.hint = exit_pending.expect("exit was armed").hint().to_owned();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.hint.clear();
+                        state.previous();
+                        state.refresh_preview(provider);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.hint.clear();
+                        state.next();
+                        state.refresh_preview(provider);
+                    }
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
+                        state.hint.clear();
+                        state.page_up();
+                        state.refresh_preview(provider);
+                    }
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
+                        state.hint.clear();
+                        state.page_down();
+                        state.refresh_preview(provider);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        if let Some(item) = state.focused_item().cloned() {
+                            return Ok(WorkspaceSearchSelection::Open(item));
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::BackTab,
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Tab,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } => {
+                        if let Some(item) = state.focused_item().cloned() {
+                            return Ok(WorkspaceSearchSelection::InsertPath(item));
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => {
+                        if let Some(item) = state.focused_item().cloned() {
+                            return Ok(WorkspaceSearchSelection::Mention(item));
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => {
+                        if state.query.pop().is_some() {
+                            refresh_workspace_search(&mut state, provider)?;
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char(character),
+                        ..
+                    } if plain_modifiers => {
+                        if append_workspace_query(&mut state.query, &character.to_string()) {
+                            refresh_workspace_search(&mut state, provider)?;
+                        } else {
+                            state.hint = format!(
+                                "Search query is limited to {MAX_WORKSPACE_SEARCH_QUERY_BYTES} bytes"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn refresh_workspace_search(
+    state: &mut WorkspaceSearchDialogState,
+    provider: &mut WorkspaceSearchProvider,
+) -> Result<()> {
+    state.focused = 0;
+    state.visible_from = 0;
+    state.error = None;
+    state.hint.clear();
+    match state.kind {
+        WorkspaceSearchKind::QuickOpen => {
+            state.searching = false;
+            state.replace_items(provider.quick_open(&state.query), false);
+            state.refresh_preview(provider);
+        }
+        WorkspaceSearchKind::GlobalSearch => {
+            provider.request_global(&state.query)?;
+            state.items.clear();
+            state.preview = None;
+            state.searching = !state.query.is_empty();
+            state.truncated = false;
+        }
+    }
+    Ok(())
+}
+
+fn append_workspace_query(query: &mut String, value: &str) -> bool {
+    let before = query.len();
+    for character in value.chars() {
+        let character = if character == '\t' { ' ' } else { character };
+        if character.is_control() {
+            continue;
+        }
+        if query.len().saturating_add(character.len_utf8()) > MAX_WORKSPACE_SEARCH_QUERY_BYTES {
+            break;
+        }
+        query.push(character);
+    }
+    query.len() != before
+}
+
+fn render_workspace_search_frame(
+    state: &WorkspaceSearchDialogState,
+    width: u16,
+    height: u16,
+) -> crate::terminal_dialogs::DialogFrame {
+    let wide = width >= 120;
+    let total_width = usize::from(width.max(1));
+    let left_width = if wide {
+        (total_width.saturating_mul(11) / 20).clamp(52, total_width.saturating_sub(34))
+    } else {
+        total_width
+    };
+    let placeholder = match state.kind {
+        WorkspaceSearchKind::QuickOpen => "Type to search files…",
+        WorkspaceSearchKind::GlobalSearch => "Type to search…",
+    };
+    let query_line = if state.query.is_empty() {
+        format!("Search › {placeholder}")
+    } else {
+        format!("Search › {}", state.query)
+    };
+    let status = if let Some(error) = &state.error {
+        error.clone()
+    } else if state.searching {
+        "Searching…".to_owned()
+    } else if state.items.is_empty() {
+        if state.query.is_empty() {
+            match state.kind {
+                WorkspaceSearchKind::QuickOpen => "No workspace files".to_owned(),
+                WorkspaceSearchKind::GlobalSearch => "Type to search workspace text".to_owned(),
+            }
+        } else {
+            "No matches".to_owned()
+        }
+    } else {
+        format!(
+            "{}{} match{}",
+            state.items.len(),
+            if state.truncated { "+" } else { "" },
+            if state.items.len() == 1 { "" } else { "es" }
+        )
+    };
+    let mut left = vec![
+        state.kind.title().to_owned(),
+        query_line,
+        status,
+        String::new(),
+    ];
+    if state.items.is_empty() {
+        left.push("  —".to_owned());
+    } else {
+        for (index, item) in state
+            .items
+            .iter()
+            .enumerate()
+            .skip(state.visible_from)
+            .take(state.visible_count)
+        {
+            let marker = if index == state.focused { '›' } else { ' ' };
+            let row = match state.kind {
+                WorkspaceSearchKind::QuickOpen => format!("{marker} {}", item.path),
+                WorkspaceSearchKind::GlobalSearch => {
+                    format!("{marker} {}  {}", workspace_item_label(item), item.text)
+                }
+            };
+            left.push(row);
+        }
+    }
+    left.push(String::new());
+    left.push(if state.hint.is_empty() {
+        "↑↓ navigate · Enter open · Tab mention · Shift-Tab insert path · Esc close".to_owned()
+    } else {
+        state.hint.clone()
+    });
+
+    let mut preview = vec!["Preview".to_owned()];
+    if let Some(file) = &state.preview {
+        preview[0] = format!("Preview · {}", file.title);
+        preview.extend(file.lines.iter().cloned());
+        if file.truncated {
+            preview.push("… preview limited to 256 KiB".to_owned());
+        }
+    } else {
+        preview.push("No file selected".to_owned());
+    }
+
+    let lines = if wide {
+        let right_width = total_width.saturating_sub(left_width + 3);
+        let rows = left.len().max(preview.len());
+        (0..rows)
+            .map(|row| {
+                let left_line = left.get(row).map_or("", String::as_str);
+                let right_line = preview.get(row).map_or("", String::as_str);
+                format!(
+                    "{} │ {}",
+                    pad_visible(left_line, left_width),
+                    visible_line(right_line, right_width)
+                )
+            })
+            .collect()
+    } else {
+        left.push("─".repeat(total_width.min(160)));
+        left.extend(preview);
+        left
+    };
+    let query_column = UnicodeWidthStr::width("Search › ")
+        + if state.query.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(state.query.as_str())
+        };
+    crate::terminal_dialogs::DialogFrame::new(
+        lines,
+        Some((u16::try_from(query_column).unwrap_or(u16::MAX), 1)),
+        width,
+        height,
+    )
+}
+
+fn workspace_item_label(item: &WorkspaceSearchItem) -> String {
+    item.line
+        .map(|line| format!("{}:{line}", item.path))
+        .unwrap_or_else(|| item.path.clone())
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let value = visible_line(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{value}{}", " ".repeat(padding))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PickerText<'a> {
     title: &'a str,
@@ -3926,6 +4450,7 @@ impl InputEditor {
             scheduled_prompt,
             model_picker,
             rewind_picker,
+            workspace_search,
             transcript_viewer,
             status_line_refresh,
             task_refresh,
@@ -4688,6 +5213,56 @@ impl InputEditor {
                                         "Clipboard does not contain a supported image".to_owned();
                                 }
                                 continue;
+                            }
+                            BindingDispatch::WorkspaceSearch(kind) => {
+                                if let Some(ui) =
+                                    self.ui.as_ref().filter(|ui| ui.fullscreen_active())
+                                {
+                                    ui.render_fullscreen_prompt(&[], 1)?;
+                                } else {
+                                    rendered.erase(&mut out)?;
+                                }
+                                drop(raw_guard.take());
+                                let outcome = workspace_search(kind);
+                                flush_terminal_input_buffer();
+                                raw_guard = Some(RawModeGuard::enter()?);
+                                rendered = RenderedInput::default();
+                                match outcome {
+                                    Ok(WorkspaceSearchOutcome::Inserted(value)) => {
+                                        let value = sanitize_paste(&value);
+                                        if value.is_empty() {
+                                            hint = "Workspace search returned an empty path"
+                                                .to_owned();
+                                            continue;
+                                        }
+                                        if buffer.len().saturating_add(value.len())
+                                            > MAX_INPUT_BYTES
+                                        {
+                                            hint =
+                                                "Workspace path exceeds the input limit".to_owned();
+                                            continue;
+                                        }
+                                        buffer.insert_str(cursor_byte, &value);
+                                        cursor_byte += value.len();
+                                        canonical_key(KeyCode::Null, KeyModifiers::NONE)
+                                    }
+                                    Ok(WorkspaceSearchOutcome::Opened(label)) => {
+                                        hint = format!("Opened {}", single_line(&label, 120));
+                                        continue;
+                                    }
+                                    Ok(WorkspaceSearchOutcome::Cancelled) => {
+                                        hint = "Workspace search cancelled".to_owned();
+                                        continue;
+                                    }
+                                    Ok(WorkspaceSearchOutcome::Exit) => return Ok(None),
+                                    Err(error) => {
+                                        hint = format!(
+                                            "Workspace search failed: {}",
+                                            single_line(&format!("{error:#}"), 160)
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                             BindingDispatch::Unsupported(action) => {
                                 hint = format!("Action {action} is unavailable in this view");
@@ -7958,6 +8533,56 @@ mod tests {
         let lines = bounded_error_lines(&oversized);
         assert_eq!(lines.len(), 25);
         assert_eq!(lines.last().unwrap(), "… error details truncated");
+    }
+
+    #[test]
+    fn workspace_search_frames_are_responsive_and_control_free() {
+        let item = WorkspaceSearchItem {
+            path: "src/workspace_search.rs".to_owned(),
+            line: Some(42),
+            text: "provider-neutral search result".to_owned(),
+        };
+        let mut state =
+            WorkspaceSearchDialogState::new(WorkspaceSearchKind::GlobalSearch, vec![item.clone()]);
+        state.query = "search".to_owned();
+        state.preview = Some(WorkspacePreview {
+            title: workspace_item_label(&item),
+            lines: vec![">    42  provider-neutral search result".to_owned()],
+            truncated: false,
+        });
+        state.fit_terminal(140, 30);
+        let wide = render_workspace_search_frame(&state, 140, 30);
+        assert!(wide.lines().iter().any(|line| line.contains(" │ Preview")));
+        assert!(
+            wide.lines()
+                .iter()
+                .all(|line| !line.chars().any(char::is_control))
+        );
+
+        state.fit_terminal(72, 22);
+        let narrow = render_workspace_search_frame(&state, 72, 22);
+        assert!(
+            narrow
+                .lines()
+                .iter()
+                .any(|line| line == "Preview · src/workspace_search.rs:42")
+        );
+        assert!(
+            narrow
+                .lines()
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 72)
+        );
+    }
+
+    #[test]
+    fn workspace_search_query_rejects_controls_and_stays_byte_bounded() {
+        let mut query = String::new();
+        assert!(append_workspace_query(&mut query, "alpha\n\tbeta"));
+        assert_eq!(query, "alpha beta");
+        assert!(append_workspace_query(&mut query, &"界".repeat(200)));
+        assert!(query.len() <= MAX_WORKSPACE_SEARCH_QUERY_BYTES);
+        assert!(query.is_char_boundary(query.len()));
     }
 
     #[test]

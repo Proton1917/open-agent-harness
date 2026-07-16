@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    fmt::Write as _,
     fs::File,
     io::{self, Read, Write},
     net::TcpListener,
@@ -86,6 +87,93 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     terminal.write_all(b"\x03").unwrap();
     assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     assert!(output.contains("accept edits"));
+}
+
+#[test]
+fn context_command_renders_partitioned_usage_and_memory_status() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"/context\r").unwrap();
+    let report = read_until(&mut terminal, "Workspace memory", Duration::from_secs(4));
+    assert!(report.contains("Context usage"), "{report}");
+    assert!(report.contains("Estimated usage by category"), "{report}");
+    assert!(report.contains("Base instructions"), "{report}");
+    assert!(report.contains("Tool definitions"), "{report}");
+    assert!(report.contains("Free before auto-compact"), "{report}");
+    assert!(child.try_wait().unwrap().is_none());
+
+    let ready = if report.contains("Shift+Tab mode") {
+        report
+    } else {
+        read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3))
+    };
+    assert!(ready.contains("Shift+Tab mode"));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+}
+
+#[test]
+fn workspace_quick_open_and_global_search_insert_source_style_paths() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+    // Ctrl-X Ctrl-P is the classic-PTY fallback for Ctrl/Cmd-Shift-P.
+    terminal.write_all(b"\x18\x10").unwrap();
+    let quick = read_until(&mut terminal, "Quick Open", Duration::from_secs(3));
+    assert!(quick.contains("Enter open"), "{quick}");
+    terminal.write_all(b"Cargo.toml").unwrap();
+    let quick_match = read_until(
+        &mut terminal,
+        "Preview · Cargo.toml",
+        Duration::from_secs(3),
+    );
+    assert!(quick_match.contains("Cargo.toml"), "{quick_match}");
+    terminal.write_all(b"\t").unwrap();
+    let mentioned = read_until(&mut terminal, "@Cargo.toml", Duration::from_secs(3));
+    assert!(mentioned.contains("@Cargo.toml"), "{mentioned}");
+
+    terminal.write_all(b"\x15").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Ctrl+Y to paste deleted text",
+        Duration::from_secs(3),
+    );
+    // Ctrl-X Ctrl-F is the classic-PTY fallback for Ctrl/Cmd-Shift-F.
+    terminal.write_all(b"\x18\x06").unwrap();
+    let global = read_until(&mut terminal, "Global Search", Duration::from_secs(3));
+    assert!(global.contains("Type to search workspace text"), "{global}");
+    terminal
+        .write_all(b"provider-neutral Rust coding-agent harness")
+        .unwrap();
+    let global_match = read_until(&mut terminal, "Cargo.toml:6", Duration::from_secs(5));
+    assert!(global_match.contains("provider-neutral"), "{global_match}");
+    terminal.write_all(b"\x1b[Z").unwrap();
+    let inserted = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    assert!(inserted.contains("Cargo.toml:6"), "{inserted}");
+    assert!(child.try_wait().unwrap().is_none());
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(900));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -1311,8 +1399,10 @@ fn tool_use_stream() -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("data: {value}\n\n"))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn single_tool_stream(id: &str, command: &str) -> String {
@@ -1327,8 +1417,10 @@ fn single_tool_stream(id: &str, command: &str) -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("data: {value}\n\n"))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn text_stream(text: &str) -> String {
@@ -1343,8 +1435,10 @@ fn text_stream(text: &str) -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("data: {value}\n\n"))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> String {

@@ -120,7 +120,8 @@ for term in "${removed_terms[@]}"; do
     git -C "$root" grep -n -i "$term" -- . \
       ':(exclude)README.md' \
       ':(exclude)CONTRIBUTING.md' \
-      ':(exclude)docs/MIGRATION_COVERAGE.tsv' || true
+      ':(exclude)docs/MIGRATION_COVERAGE.tsv' \
+      ':(exclude)docs/MIGRATION_FAMILY_INVENTORY.tsv' || true
   )"
   if [[ -n "$tracked_brand_hits" ]]; then
     printf 'brand_text_outside_documented_exceptions=%s\n' "$tracked_brand_hits" >&2
@@ -133,7 +134,7 @@ for term in "${removed_terms[@]}"; do
 done
 
 echo 'brand_free=true'
-echo 'brand_exceptions_limited_to_readme_contributing_and_source_inventory=true'
+echo 'brand_exceptions_limited_to_readme_contributing_and_source_inventories=true'
 echo 'binary_brand_free=true'
 
 if [[ -n "$(git -C "$root" ls-files reference)" ]]; then

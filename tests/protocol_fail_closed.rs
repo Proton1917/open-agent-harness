@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::mpsc,
@@ -359,24 +360,24 @@ fn write_arguments() -> String {
 }
 
 fn chat_sse<const N: usize>(events: [Value; N]) -> String {
-    let mut body = events
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
+    let mut body = events.into_iter().fold(String::new(), |mut body, event| {
+        write!(body, "data: {event}\n\n").expect("writing to a String cannot fail");
+        body
+    });
     body.push_str("data: [DONE]\n\n");
     body
 }
 
 fn responses_sse<const N: usize>(events: [Value; N]) -> String {
-    let mut body = events
-        .into_iter()
-        .map(|event| {
-            format!(
-                "event: {}\ndata: {event}\n\n",
-                event["type"].as_str().unwrap()
-            )
-        })
-        .collect::<String>();
+    let mut body = events.into_iter().fold(String::new(), |mut body, event| {
+        write!(
+            body,
+            "event: {}\ndata: {event}\n\n",
+            event["type"].as_str().unwrap()
+        )
+        .expect("writing to a String cannot fail");
+        body
+    });
     body.push_str("data: [DONE]\n\n");
     body
 }

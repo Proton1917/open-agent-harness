@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{Read, Write},
     net::TcpListener,
     process::{Command, Stdio},
@@ -15,6 +16,131 @@ use std::{
 use serde_json::Value;
 
 const SESSION_END_MARKER: &str = ".session-end-cleanup-marker";
+
+#[test]
+fn shell_completion_supports_stdout_and_create_only_output() {
+    let stdout = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args(["completion", "bash"])
+        .output()
+        .unwrap();
+    assert!(
+        stdout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stdout.stderr)
+    );
+    assert!(
+        String::from_utf8(stdout.stdout)
+            .unwrap()
+            .contains("open-agent-harness")
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("completion.zsh");
+    let first = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args(["completion", "zsh", "--output"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let original = std::fs::read(&path).unwrap();
+    assert!(!original.is_empty());
+    let second = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args(["completion", "zsh", "--output"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn invalid_network_trust_fails_before_connecting() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args(["--print", "--bare", "--no-session-persistence", "hello"])
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", "http://127.0.0.1:9")
+        .env("HARNESS_CA_CERT_FILE", "relative-ca.pem")
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be an absolute path"));
+}
+
+#[test]
+fn valid_network_trust_material_reaches_the_model_client() {
+    let workspace = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let ca = workspace.path().join("ca.pem");
+    let client = workspace.path().join("client.pem");
+    let key = workspace.path().join("client.key");
+    std::fs::write(&ca, cert.pem()).unwrap();
+    std::fs::write(&client, cert.pem()).unwrap();
+    std::fs::write(&key, key_pair.serialize_pem()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let body = serde_json::json!({
+            "id":"network-trust",
+            "type":"message",
+            "role":"assistant",
+            "model":"test-model",
+            "content":[{"type":"text","text":"trusted"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":1,"output_tokens":1}
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_open-agent-harness"))
+        .args([
+            "--print",
+            "--bare",
+            "--no-session-persistence",
+            "--output-format",
+            "json",
+            "hello",
+        ])
+        .current_dir(workspace.path())
+        .env("HARNESS_BASE_URL", format!("http://{address}"))
+        .env("HARNESS_API_PATH", "/v1/messages")
+        .env("HARNESS_STREAM", "false")
+        .env("HARNESS_CA_CERT_FILE", &ca)
+        .env("HARNESS_CLIENT_CERT_FILE", &client)
+        .env("HARNESS_CLIENT_KEY_FILE", &key)
+        .env_remove("HARNESS_API_KEY")
+        .env_remove("HARNESS_AUTH_TOKEN")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["result"], "trusted");
+}
 
 #[cfg(unix)]
 #[test]
@@ -53,6 +179,10 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
         serde_json::json!({
             "type":"control_request", "request_id":"settings-status",
             "request":{"subtype":"get_settings"}
+        }),
+        serde_json::json!({
+            "type":"control_request", "request_id":"context-status",
+            "request":{"subtype":"get_context_usage"}
         }),
     ] {
         writeln!(input, "{request}").unwrap();
@@ -93,6 +223,13 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
             })
     );
     assert_eq!(init["commandDescriptors"], init["command_descriptors"]);
+    assert!(
+        init["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "side_question_v1")
+    );
     let response = |id: &str| {
         lines
             .iter()
@@ -108,6 +245,22 @@ fn stream_json_exposes_dynamic_commands_and_runtime_status_controls() {
         response("settings-status")["response"]["response"]["effective"]["memoryEnabled"],
         false
     );
+    let context = &response("context-status")["response"]["response"];
+    let categories = context["categories"].as_array().unwrap();
+    assert!(categories.len() >= 2);
+    assert!(
+        categories
+            .iter()
+            .any(|category| category["name"] == "Tool definitions")
+    );
+    assert_eq!(
+        categories
+            .iter()
+            .map(|category| category["tokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        context["totalTokens"].as_u64().unwrap()
+    );
+    assert!(context["percentage"].is_number());
 }
 
 #[cfg(unix)]
@@ -1127,8 +1280,10 @@ fn sse_response(text: &str) -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("data: {value}\n\n"))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn chat_reasoning_sse_response(text: &str) -> String {
@@ -1148,8 +1303,10 @@ fn chat_reasoning_sse_response(text: &str) -> String {
         }),
     ]
     .into_iter()
-    .map(|value| format!("data: {value}\n\n"))
-    .collect::<String>();
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    });
     format!("{events}data: [DONE]\n\n")
 }
 

@@ -36,7 +36,7 @@ pub fn estimate_content(content: &Value) -> usize {
     }
 }
 
-fn estimate_block(block: &Value) -> usize {
+pub(crate) fn estimate_block(block: &Value) -> usize {
     let Some(object) = block.as_object() else {
         return rough_token_count(&block.to_string(), 4);
     };

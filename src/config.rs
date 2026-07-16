@@ -525,6 +525,7 @@ fn append_installed_plugin_directories(
 }
 
 pub fn endpoint_config() -> Result<EndpointConfig> {
+    crate::network_trust::initialize_process_network_trust_from_env()?;
     let token = env::var("HARNESS_API_KEY")
         .or_else(|_| env::var("HARNESS_AUTH_TOKEN"))
         .ok()

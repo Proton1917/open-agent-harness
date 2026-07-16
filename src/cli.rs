@@ -22,11 +22,26 @@ pub enum InputFormat {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HarnessCommand {
+    /// Generate a shell completion script without modifying shell configuration.
+    Completion {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// Write to a new file instead of stdout. Existing paths are never overwritten.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
     /// Manage provider-neutral trusted plugins in the private user cache.
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -246,6 +261,25 @@ mod tests {
             cli.command,
             Some(HarnessCommand::Plugin {
                 command: PluginCommand::Install { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_shell_completion_without_entering_the_harness_runtime() {
+        let cli = Cli::try_parse_from([
+            "open-agent-harness",
+            "completion",
+            "zsh",
+            "--output",
+            "completion.zsh",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(HarnessCommand::Completion {
+                shell: CompletionShell::Zsh,
+                output: Some(_),
             })
         ));
     }

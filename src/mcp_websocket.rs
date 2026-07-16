@@ -31,6 +31,7 @@ use url::Url;
 
 use crate::{
     mcp::{McpRpc, TokenCredentialProvider, authorized_headers},
+    network_trust::process_network_trust,
     rpc::RpcServerRequestHandler,
     web_tools::resolve_target,
 };
@@ -644,9 +645,14 @@ async fn connect_socket(config: &WebSocketMcpConfig) -> Result<ConnectedSocket> 
         .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_WS_FRAME_BYTES))
         .max_write_buffer_size(MAX_WS_MESSAGE_BYTES * 2);
+    let connector = if config.url.scheme() == "wss" {
+        process_network_trust().websocket_connector()?
+    } else {
+        None
+    };
     let (socket, response) = timeout(
         WS_CONNECT_TIMEOUT,
-        client_async_tls_with_config(request, stream, Some(websocket_config), None),
+        client_async_tls_with_config(request, stream, Some(websocket_config), connector),
     )
     .await
     .map_err(|_| anyhow::anyhow!("{} WebSocket handshake timeout", config.label))?

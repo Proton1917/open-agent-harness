@@ -771,12 +771,14 @@ pub(crate) async fn resolve_target(url: &Url, allow_private: bool) -> Result<Soc
 
 fn client_for_target(url: &Url, address: SocketAddr) -> Result<Client> {
     let host = url.host_str().context("URL 缺少 host")?;
-    Client::builder()
+    let builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .resolve(host, address)
+        .resolve(host, address);
+    crate::network_trust::process_network_trust()
+        .apply_reqwest(builder)?
         .build()
         .context("无法创建 Web HTTP client")
 }

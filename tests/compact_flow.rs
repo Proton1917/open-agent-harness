@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{Read, Write},
     net::TcpListener,
     thread,
@@ -460,8 +461,16 @@ fn summary_stream() -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("event: {}\ndata: {}\n\n", value["type"].as_str().unwrap(), value))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(
+            body,
+            "event: {}\ndata: {}\n\n",
+            value["type"].as_str().unwrap(),
+            value
+        )
+        .expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn final_stream() -> String {
@@ -477,8 +486,16 @@ fn final_stream() -> String {
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
-    .map(|value| format!("event: {}\ndata: {}\n\n", value["type"].as_str().unwrap(), value))
-    .collect()
+    .fold(String::new(), |mut body, value| {
+        write!(
+            body,
+            "event: {}\ndata: {}\n\n",
+            value["type"].as_str().unwrap(),
+            value
+        )
+        .expect("writing to a String cannot fail");
+        body
+    })
 }
 
 fn read_http_body(stream: &mut std::net::TcpStream) -> Vec<u8> {

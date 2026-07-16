@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     io::{Read, Write},
     net::TcpListener,
     thread,
@@ -170,8 +171,10 @@ async fn interrupted_tool_input_json_is_rejected() {
             json!({"type":"message_stop"}),
         ]
         .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
+        .fold(String::new(), |mut body, event| {
+            write!(body, "data: {event}\n\n").expect("writing to a String cannot fail");
+            body
+        });
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

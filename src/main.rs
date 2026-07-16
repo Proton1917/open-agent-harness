@@ -33,6 +33,7 @@ use open_agent_harness::{
     },
     commands::{self, CommandOutcome, CustomCommandCatalog},
     config::{DEFAULT_MODEL, EndpointConfig, ModelOption, Settings, endpoint_config},
+    context_inspection::render_context_report,
     control::{ControlHandle, ControlSession, InboundMessage},
     file_history::{CheckpointInfo, CheckpointStatus, FileHistory, RewindReport},
     hooks::{HookExecutionEvent, HookObserver, HookRunner},
@@ -53,16 +54,18 @@ use open_agent_harness::{
         SideQuestionAnswer, SideQuestionContext, TextDeltaSink, TurnResult,
     },
     session::{SessionStateRoot, SessionStore, SessionSummary},
+    shell_completion::run_completion,
     sleep_inhibitor::SleepInhibitor,
     statusline::{StatusLineOutcome, StatusLineRunner},
     structured_output::StructuredOutputTool,
     terminal::{
         ActiveTurnAction, ActiveTurnInput, AsyncInputNotice, ConversationUi, FileSuggestion,
         InputEditor, InputReadActions, InputReadContext, ModelPickerOutcome,
-        SlashCommandSuggestion, TaskUiUpdate, TuiMode, configure_ui_dialog,
-        manage_permissions_dialog, open_file_in_external_editor, select_model,
+        SlashCommandSuggestion, TaskUiUpdate, TuiMode, WorkspaceSearchOutcome,
+        WorkspaceSearchSelection, configure_ui_dialog, manage_permissions_dialog,
+        open_file_in_external_editor, open_file_in_external_editor_at, select_model,
         select_option_dialog, select_rewind_checkpoint, select_searchable_option, select_theme,
-        show_tasks_dialog, view_transcript,
+        select_workspace_search, show_tasks_dialog, view_transcript,
     },
     terminal_dialogs::{
         PermissionDialogData, PermissionDialogItem, PermissionManagerAction,
@@ -84,6 +87,7 @@ use open_agent_harness::{
         UiSettingsStore,
     },
     web_tools::configure_web,
+    workspace_search::{WorkspaceSearchItem, WorkspaceSearchProvider},
     worktree::{RepositoryWorktree, configure_worktree, same_repository_worktrees},
 };
 
@@ -502,12 +506,19 @@ fn bootstrap() -> Result<()> {
                 "" | "0" | "false" | "no" | "off"
             )
         });
-    if let Some(HarnessCommand::Plugin { command }) = cli.command.take() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("无法创建 plugin manager async runtime")?;
-        return runtime.block_on(run_plugin_command(command));
+    if let Some(command) = cli.command.take() {
+        match command {
+            HarnessCommand::Completion { shell, output } => {
+                return run_completion(shell, output.as_deref());
+            }
+            HarnessCommand::Plugin { command } => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .context("无法创建 plugin manager async runtime")?;
+                return runtime.block_on(run_plugin_command(command));
+            }
+        }
     }
     let cwd = std::env::current_dir().context("无法确定当前目录")?;
     let mut settings = Settings::load(&cwd, cli.settings.as_deref(), cli.bare)?;
@@ -528,6 +539,9 @@ fn bootstrap() -> Result<()> {
     unsafe {
         std::env::remove_var("HARNESS_API_KEY");
         std::env::remove_var("HARNESS_AUTH_TOKEN");
+        std::env::remove_var("HARNESS_CA_CERT_FILE");
+        std::env::remove_var("HARNESS_CLIENT_CERT_FILE");
+        std::env::remove_var("HARNESS_CLIENT_KEY_FILE");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1291,6 +1305,42 @@ async fn run(
                             &rewind_message_snapshot,
                         );
                         let mut rewind_picker = || select_rewind_checkpoint(&rewind_options);
+                        let quick_open_files = file_suggestions
+                            .iter()
+                            .filter(|file| !file.is_dir)
+                            .map(|file| file.display_path.clone())
+                            .collect::<Vec<_>>();
+                        let mut workspace_search_provider = WorkspaceSearchProvider::new(
+                            command_context.clone(),
+                            quick_open_files,
+                        );
+                        let mut workspace_search = |kind| {
+                            let selection =
+                                select_workspace_search(kind, &mut workspace_search_provider)?;
+                            match selection {
+                                WorkspaceSearchSelection::Open(item) => {
+                                    let path = workspace_search_provider.resolve_item(&item)?;
+                                    open_file_in_external_editor_at(&path, item.line)?;
+                                    Ok(WorkspaceSearchOutcome::Opened(workspace_item_label(
+                                        &item,
+                                    )))
+                                }
+                                WorkspaceSearchSelection::Mention(item) => {
+                                    Ok(WorkspaceSearchOutcome::Inserted(
+                                        workspace_item_insertion(&item, true),
+                                    ))
+                                }
+                                WorkspaceSearchSelection::InsertPath(item) => {
+                                    Ok(WorkspaceSearchOutcome::Inserted(
+                                        workspace_item_insertion(&item, false),
+                                    ))
+                                }
+                                WorkspaceSearchSelection::Cancelled => {
+                                    Ok(WorkspaceSearchOutcome::Cancelled)
+                                }
+                                WorkspaceSearchSelection::Exit => Ok(WorkspaceSearchOutcome::Exit),
+                            }
+                        };
                         let mut transcript_viewer = || view_transcript(&transcript_snapshot);
                         let status_refresh_config = ui_settings.status_line.clone();
                         let status_refresh_runner = status_line_runner.clone();
@@ -1415,6 +1465,7 @@ async fn run(
                                     scheduled_prompt: &mut scheduled_prompt,
                                     model_picker: &mut model_picker,
                                     rewind_picker: &mut rewind_picker,
+                                    workspace_search: &mut workspace_search,
                                     transcript_viewer: &mut transcript_viewer,
                                     status_line_refresh: &mut status_line_refresh,
                                     task_refresh: &mut task_refresh,
@@ -1707,6 +1758,17 @@ async fn run(
                         &hooks,
                         &memory,
                     );
+                    continue;
+                }
+                CommandOutcome::ShowContext => {
+                    let memory_entries = memory.index()?.len();
+                    let report = engine
+                        .context_report()
+                        .with_memory(memory.enabled(), memory_entries);
+                    let terminal_width = crossterm::terminal::size()
+                        .map(|(columns, _)| usize::from(columns))
+                        .unwrap_or(80);
+                    println!("{}", render_context_report(&report, terminal_width));
                     continue;
                 }
                 CommandOutcome::ShowStats => {
@@ -4053,10 +4115,7 @@ async fn handle_control_slash_command(
                 "tokensAfter":stats.after_tokens,
             }))
         }
-        "/context" => {
-            let (used, threshold, window) = engine.context_status();
-            handled(json!({"estimatedTokens":used,"autoCompactAt":threshold,"window":window}))
-        }
+        "/context" => handled(context_report_json(engine, metadata.memory)?),
         "/cost" => handled(json!({
             "inputTokens":engine.usage.input_tokens,
             "outputTokens":engine.usage.output_tokens,
@@ -4528,6 +4587,35 @@ struct ResumeSessionCandidate {
     workspace: RepositoryWorktree,
 }
 
+fn context_report_json(engine: &QueryEngine, memory: &AutoMemory) -> Result<Value> {
+    let report = engine
+        .context_report()
+        .with_memory(memory.enabled(), memory.index()?.len());
+    let percentage = report.percentage_tenths as f64 / 10.0;
+    let mut value = serde_json::to_value(&report).context("cannot encode context usage report")?;
+    let object = value
+        .as_object_mut()
+        .context("encoded context usage report is not an object")?;
+    object.insert("percentage".to_owned(), json!(percentage));
+    object.insert("estimatedTokens".to_owned(), json!(report.total_tokens));
+    object.insert(
+        "autoCompactAt".to_owned(),
+        json!(report.auto_compact_threshold),
+    );
+    object.insert("window".to_owned(), json!(report.max_tokens));
+    object.insert("gridRows".to_owned(), json!([]));
+    object.insert("memoryFiles".to_owned(), json!([]));
+    object.insert("mcpTools".to_owned(), json!([]));
+    if let Some(categories) = object.get_mut("categories").and_then(Value::as_array_mut) {
+        for category in categories {
+            if let Some(category) = category.as_object_mut() {
+                category.insert("color".to_owned(), json!("default"));
+            }
+        }
+    }
+    Ok(value)
+}
+
 async fn handle_control_request(
     handle: &ControlHandle,
     request_id: &str,
@@ -4573,6 +4661,7 @@ async fn handle_control_request(
                 "queue_priority_v1",
                 "replay_user_messages_v1",
                 "rewind_conversation_v1",
+                "side_question_v1",
                 "stop_task_v1"
             ],
         })),
@@ -4602,16 +4691,7 @@ async fn handle_control_request(
                 Ok(json!({"model":engine.model}))
             }
         }
-        "get_context_usage" => {
-            let (tokens, threshold, window) = engine.context_status();
-            Ok(json!({
-                "categories":[{"name":"conversation_and_tools", "tokens":tokens, "color":"default"}],
-                "totalTokens":tokens, "maxTokens":window, "rawMaxTokens":window,
-                "autoCompactThreshold":threshold,
-                "percentage":if window == 0 { 0.0 } else { (tokens as f64 / window as f64) * 100.0 },
-                "gridRows":[], "model":engine.model, "memoryFiles":[]
-            }))
-        }
+        "get_context_usage" => context_report_json(engine, metadata.memory),
         "mcp_status" => Ok(json!({
             "mcpServers": metadata
                 .mcp_control
@@ -5744,6 +5824,32 @@ struct ExplicitFileMention {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+fn workspace_item_label(item: &WorkspaceSearchItem) -> String {
+    item.line
+        .map(|line| format!("{}:{line}", item.path))
+        .unwrap_or_else(|| item.path.clone())
+}
+
+fn workspace_item_insertion(item: &WorkspaceSearchItem, mention: bool) -> String {
+    if !mention {
+        return format!("{} ", workspace_item_label(item));
+    }
+    let suffix = item
+        .line
+        .map(|line| format!("#L{line}"))
+        .unwrap_or_default();
+    let quote = item
+        .path
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '"' | '\\'));
+    if quote {
+        let escaped = item.path.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("@\"{escaped}\"{suffix} ")
+    } else {
+        format!("@{}{suffix} ", item.path)
+    }
 }
 
 fn workspace_file_suggestions(context: &ToolContext) -> Vec<FileSuggestion> {
@@ -8038,6 +8144,24 @@ mod tests {
 
         let escaped = "@\"a\\\"b.md\"";
         assert_eq!(parse_quoted_file_mention(escaped, 2).unwrap().0, "a\"b.md");
+    }
+
+    #[test]
+    fn workspace_search_insertions_match_file_mention_and_path_syntax() {
+        let item = WorkspaceSearchItem {
+            path: "docs/file name.md".to_owned(),
+            line: Some(27),
+            text: String::new(),
+        };
+        assert_eq!(
+            workspace_item_insertion(&item, true),
+            "@\"docs/file name.md\"#L27 "
+        );
+        assert_eq!(
+            workspace_item_insertion(&item, false),
+            "docs/file name.md:27 "
+        );
+        assert_eq!(workspace_item_label(&item), "docs/file name.md:27");
     }
 
     #[test]

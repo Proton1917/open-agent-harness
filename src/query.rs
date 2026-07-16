@@ -7,6 +7,7 @@ use crate::{
     agents::{AgentRegistryFilter, AgentRuntime, AgentToolPolicy, CustomAgentCatalog},
     api::{ApiRetryEvent, ModelClient, is_size_rejection},
     compact::{CompactConfig, CompactStats, compact_prompt, continuation_message},
+    context_inspection::ContextUsageReport,
     file_history::{CheckpointBoundary, DiffStats, RewindReport},
     hooks::{HookRunner, blocking_feedback},
     image_processing::normalize_user_content_images,
@@ -1377,6 +1378,21 @@ impl QueryEngine {
     pub fn context_status(&self) -> (usize, usize, usize) {
         (
             self.estimated_tokens(),
+            self.compact_config.auto_threshold(),
+            self.compact_config.effective_window(),
+        )
+    }
+
+    pub fn context_report(&self) -> ContextUsageReport {
+        let effective_system = self.effective_system_prompt();
+        let definitions = self.registry.definitions();
+        let messages = normalize_for_api(&self.messages);
+        ContextUsageReport::analyze(
+            &self.model,
+            &self.system,
+            &effective_system,
+            &definitions,
+            &messages,
             self.compact_config.auto_threshold(),
             self.compact_config.effective_window(),
         )

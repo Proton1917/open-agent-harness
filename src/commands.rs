@@ -257,6 +257,7 @@ pub enum CommandOutcome {
     SelectModel,
     ShowHelp,
     ShowStatus,
+    ShowContext,
     ToggleVim,
     ConfigureKeybindings,
     ShowDoctor,
@@ -355,14 +356,7 @@ pub fn handle(input: &str, engine: &mut QueryEngine) -> CommandOutcome {
             );
             CommandOutcome::Handled
         }
-        "/context" => {
-            let (used, auto_threshold, effective_window) = engine.context_status();
-            println!(
-                "estimated={} auto_compact={} effective_window={}",
-                used, auto_threshold, effective_window
-            );
-            CommandOutcome::Handled
-        }
+        "/context" => CommandOutcome::ShowContext,
         "/init" => CommandOutcome::Submit(init_prompt().to_owned()),
         "/loop" => {
             eprintln!("Usage: /loop [interval] <prompt>");
