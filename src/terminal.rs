@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, IsTerminal, Read, Write},
+    panic,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Once, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -69,6 +70,7 @@ const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FULLSCREEN_STREAM_BYTES: usize = 64 * 1024;
 const MAX_PERMISSION_PREVIEW_BYTES: usize = 64 * 1024;
 const FULLSCREEN_CLICK_WINDOW: Duration = Duration::from_millis(500);
+const EMPTY_TRANSCRIPT_MESSAGE: &str = "Transcript is empty.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitKey {
@@ -156,6 +158,7 @@ struct OutputState {
     trusted_roots: Vec<PathBuf>,
     prompt_color: Option<String>,
     active_tools: HashMap<String, ActiveToolDisplay>,
+    last_fullscreen_frame: Option<Vec<u8>>,
 }
 
 struct ToolDisplay {
@@ -189,6 +192,98 @@ impl Default for OutputState {
             trusted_roots: Vec::new(),
             prompt_color: None,
             active_tools: HashMap::new(),
+            last_fullscreen_frame: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActiveFullscreenHandle {
+    state: Weak<Mutex<OutputState>>,
+    progress_epoch: Weak<AtomicU64>,
+}
+
+fn active_fullscreen_slot() -> &'static Mutex<Option<ActiveFullscreenHandle>> {
+    static ACTIVE: OnceLock<Mutex<Option<ActiveFullscreenHandle>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(None))
+}
+
+fn terminal_modal_slot() -> &'static Mutex<()> {
+    static MODAL: OnceLock<Mutex<()>> = OnceLock::new();
+    MODAL.get_or_init(|| Mutex::new(()))
+}
+
+struct TerminalModalGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl TerminalModalGuard {
+    fn acquire() -> Self {
+        Self {
+            _guard: terminal_modal_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+}
+
+struct ActiveFullscreenSuspendGuard {
+    state: Weak<Mutex<OutputState>>,
+    restore: bool,
+}
+
+impl ActiveFullscreenSuspendGuard {
+    fn acquire() -> Result<Self> {
+        let handle = active_fullscreen_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(handle) = handle else {
+            return Ok(Self {
+                state: Weak::new(),
+                restore: false,
+            });
+        };
+        if let Some(epoch) = handle.progress_epoch.upgrade() {
+            epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        let Some(state) = handle.state.upgrade() else {
+            return Ok(Self {
+                state: Weak::new(),
+                restore: false,
+            });
+        };
+        let restore = {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.last_fullscreen_frame = None;
+            state.fullscreen_guard.take().is_some()
+        };
+        Ok(Self {
+            state: Arc::downgrade(&state),
+            restore,
+        })
+    }
+}
+
+impl Drop for ActiveFullscreenSuspendGuard {
+    fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fullscreen_guard.is_none() {
+            if let Ok(guard) = AlternateScreenGuard::enter() {
+                state.fullscreen_guard = Some(guard);
+                state.last_fullscreen_frame = None;
+                let _ = render_fullscreen_locked(&mut state, None);
+            }
         }
     }
 }
@@ -220,11 +315,18 @@ impl TuiMode {
 
 impl ConversationUi {
     pub fn detect() -> Self {
-        Self {
+        let ui = Self {
             inner: Arc::new(Mutex::new(OutputState::default())),
             progress_epoch: Arc::new(AtomicU64::new(0)),
             color: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-        }
+        };
+        *active_fullscreen_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveFullscreenHandle {
+            state: Arc::downgrade(&ui.inner),
+            progress_epoch: Arc::downgrade(&ui.progress_epoch),
+        });
+        ui
     }
 
     pub fn interactive(&self) -> bool {
@@ -285,11 +387,13 @@ impl ConversationUi {
             TuiMode::Default => {
                 state.fullscreen_composer_reserve = 1;
                 state.fullscreen.set_composer_reserve(1);
+                state.last_fullscreen_frame = None;
                 drop(state.fullscreen_guard.take());
             }
             TuiMode::Fullscreen => {
                 if state.fullscreen_guard.is_none() {
                     state.fullscreen_guard = Some(AlternateScreenGuard::enter()?);
+                    state.last_fullscreen_frame = None;
                 }
                 render_fullscreen_locked(&mut state, None)?;
             }
@@ -315,8 +419,11 @@ impl ConversationUi {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.fullscreen.clear();
-        for line in lines {
-            state.fullscreen.push_message(line);
+        let empty = lines.len() == 1 && lines[0] == EMPTY_TRANSCRIPT_MESSAGE;
+        if !empty {
+            for line in lines {
+                state.fullscreen.push_message(line);
+            }
         }
         if state.fullscreen_guard.is_some() {
             render_fullscreen_locked(&mut state, None)?;
@@ -538,7 +645,15 @@ impl ConversationUi {
             return Ok(());
         }
         state.fullscreen.resize(rows, columns);
+        state.last_fullscreen_frame = None;
         Ok(())
+    }
+
+    fn invalidate_fullscreen_frame(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_fullscreen_frame = None;
     }
 
     pub fn banner(
@@ -548,6 +663,12 @@ impl ConversationUi {
         session: uuid::Uuid,
         mode: PermissionMode,
     ) -> Result<()> {
+        if self.fullscreen_active() {
+            // The caller seeds the richer session header before acquiring the
+            // alternate screen. Do not overwrite it with the inline banner's
+            // reduced metadata after the first fullscreen frame is visible.
+            return Ok(());
+        }
         let width = terminal::size()
             .map(|(width, _)| usize::from(width).clamp(42, 92))
             .unwrap_or(72);
@@ -886,11 +1007,12 @@ impl ConversationUi {
         if text.is_empty() {
             return Ok(());
         }
-        self.text_delta(text);
+        self.progress_epoch.fetch_add(1, Ordering::AcqRel);
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let frame = append_bounded_fullscreen_stream(&mut state, text);
         finish_fullscreen_stream(&mut state);
         if state.fullscreen_guard.is_some() {
             render_fullscreen_locked(&mut state, None)?;
@@ -898,6 +1020,17 @@ impl ConversationUi {
             return Ok(());
         }
         let mut out = io::stdout().lock();
+        clear_status(&mut out, &mut state);
+        let stable_start = state.markdown_committed_lines.min(frame.stable.lines.len());
+        if stable_start < frame.stable.lines.len() {
+            write_assistant_markdown_lines(
+                &mut out,
+                self.color,
+                &mut state.assistant_open,
+                &frame.stable.lines[stable_start..],
+            )?;
+            state.markdown_committed_lines = frame.stable.lines.len();
+        }
         let rendered = state.markdown_stream.finish();
         let start = state.markdown_committed_lines.min(rendered.lines.len());
         if start < rendered.lines.len() {
@@ -944,9 +1077,13 @@ fn render_fullscreen_locked(state: &mut OutputState, composer: Option<&[u8]>) ->
     if synchronized {
         frame.extend_from_slice(SYNC_OUTPUT_END);
     }
+    if state.last_fullscreen_frame.as_deref() == Some(frame.as_slice()) {
+        return Ok(());
+    }
     let mut out = io::stdout().lock();
     out.write_all(&frame)?;
     out.flush()?;
+    state.last_fullscreen_frame = Some(frame);
     Ok(())
 }
 
@@ -1687,7 +1824,9 @@ pub fn view_transcript(lines: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    let _modal = TerminalModalGuard::acquire();
     let _raw = RawModeGuard::enter()?;
+    let _fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
     let _alternate = AlternateScreenGuard::enter()?;
     let mut out = io::stdout();
     const MAX_TRANSCRIPT_VIEW_BYTES: usize = 8 * 1024 * 1024;
@@ -2645,7 +2784,9 @@ impl Drop for DialogScreenGuard {
 }
 
 fn run_terminal_dialog<D: TerminalDialog>(mut dialog: D) -> Result<D::Action> {
+    let _modal = TerminalModalGuard::acquire();
     let _raw = RawModeGuard::enter()?;
+    let _fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
     let mut screen = DialogScreenGuard::enter()?;
     let started = Instant::now();
     let mut exit_hint = None;
@@ -2733,7 +2874,9 @@ fn select_option_internal(
     if options.is_empty() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Ok((ModelPickerOutcome::Cancelled, syntax_highlighting));
     }
+    let _modal = TerminalModalGuard::acquire();
     let _raw = RawModeGuard::enter()?;
+    let _fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
     let mut out = io::stdout();
     let mut visible_options = options.to_vec();
     let mut state = ModelPickerState::new(&visible_options, current);
@@ -2925,7 +3068,9 @@ pub fn request_permission(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Ok(PermissionChoice::Deny);
     }
+    let _modal = TerminalModalGuard::acquire();
     let _raw = RawModeGuard::enter()?;
+    let _fullscreen = ActiveFullscreenSuspendGuard::acquire()?;
     let mut out = io::stdout();
     let tool = sanitize_inline(tool);
     let summary = single_line(summary, 4 * 1024);
@@ -3340,6 +3485,7 @@ impl InputEditor {
                 }
                 drop(raw_guard.take());
                 signal_hook::low_level::raise(signal_hook::consts::signal::SIGSTOP)?;
+                flush_terminal_input_buffer();
                 raw_guard = Some(RawModeGuard::enter()?);
                 if was_fullscreen {
                     self.ui
@@ -3939,7 +4085,13 @@ impl InputEditor {
                                 continue;
                             }
                             BindingDispatch::Redraw => {
-                                rendered.reset_viewport(&mut out)?;
+                                if let Some(ui) =
+                                    self.ui.as_ref().filter(|ui| ui.fullscreen_active())
+                                {
+                                    ui.invalidate_fullscreen_frame();
+                                } else {
+                                    rendered.reset_viewport(&mut out)?;
+                                }
                                 hint = "Redrawn".to_owned();
                                 continue;
                             }
@@ -3953,8 +4105,14 @@ impl InputEditor {
                                 continue;
                             }
                             BindingDispatch::ClearScreen => {
-                                execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-                                rendered = RenderedInput::default();
+                                if let Some(ui) =
+                                    self.ui.as_ref().filter(|ui| ui.fullscreen_active())
+                                {
+                                    ui.invalidate_fullscreen_frame();
+                                } else {
+                                    execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+                                    rendered = RenderedInput::default();
+                                }
                                 continue;
                             }
                             BindingDispatch::PasteImage => {
@@ -5052,8 +5210,12 @@ impl InputEditor {
                             modifiers: KeyModifiers::CONTROL,
                             ..
                         } => {
-                            execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-                            rendered = RenderedInput::default();
+                            if let Some(ui) = self.ui.as_ref().filter(|ui| ui.fullscreen_active()) {
+                                ui.invalidate_fullscreen_frame();
+                            } else {
+                                execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+                                rendered = RenderedInput::default();
+                            }
                         }
                         KeyEvent {
                             code: KeyCode::Char(character),
@@ -5150,6 +5312,7 @@ impl InputEditor {
                 drop(raw_guard.take());
                 let edited =
                     edit_prompt_externally(&expand_pasted_text_refs(&buffer, &pasted_texts));
+                flush_terminal_input_buffer();
                 raw_guard = Some(RawModeGuard::enter()?);
                 if let Some(ui) = &fullscreen_ui {
                     ui.set_tui_mode(TuiMode::Fullscreen)?;
@@ -6154,14 +6317,25 @@ struct AlternateScreenGuard;
 
 impl AlternateScreenGuard {
     fn enter() -> Result<Self> {
-        execute!(
-            io::stdout(),
+        let mut out = io::stdout();
+        if let Err(error) = execute!(
+            out,
             EnterAlternateScreen,
             EnableMouseCapture,
             cursor::Hide,
             cursor::MoveTo(0, 0),
             Clear(ClearType::All)
-        )?;
+        ) {
+            let _ = execute!(
+                out,
+                DisableMouseCapture,
+                ResetColor,
+                cursor::Show,
+                cursor::SetCursorStyle::DefaultUserShape,
+                LeaveAlternateScreen
+            );
+            return Err(error.into());
+        }
         Ok(Self)
     }
 }
@@ -6171,14 +6345,73 @@ impl Drop for AlternateScreenGuard {
         let _ = execute!(
             io::stdout(),
             DisableMouseCapture,
+            ResetColor,
             cursor::Show,
+            cursor::SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen
         );
     }
 }
 
+fn install_terminal_panic_restore() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let prior = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            force_restore_terminal();
+            prior(info);
+        }));
+    });
+}
+
+fn force_restore_terminal() {
+    let mut out = io::stdout();
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    let _ = out.write_all(b"\x1b[<u");
+    let _ = execute!(out, DisableBracketedPaste);
+    let _ = execute!(out, DisableMouseCapture);
+    let _ = execute!(
+        out,
+        ResetColor,
+        cursor::Show,
+        cursor::SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen
+    );
+    // A stack pop is the normal inverse of PushKeyboardEnhancementFlags; the
+    // explicit reset above is the failure-path backstop when stack state was
+    // lost by the terminal.
+    let _ = out.flush();
+    let _ = terminal::disable_raw_mode();
+}
+
+#[cfg(unix)]
+fn flush_terminal_input_buffer() {
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(windows)]
+fn flush_terminal_input_buffer() {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE},
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+        unsafe {
+            FlushConsoleInputBuffer(handle);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn flush_terminal_input_buffer() {}
+
 impl RawModeGuard {
     fn enter() -> Result<Self> {
+        install_terminal_panic_restore();
         terminal::enable_raw_mode()?;
         let mut out = io::stdout();
         let bracketed_paste = execute!(out, EnableBracketedPaste).is_ok();
@@ -6207,7 +6440,12 @@ impl Drop for RawModeGuard {
         if self.bracketed_paste {
             let _ = execute!(out, DisableBracketedPaste);
         }
-        let _ = execute!(out, cursor::SetCursorStyle::DefaultUserShape);
+        let _ = execute!(
+            out,
+            ResetColor,
+            cursor::Show,
+            cursor::SetCursorStyle::DefaultUserShape
+        );
         let _ = terminal::disable_raw_mode();
     }
 }

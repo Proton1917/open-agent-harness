@@ -44,6 +44,14 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     );
     assert!(entered.contains("TUI mode: fullscreen"));
     assert!(
+        !entered.contains("\r\r\n"),
+        "fullscreen frames must not depend on cooked tty newline translation"
+    );
+    assert!(
+        !entered.contains("Transcript is empty."),
+        "the empty-state placeholder must disappear before the first real transcript entry"
+    );
+    assert!(
         entered.contains("\x1b[?1049h"),
         "alternate screen was not entered"
     );
@@ -74,6 +82,39 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         INTERACTION_TIMEOUT,
     );
     assert!(copied.contains("Selected transcript text copied"));
+
+    drain_terminal(
+        &mut terminal,
+        &mut pending_output,
+        Duration::from_millis(100),
+    );
+    terminal.write_all(b"/tasks\r").unwrap();
+    let dialog = read_until(
+        &mut terminal,
+        &mut pending_output,
+        "Background tasks",
+        INTERACTION_TIMEOUT,
+    );
+    let outer_leave = dialog
+        .find("\x1b[?1049l")
+        .expect("fullscreen owner was not suspended before the task dialog");
+    let dialog_enter = dialog
+        .rfind("\x1b[?1049h")
+        .expect("task dialog did not acquire its own alternate screen");
+    assert!(outer_leave < dialog_enter);
+    terminal.write_all(b"\x1b").unwrap();
+    let resumed = read_until(
+        &mut terminal,
+        &mut pending_output,
+        "Shift+Tab mode",
+        INTERACTION_TIMEOUT,
+    );
+    assert!(
+        resumed.contains("\x1b[?1049l") && resumed.contains("\x1b[?1049h"),
+        "closing a nested dialog must restore the owning fullscreen surface"
+    );
+    assert!(resumed.contains("open-agent-harness"));
+    wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
 
     for _ in 0..12 {
         let cycle = submit_prompt(
@@ -146,8 +187,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, &mut terminal, Duration::from_secs(3)).success());
 }
 
 fn serial_terminal_test() -> MutexGuard<'static, ()> {
@@ -177,6 +217,14 @@ fn spawn_terminal(clipboard_bin: &Path) -> (Child, File) {
         )
     };
     assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    let descriptor_flags = unsafe { libc::fcntl(master, libc::F_GETFD) };
+    assert!(descriptor_flags >= 0, "{}", io::Error::last_os_error());
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC,) },
+        0,
+        "{}",
+        io::Error::last_os_error()
+    );
     let stdout = unsafe { libc::dup(slave) };
     let stderr = unsafe { libc::dup(slave) };
     assert!(stdout >= 0 && stderr >= 0);
@@ -316,11 +364,25 @@ fn wait_for_raw_mode(terminal: &mut File, timeout: Duration) {
     panic!("PTY did not enter raw mode before injected input")
 }
 
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+fn wait_for_exit(
+    child: &mut Child,
+    terminal: &mut File,
+    timeout: Duration,
+) -> std::process::ExitStatus {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
+        }
+        let mut output = [0u8; 8192];
+        loop {
+            match terminal.read(&mut output) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("terminal read failed while awaiting exit: {error}"),
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }

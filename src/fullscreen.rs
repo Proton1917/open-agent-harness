@@ -6,7 +6,7 @@
 //! ANSI frame returned by [`FullscreenState::render_ansi`] using its own
 //! terminal lifecycle guard.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, fmt::Write as _, time::Duration};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -18,6 +18,7 @@ const ANSI_HEADER: &str = "\x1b[1;36m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_SELECTION: &str = "\x1b[7m";
 const ANSI_PILL: &str = "\x1b[1;30;46m";
+const EMPTY_TRANSCRIPT_MESSAGE: &str = "Transcript is empty.";
 
 /// Resource limits for the in-memory transcript and copied selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,7 +798,13 @@ impl FullscreenState {
         for offset in 0..layout.content_rows {
             let row = visual.get(top + offset);
             rendered_rows.push(row.map_or_else(
-                || " ".repeat(self.columns),
+                || {
+                    if visual.is_empty() && offset == 0 {
+                        plain_row(EMPTY_TRANSCRIPT_MESSAGE, self.columns)
+                    } else {
+                        " ".repeat(self.columns)
+                    }
+                },
                 |row| self.render_visual_row(row),
             ));
         }
@@ -833,7 +840,11 @@ impl FullscreenState {
             bytes.push_str(row);
             bytes.push_str(ANSI_RESET);
             if index + 1 < rendered_rows.len() {
-                bytes.push_str("\r\n");
+                // Address rows explicitly instead of relying on CR/LF output
+                // processing.  The fullscreen state can be rendered both
+                // before and after raw mode transitions; a literal `\r\n`
+                // becomes `\r\r\n` when the tty still has ONLCR enabled.
+                let _ = write!(bytes, "\x1b[{};1H", index + 2);
             }
         }
         AnsiFrame {
@@ -1966,6 +1977,20 @@ mod tests {
         assert!(frame.bytes.contains("streaming"));
         assert!(frame.bytes.contains("prompt"));
         assert!(frame.bytes.contains("hint"));
+    }
+
+    #[test]
+    fn empty_state_is_ephemeral_and_frames_do_not_depend_on_tty_newline_modes() {
+        let mut state = state(5, 32);
+        let empty = state.render_ansi(FrameSpec::new("session", &[]));
+        assert!(empty.bytes.contains(EMPTY_TRANSCRIPT_MESSAGE));
+        assert!(!empty.bytes.contains('\n'));
+        assert!(!empty.bytes.contains('\r'));
+
+        state.push_message("You\nhello");
+        let populated = state.render_ansi(FrameSpec::new("session", &[]));
+        assert!(populated.bytes.contains("hello"));
+        assert!(!populated.bytes.contains(EMPTY_TRANSCRIPT_MESSAGE));
     }
 
     #[test]

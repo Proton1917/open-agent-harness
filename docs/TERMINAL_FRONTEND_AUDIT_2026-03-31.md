@@ -7,6 +7,13 @@ The only design authority for the interactive CLI frontend is
 separate 2.1.207 archive is not evidence for terminal layout, rendering,
 editing, commands, key behavior, dialogs, or other frontend interaction.
 
+Rust and platform-level terminal mechanics are additionally cross-checked
+against `reference/codex` and `reference/grok-build`, specifically for event
+invalidation, alternate-screen ownership, modal suspension, panic restoration,
+job-control recovery, and keyboard/input cleanup. They are implementation
+pattern references, not additional authorities for product behavior or UI
+parity. All three reference trees remain read-only.
+
 This project independently implements the generally useful, provider-neutral
 behavior in Rust. It does not copy source structure, React/Ink components,
 prompts, wording, assets, brand identity, account flows, telemetry, hosted
@@ -82,6 +89,22 @@ The frontend comparison is grounded principally in these source files:
 - The trusted status line refreshes asynchronously and receives source-shaped
   model/workspace/context fields with local absolute paths intentionally
   reduced to public relative or opaque identities.
+
+### Terminal lifecycle correction (2026-07-16)
+
+- Startup now seeds the bounded transcript and full session header before the
+  fullscreen owner enters the alternate screen. Empty-transcript text is a
+  visual-only placeholder and cannot become a stale transcript row.
+- Fullscreen rows use absolute cursor addressing instead of tty-dependent
+  newlines, and byte-identical frames are suppressed until explicit
+  invalidation or state change.
+- A single fullscreen owner is suspended around a serialized modal lease, then
+  repainted after model, transcript, permission, settings, task, and related
+  dialogs release their own surface. Partial setup, panic, job-control resume,
+  and external-editor return paths restore terminal and input modes.
+- Real-PTY fixtures mark the master descriptor close-on-exec, drain terminal
+  output while awaiting a clean exit, and assert that controlling-PTY hangup
+  cannot leave detached harness children behind.
 
 ## Deliberate boundaries
 

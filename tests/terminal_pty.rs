@@ -84,9 +84,22 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     assert!(output.contains("accept edits"));
+}
+
+#[test]
+fn composer_exits_when_its_controlling_pty_hangs_up() {
+    let _serial = serial_terminal_test();
+    let (mut child, mut terminal) = spawn_terminal(&[]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+    // The child must not inherit the PTY master. Closing the parent's only
+    // master descriptor should therefore deliver a terminal hangup instead of
+    // leaving a detached harness process behind.
+    drop(terminal);
+    let _ = wait_for_exit(&mut child, None, Duration::from_secs(3));
 }
 
 #[test]
@@ -136,8 +149,7 @@ fn composer_collapses_large_paste_expands_on_submit_and_completes_mid_input_slas
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -189,8 +201,7 @@ fn composer_restores_terminal_around_job_control_suspend() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -232,8 +243,7 @@ fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
     assert!(child.try_wait().unwrap().is_none());
 
     terminal.write_all(b"\x04").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -294,8 +304,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -332,8 +341,7 @@ fn theme_picker_previews_without_persisting_on_escape() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -375,8 +383,7 @@ fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -403,8 +410,7 @@ fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -439,8 +445,7 @@ fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -498,8 +503,7 @@ fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
         Duration::from_secs(3),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
 }
 
 #[test]
@@ -540,8 +544,7 @@ fn direct_shell_mode_uses_the_tool_path_and_returns_output_to_the_model() {
         Duration::from_secs(3),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     server.join().unwrap();
 }
 
@@ -582,8 +585,7 @@ fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     server.join().unwrap();
 }
 
@@ -634,8 +636,7 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
         Duration::from_secs(2),
     );
     terminal.write_all(b"\x03").unwrap();
-    drop(terminal);
-    assert!(wait_for_exit(&mut child, Duration::from_secs(3)).success());
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
     server.join().unwrap();
 }
 
@@ -671,6 +672,14 @@ fn spawn_terminal_with_args(extra_env: &[&str], extra_args: &[&str]) -> (Child, 
         )
     };
     assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    let descriptor_flags = unsafe { libc::fcntl(master, libc::F_GETFD) };
+    assert!(descriptor_flags >= 0, "{}", io::Error::last_os_error());
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC,) },
+        0,
+        "{}",
+        io::Error::last_os_error()
+    );
     let stdout = unsafe { libc::dup(slave) };
     let stderr = unsafe { libc::dup(slave) };
     assert!(stdout >= 0 && stderr >= 0);
@@ -772,11 +781,27 @@ fn open_slash_palette(terminal: &mut File) -> String {
     panic!("slash palette did not open: {output}")
 }
 
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+fn wait_for_exit(
+    child: &mut Child,
+    mut terminal: Option<&mut File>,
+    timeout: Duration,
+) -> std::process::ExitStatus {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
+        }
+        if let Some(terminal) = terminal.as_deref_mut() {
+            let mut output = [0u8; 8192];
+            loop {
+                match terminal.read(&mut output) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => panic!("terminal read failed while awaiting exit: {error}"),
+                }
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }

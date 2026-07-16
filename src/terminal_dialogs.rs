@@ -161,7 +161,11 @@ impl AlternateScreenRenderer {
 
     pub fn enter(&mut self, output: &mut impl Write) -> io::Result<()> {
         if !self.active {
-            output.write_all(b"\x1b[?1049h\x1b[?25l")?;
+            if let Err(error) = output.write_all(b"\x1b[?1049h\x1b[?25l") {
+                let _ = output.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
+                let _ = output.flush();
+                return Err(error);
+            }
             self.active = true;
         }
         Ok(())
@@ -189,7 +193,7 @@ impl AlternateScreenRenderer {
 
     pub fn leave(&mut self, output: &mut impl Write) -> io::Result<()> {
         if self.active {
-            output.write_all(b"\x1b[?25h\x1b[?1049l")?;
+            output.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l")?;
             output.flush()?;
             self.active = false;
         }

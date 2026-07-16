@@ -727,11 +727,12 @@ async fn run(
         let status_line_runner = StatusLineRunner::default();
         ui.set_syntax_highlighting(ui_settings.syntax_highlighting);
         ui.set_trusted_roots(command_context.trusted_roots());
-        if enhanced_terminal && ui_settings.tui_mode == PersistedTuiMode::Fullscreen {
-            ui.set_tui_mode(TuiMode::Fullscreen)?;
-        }
         if enhanced_terminal {
             ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
+            ui.set_fullscreen_header(fullscreen_session_header(&engine, &active_store)?)?;
+            if ui_settings.tui_mode == PersistedTuiMode::Fullscreen {
+                ui.set_tui_mode(TuiMode::Fullscreen)?;
+            }
             ui.banner(
                 &engine.model,
                 &command_context.cwd(),

@@ -427,6 +427,14 @@ fn spawn_terminal(home: &Path) -> PtySession {
         )
     };
     assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    let descriptor_flags = unsafe { libc::fcntl(master, libc::F_GETFD) };
+    assert!(descriptor_flags >= 0, "{}", io::Error::last_os_error());
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC,) },
+        0,
+        "{}",
+        io::Error::last_os_error()
+    );
     let stdout = unsafe { libc::dup(slave) };
     let stderr = unsafe { libc::dup(slave) };
     assert!(stdout >= 0 && stderr >= 0);
