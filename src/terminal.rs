@@ -1734,6 +1734,10 @@ pub struct InputReadActions<'a> {
     pub task_refresh: &'a mut dyn FnMut() -> Option<TaskUiUpdate>,
     /// Returns a completed background notice without blocking composer input.
     pub notice_refresh: &'a mut dyn FnMut() -> Option<AsyncInputNotice>,
+    /// Returns a raw, already-sanitized terminal notification sequence.
+    pub terminal_notification_refresh: &'a mut dyn FnMut() -> Option<Vec<u8>>,
+    /// Records any terminal interaction so a pending idle notification can be cancelled.
+    pub user_activity: &'a mut dyn FnMut(),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3424,6 +3428,8 @@ impl InputEditor {
             status_line_refresh,
             task_refresh,
             notice_refresh,
+            terminal_notification_refresh,
+            user_activity,
         } = actions;
         let mut raw_guard = Some(RawModeGuard::enter()?);
         #[cfg(unix)]
@@ -3535,6 +3541,10 @@ impl InputEditor {
                     "Background answer received".to_owned()
                 };
                 needs_redraw = true;
+            }
+            if let Some(sequence) = terminal_notification_refresh() {
+                out.write_all(&sequence)?;
+                out.flush()?;
             }
             if pending_fullscreen_action
                 .as_ref()
@@ -3710,6 +3720,7 @@ impl InputEditor {
                     continue;
                 }
                 if let Some(prompt) = scheduled_prompt()? {
+                    user_activity();
                     if !buffer.trim().is_empty() || !clipboard_images.is_empty() {
                         self.stashed_prompt = Some(EditorSnapshot {
                             text: buffer.clone(),
@@ -3728,6 +3739,7 @@ impl InputEditor {
                 continue;
             }
             let event = event::read()?;
+            user_activity();
             needs_redraw = true;
             if let Some(ui) = self.ui.as_ref().filter(|ui| ui.fullscreen_active()) {
                 match &event {

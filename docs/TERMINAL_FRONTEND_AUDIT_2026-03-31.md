@@ -105,6 +105,15 @@ The frontend comparison is grounded principally in these source files:
 - Real-PTY fixtures mark the master descriptor close-on-exec, drain terminal
   output while awaiting a clean exit, and assert that controlling-PTY hangup
   cannot leave detached harness children behind.
+- Completed interactive turns arm one bounded idle-notification timer. Any
+  terminal event or next scheduled/submitted prompt cancels it; a real-PTY
+  regression proves cancellation and re-arming. Delivery supports sanitized
+  iTerm2, Kitty, Ghostty, raw BEL, and tmux/screen passthrough, with the trusted
+  `Notification` hook ordered before the terminal sequence.
+- macOS active-turn work uses a self-expiring `caffeinate` child. Reference
+  counting, restart, abnormal-child recovery, and cleanup are deterministic;
+  permission, question, plan-approval, and elicitation wait guards suspend the
+  assertion until actual work resumes. No process is started on other targets.
 
 ## Deliberate boundaries
 

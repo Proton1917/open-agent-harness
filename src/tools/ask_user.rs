@@ -127,6 +127,7 @@ impl Tool for AskUserQuestionTool {
         } else if context.agent_depth() != 0 || !context.permissions.interactive {
             bail!("AskUserQuestion 需要交互式终端或 stream-json control handler")
         } else {
+            let _waiting = context.begin_user_interaction();
             prompt_interactively(&parsed.questions)?
         };
         validate_answers_complete(&parsed.questions, &answers)?;

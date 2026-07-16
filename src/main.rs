@@ -50,6 +50,7 @@ use open_agent_harness::{
         QueryEngine, QueryEvent, QueryEventSink, QueryOptions, SideQuestionAnswer, TextDeltaSink,
     },
     session::{SessionStateRoot, SessionStore, SessionSummary},
+    sleep_inhibitor::SleepInhibitor,
     statusline::{StatusLineOutcome, StatusLineRunner},
     structured_output::StructuredOutputTool,
     terminal::{
@@ -64,6 +65,10 @@ use open_agent_harness::{
         PermissionManagerDialog, PermissionTab, SettingItem, SettingValue, SettingsDialog,
         SettingsDialogAction, SettingsSnapshot, TaskCategory, TaskDialog, TaskDialogAction,
         TaskDialogItem, TaskState,
+    },
+    terminal_notifications::{
+        IdleNotificationService, TerminalEnvironment, TerminalNotification,
+        render_terminal_notification,
     },
     tools::{
         MemoryTool, TaskUiItem, TaskUiItemKind, TaskUiStatus, TeamTool, ToolContext, ToolRegistry,
@@ -279,6 +284,14 @@ async fn run(
     );
     permissions.set_user_rules(ui_settings.permission_rules.clone())?;
     let mut tool_context = ToolContext::new(cwd.clone(), permissions);
+    let sleep_inhibitor = SleepInhibitor::new();
+    let idle_notifications = IdleNotificationService::new();
+    let terminal_environment = TerminalEnvironment::from_process();
+    let interaction_wait_observer = sleep_inhibitor.interaction_wait_observer();
+    tool_context
+        .permissions
+        .set_interaction_wait_observer(Some(interaction_wait_observer.clone()));
+    tool_context.set_interaction_wait_observer(Some(interaction_wait_observer));
     if let Some(root) = &session_state_root {
         tool_context.reserve_private_state_root(root.path())?;
     }
@@ -1071,6 +1084,22 @@ async fn run(
                                 None
                             }
                         };
+                        let notification_hooks = Arc::clone(&hooks);
+                        let notification_cwd = command_context.cwd();
+                        let notification_channel = ui_settings.preferred_notif_channel;
+                        let mut terminal_notification_refresh = || {
+                            idle_notifications
+                                .poll(&notification_hooks, &notification_cwd)
+                                .map(|notification| {
+                                    render_terminal_notification(
+                                        notification_channel,
+                                        &notification,
+                                        &terminal_environment,
+                                    )
+                                    .0
+                                })
+                        };
+                        let mut user_activity = || idle_notifications.record_user_activity();
                         let read = editor.read(
                                 initial_mode,
                                 mode_locked,
@@ -1091,6 +1120,8 @@ async fn run(
                                     status_line_refresh: &mut status_line_refresh,
                                     task_refresh: &mut task_refresh,
                                     notice_refresh: &mut notice_refresh,
+                                    terminal_notification_refresh: &mut terminal_notification_refresh,
+                                    user_activity: &mut user_activity,
                                 },
                             )?;
                         merge_background_usage(&mut engine.usage, &side_question_usage);
@@ -1928,7 +1959,7 @@ async fn run(
                         }
                         println!("{}", serde_json::to_string_pretty(&ui_settings)?);
                         println!(
-                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
+                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, preferredNotifChannel, messageIdleNotifThresholdMs, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
                         );
                         continue;
                     }
@@ -2673,7 +2704,20 @@ async fn run(
                     }
                 }
             };
+            idle_notifications.record_user_activity();
+            let sleep_guard = sleep_inhibitor.start_work();
             let turn = engine.run_turn_content_interruptible(content).await;
+            drop(sleep_guard);
+            if enhanced_terminal {
+                idle_notifications.arm(
+                    Duration::from_millis(ui_settings.message_idle_notif_threshold_ms),
+                    TerminalNotification::new(
+                        "Open Agent Harness",
+                        "The agent is waiting for your input",
+                        "idle_prompt",
+                    )?,
+                )?;
+            }
             match turn {
                 Ok(Some(result)) => {
                     persist_turn(&active_store, &engine, &result)?;
@@ -6403,6 +6447,41 @@ fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> Sett
             value: SettingValue::Boolean(settings.syntax_highlighting),
         },
     ];
+    items.push(SettingItem {
+        key: "preferredNotifChannel".to_owned(),
+        label: "Notifications".to_owned(),
+        description: "Terminal notification protocol used after idle completion".to_owned(),
+        value: choice(
+            settings.preferred_notif_channel.as_str(),
+            &[
+                "auto",
+                "iterm2",
+                "iterm2_with_bell",
+                "terminal_bell",
+                "kitty",
+                "ghostty",
+                "notifications_disabled",
+            ],
+        ),
+    });
+    let selected_delay = settings.message_idle_notif_threshold_ms.to_string();
+    let mut delay_options = ["10000", "30000", "60000", "300000"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !delay_options.contains(&selected_delay) {
+        delay_options.push(selected_delay.clone());
+        delay_options.sort_by_key(|value| value.parse::<u64>().unwrap_or(u64::MAX));
+    }
+    items.push(SettingItem {
+        key: "messageIdleNotifThresholdMs".to_owned(),
+        label: "Notification delay".to_owned(),
+        description: "Idle milliseconds before a completed turn notifies".to_owned(),
+        value: SettingValue::Choice {
+            selected: selected_delay,
+            options: delay_options,
+        },
+    });
     let mut style_options = vec!["default".to_owned()];
     style_options.extend(output_styles.iter().cloned());
     style_options.sort();

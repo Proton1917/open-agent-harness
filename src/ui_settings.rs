@@ -15,7 +15,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{permissions::UserPermissionRules, protocol::ReasoningEffort};
+use crate::{
+    permissions::UserPermissionRules,
+    protocol::ReasoningEffort,
+    terminal_notifications::{
+        DEFAULT_IDLE_NOTIFICATION_THRESHOLD_MS, MAX_IDLE_NOTIFICATION_THRESHOLD_MS,
+        MIN_IDLE_NOTIFICATION_THRESHOLD_MS, NotificationChannel,
+    },
+};
 
 pub const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const MAX_UI_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -110,6 +117,10 @@ pub struct UiSettings {
     pub copy_on_select: bool,
     #[serde(default = "default_true")]
     pub syntax_highlighting: bool,
+    #[serde(default)]
+    pub preferred_notif_channel: NotificationChannel,
+    #[serde(default = "default_idle_notification_threshold_ms")]
+    pub message_idle_notif_threshold_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_line: Option<StatusLineConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +139,8 @@ impl Default for UiSettings {
             theme: ThemePreset::default(),
             copy_on_select: true,
             syntax_highlighting: true,
+            preferred_notif_channel: NotificationChannel::default(),
+            message_idle_notif_threshold_ms: DEFAULT_IDLE_NOTIFICATION_THRESHOLD_MS,
             status_line: None,
             output_style: None,
             reasoning_effort: None,
@@ -140,6 +153,13 @@ impl UiSettings {
     pub fn validate(&self) -> Result<()> {
         if let Some(status_line) = &self.status_line {
             status_line.validate()?;
+        }
+        if !(MIN_IDLE_NOTIFICATION_THRESHOLD_MS..=MAX_IDLE_NOTIFICATION_THRESHOLD_MS)
+            .contains(&self.message_idle_notif_threshold_ms)
+        {
+            bail!(
+                "messageIdleNotifThresholdMs must be between {MIN_IDLE_NOTIFICATION_THRESHOLD_MS} and {MAX_IDLE_NOTIFICATION_THRESHOLD_MS}"
+            )
         }
         if let Some(output_style) = &self.output_style {
             validate_output_style(output_style)?;
@@ -175,6 +195,14 @@ impl UiSettings {
                 next.syntax_highlighting = value
                     .parse::<bool>()
                     .context("syntaxHighlighting must be true or false")?;
+            }
+            "preferredNotifChannel" => {
+                next.preferred_notif_channel = NotificationChannel::parse(value)?;
+            }
+            "messageIdleNotifThresholdMs" => {
+                next.message_idle_notif_threshold_ms = value
+                    .parse::<u64>()
+                    .context("messageIdleNotifThresholdMs must be an unsigned integer")?;
             }
             "outputStyle" => {
                 next.output_style = if matches!(value.trim(), "default" | "null" | "none") {
@@ -319,6 +347,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_idle_notification_threshold_ms() -> u64 {
+    DEFAULT_IDLE_NOTIFICATION_THRESHOLD_MS
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSettingSource {
     User,
@@ -330,6 +362,7 @@ pub enum UiSettingValueKind {
     EditorMode,
     TuiMode,
     ThemePreset,
+    NotificationChannel,
     StatusLineJson,
     Text,
     UnsignedInteger,
@@ -364,6 +397,18 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     UiSettingSpec {
         key: "copyOnSelect",
         value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "syntaxHighlighting",
+        value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "preferredNotifChannel",
+        value_kind: UiSettingValueKind::NotificationChannel,
+    },
+    UiSettingSpec {
+        key: "messageIdleNotifThresholdMs",
+        value_kind: UiSettingValueKind::UnsignedInteger,
     },
     UiSettingSpec {
         key: "outputStyle",
@@ -777,6 +822,8 @@ mod tests {
             theme: ThemePreset::DarkDaltonized,
             copy_on_select: false,
             syntax_highlighting: false,
+            preferred_notif_channel: NotificationChannel::Ghostty,
+            message_idle_notif_threshold_ms: 90_000,
             status_line: Some(StatusLineConfig {
                 command: "status-helper --json".to_owned(),
                 padding: 2,
@@ -888,6 +935,55 @@ mod tests {
         );
         assert_eq!(settings, before);
         assert!(UiSettingsStore::for_scope(UiSettingsScope::Project, "/tmp/project-ui").is_err());
+    }
+
+    #[test]
+    fn notification_settings_are_typed_bounded_and_transactional() {
+        let mut settings = UiSettings::default();
+        settings
+            .apply_setting(UiSettingSource::User, "preferredNotifChannel", "kitty")
+            .unwrap();
+        settings
+            .apply_setting(
+                UiSettingSource::User,
+                "messageIdleNotifThresholdMs",
+                "30000",
+            )
+            .unwrap();
+        assert_eq!(settings.preferred_notif_channel, NotificationChannel::Kitty);
+        assert_eq!(settings.message_idle_notif_threshold_ms, 30_000);
+
+        let before = settings.clone();
+        assert!(
+            settings
+                .apply_setting(
+                    UiSettingSource::User,
+                    "preferredNotifChannel",
+                    "run-a-command",
+                )
+                .is_err()
+        );
+        assert_eq!(settings, before);
+        assert!(
+            settings
+                .apply_setting(UiSettingSource::User, "messageIdleNotifThresholdMs", "999",)
+                .is_err()
+        );
+        assert_eq!(settings, before);
+
+        let encoded = serde_json::to_value(&settings).unwrap();
+        assert_eq!(encoded["preferredNotifChannel"], "kitty");
+        assert_eq!(encoded["messageIdleNotifThresholdMs"], 30_000);
+        assert!(
+            UI_SETTING_REGISTRY
+                .iter()
+                .any(|spec| spec.key == "preferredNotifChannel")
+        );
+        assert!(
+            UI_SETTING_REGISTRY
+                .iter()
+                .any(|spec| spec.key == "messageIdleNotifThresholdMs")
+        );
     }
 
     #[test]

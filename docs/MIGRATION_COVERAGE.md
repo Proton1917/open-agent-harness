@@ -55,6 +55,15 @@ request. This closes the source watch-list behavior without claiming a
 resident background OS watcher or lossless reporting of every intermediate
 write between request boundaries.
 
+The first frontend-service batch is backed by `src/sleep_inhibitor.rs`,
+`src/terminal_notifications.rs`, the interaction wait lifecycle, typed private
+UI settings, and a real PTY regression. macOS work-only sleep prevention is
+self-expiring and pauses for user dialogs. Idle notifications are replaceable,
+cancel on activity, run trusted Notification hooks before delivery, sanitize
+OSC content, and support explicit multiplexer passthrough. These close the
+`preventSleep.ts` and generic `notifier.ts` behaviors without importing account,
+analytics, or desktop-notification services.
+
 ## Current project-wide work still open
 
 - Expand the ledger to every top-level service/utility family with exact Rust

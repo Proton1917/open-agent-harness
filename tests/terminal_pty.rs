@@ -549,6 +549,86 @@ fn direct_shell_mode_uses_the_tool_path_and_returns_output_to_the_model() {
 }
 
 #[test]
+fn idle_terminal_notification_cancels_on_activity_and_rearms_after_next_turn() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for response in [
+            text_stream("FIRST_IDLE_TURN"),
+            text_stream("SECOND_IDLE_TURN"),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+
+    terminal
+        .write_all(b"/config preferredNotifChannel=iterm2\r")
+        .unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Updated UI setting preferredNotifChannel.",
+        Duration::from_secs(3),
+    );
+    terminal
+        .write_all(b"/config messageIdleNotifThresholdMs=1000\r")
+        .unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Updated UI setting messageIdleNotifThresholdMs.",
+        Duration::from_secs(3),
+    );
+
+    terminal.write_all(b"first idle turn\r").unwrap();
+    let first = read_until(&mut terminal, "FIRST_IDLE_TURN", Duration::from_secs(10));
+    if !first.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    terminal.write_all(b"x").unwrap();
+    let _ = read_until(&mut terminal, "› x", Duration::from_secs(3));
+    let cancelled_window = read_available(&mut terminal, Duration::from_millis(1_300));
+    assert!(
+        !cancelled_window.contains("\x1b]9;"),
+        "typing after completion must cancel the idle notification: {cancelled_window:?}"
+    );
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(&mut terminal, "Input cleared", Duration::from_secs(3));
+
+    terminal.write_all(b"second idle turn\r").unwrap();
+    let second = read_until(&mut terminal, "SECOND_IDLE_TURN", Duration::from_secs(10));
+    if !second.contains("Shift+Tab mode") {
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    }
+    let notification = read_until(
+        &mut terminal,
+        "\x1b]9;\n\nOpen Agent Harness:",
+        Duration::from_secs(4),
+    );
+    assert!(notification.contains("The agent is waiting for your input"));
+
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
 fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
     let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

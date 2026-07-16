@@ -10,6 +10,8 @@ use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::interactions::InteractionWaitObserver;
+
 pub const MAX_USER_PERMISSION_RULES: usize = 256;
 pub const MAX_USER_PERMISSION_RULE_BYTES: usize = 512;
 pub const MAX_RECENT_PERMISSION_PROMPTS: usize = 64;
@@ -115,6 +117,7 @@ pub struct PermissionManager {
     session_mode: Arc<RwLock<Option<PermissionMode>>>,
     workspace_deny: Arc<RwLock<Vec<String>>>,
     prompt_handler: Arc<RwLock<Option<PermissionPromptHandler>>>,
+    interaction_wait_observer: Arc<RwLock<Option<InteractionWaitObserver>>>,
     user_rules: Arc<RwLock<UserPermissionRules>>,
     recent_prompts: Arc<RwLock<VecDeque<RecentPermissionPrompt>>>,
 }
@@ -199,6 +202,7 @@ impl PermissionManager {
             session_mode: Arc::new(RwLock::new(None)),
             workspace_deny: Arc::new(RwLock::new(Vec::new())),
             prompt_handler: Arc::new(RwLock::new(None)),
+            interaction_wait_observer: Arc::new(RwLock::new(None)),
             user_rules: Arc::new(RwLock::new(UserPermissionRules::default())),
             recent_prompts: Arc::new(RwLock::new(VecDeque::new())),
         }
@@ -260,6 +264,13 @@ impl PermissionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
     }
 
+    pub fn set_interaction_wait_observer(&self, observer: Option<InteractionWaitObserver>) {
+        *self
+            .interaction_wait_observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
     pub fn set_workspace_deny(&self, rules: Vec<String>) {
         *self
             .workspace_deny
@@ -287,6 +298,7 @@ impl PermissionManager {
             session_mode: Arc::clone(&self.session_mode),
             workspace_deny: Arc::new(RwLock::new(self.workspace_deny_rules())),
             prompt_handler: Arc::clone(&self.prompt_handler),
+            interaction_wait_observer: Arc::clone(&self.interaction_wait_observer),
             user_rules: Arc::clone(&self.user_rules),
             recent_prompts: Arc::clone(&self.recent_prompts),
         }
@@ -559,6 +571,15 @@ impl PermissionManager {
         if handler.is_some() || self.interactive {
             self.record_recent_prompt(tool, summary, read_only, destructive, outside_workspace);
         }
+        let _waiting = if handler.is_some() || self.interactive {
+            self.interaction_wait_observer
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .map(|observer| observer.enter())
+        } else {
+            None
+        };
         if let Some(handler) = handler {
             return handler(&request);
         }
@@ -2767,6 +2788,57 @@ mod tests {
         );
         assert_eq!(PermissionMode::DontAsk.as_setting(), "dontAsk");
         assert_eq!(PermissionMode::from_setting("dont-ask"), None);
+    }
+
+    #[test]
+    fn permission_wait_observer_balances_success_error_and_headless_deny() {
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let begin = Arc::clone(&waiting);
+        let end = Arc::clone(&waiting);
+        let manager =
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new());
+        manager.set_interaction_wait_observer(Some(InteractionWaitObserver::new(
+            move || {
+                begin.fetch_add(1, Ordering::SeqCst);
+            },
+            move || {
+                end.fetch_sub(1, Ordering::SeqCst);
+            },
+        )));
+
+        let during_success = Arc::clone(&waiting);
+        manager.set_prompt_handler(Some(Arc::new(move |_| {
+            assert_eq!(during_success.load(Ordering::SeqCst), 1);
+            Ok(PermissionDecision::Allow)
+        })));
+        assert_eq!(
+            manager
+                .decide("Write", "output.txt", false, false, false)
+                .unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
+
+        let during_error = Arc::clone(&waiting);
+        manager.set_prompt_handler(Some(Arc::new(move |_| {
+            assert_eq!(during_error.load(Ordering::SeqCst), 1);
+            Err(anyhow::anyhow!("interaction failed"))
+        })));
+        assert!(
+            manager
+                .decide("Write", "output.txt", false, false, false)
+                .is_err()
+        );
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
+
+        manager.set_prompt_handler(None);
+        assert_eq!(
+            manager
+                .decide("Write", "output.txt", false, false, false)
+                .unwrap(),
+            PermissionDecision::Deny
+        );
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
     }
 
     #[test]

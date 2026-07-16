@@ -45,7 +45,9 @@ use crate::file_history::{
     CheckpointBoundary, CheckpointInfo, DiffStats, FileHistory, RewindReport,
 };
 use crate::hooks::HookRunner;
-use crate::interactions::{UserInteractionHandler, UserInteractionRequest};
+use crate::interactions::{
+    InteractionWaitGuard, InteractionWaitObserver, UserInteractionHandler, UserInteractionRequest,
+};
 use crate::monitor::{MonitorNotificationCheckpoint, MonitorService, MonitorTool};
 use crate::permissions::{PermissionDecision, PermissionManager, PermissionTarget};
 use crate::plugins::PluginMonitorDefinition;
@@ -359,6 +361,7 @@ pub struct ToolContext {
     workspace_context_seen_generation: Arc<AtomicU64>,
     external_file_watch: Arc<StdMutex<ExternalFileWatchState>>,
     interaction_handler: Arc<RwLock<Option<UserInteractionHandler>>>,
+    interaction_wait_observer: Arc<RwLock<Option<InteractionWaitObserver>>>,
     sandbox_runtime: Arc<RwLock<SandboxRuntime>>,
     file_history: Arc<RwLock<Option<FileHistory>>>,
     file_histories: Arc<RwLock<HashMap<String, FileHistory>>>,
@@ -577,6 +580,7 @@ impl ToolContext {
             workspace_context_seen_generation: Arc::new(AtomicU64::new(0)),
             external_file_watch: Arc::new(StdMutex::new(ExternalFileWatchState::default())),
             interaction_handler: Arc::new(RwLock::new(None)),
+            interaction_wait_observer: Arc::new(RwLock::new(None)),
             sandbox_runtime: Arc::new(RwLock::new(SandboxRuntime::default())),
             file_history: Arc::new(RwLock::new(None)),
             file_histories: Arc::new(RwLock::new(HashMap::new())),
@@ -714,6 +718,21 @@ impl ToolContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
     }
 
+    pub fn set_interaction_wait_observer(&self, observer: Option<InteractionWaitObserver>) {
+        *self
+            .interaction_wait_observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    pub(crate) fn begin_user_interaction(&self) -> Option<InteractionWaitGuard> {
+        self.interaction_wait_observer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .map(|observer| observer.enter())
+    }
+
     pub fn set_workspace_state_recorder(&self, recorder: Option<WorkspaceStateRecorder>) {
         *self
             .workspace_state_recorder
@@ -758,14 +777,15 @@ impl ToolContext {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        handler
-            .map(|handler| {
-                handler(&UserInteractionRequest {
-                    tool: tool.to_owned(),
-                    input,
-                })
-            })
-            .transpose()
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        let _waiting = self.begin_user_interaction();
+        handler(&UserInteractionRequest {
+            tool: tool.to_owned(),
+            input,
+        })
+        .map(Some)
     }
 
     pub fn set_sandbox_runtime(&self, runtime: SandboxRuntime) {
@@ -2838,6 +2858,7 @@ impl ToolContext {
                     .clone(),
             )),
             interaction_handler: Arc::clone(&self.interaction_handler),
+            interaction_wait_observer: Arc::clone(&self.interaction_wait_observer),
             sandbox_runtime: Arc::clone(&self.sandbox_runtime),
             file_history: Arc::new(RwLock::new(
                 self.file_history
@@ -6067,12 +6088,57 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::BTreeSet,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use tokio::{sync::Barrier, time::timeout};
 
     use super::*;
     use crate::permissions::{PermissionDecision, PermissionMode};
+
+    #[test]
+    fn control_interaction_handler_is_wrapped_by_wait_observer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(
+            temporary.path().to_owned(),
+            PermissionManager::new(PermissionMode::Default, false, Vec::new(), Vec::new()),
+        );
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let begin = Arc::clone(&waiting);
+        let end = Arc::clone(&waiting);
+        context.set_interaction_wait_observer(Some(InteractionWaitObserver::new(
+            move || {
+                begin.fetch_add(1, Ordering::SeqCst);
+            },
+            move || {
+                end.fetch_sub(1, Ordering::SeqCst);
+            },
+        )));
+        let during = Arc::clone(&waiting);
+        context.set_user_interaction_handler(Some(Arc::new(move |request| {
+            assert_eq!(during.load(Ordering::SeqCst), 1);
+            assert_eq!(request.tool, "AskUserQuestion");
+            Ok(json!({"answers":{"question":"answer"}}))
+        })));
+
+        let result = context
+            .request_user_interaction("AskUserQuestion", json!({"questions":[]}))
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
+
+        context.set_user_interaction_handler(None);
+        assert!(
+            context
+                .request_user_interaction("AskUserQuestion", json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn windows_native_namespace_strings_are_rejected_before_path_conversion() {

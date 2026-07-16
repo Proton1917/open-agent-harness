@@ -256,6 +256,15 @@ is accurate; “complete parity with the proprietary product” is not.
   status-line commands refresh asynchronously on relevant state changes and at
   the configured idle interval. Custom theme editing remains outside the
   declared integration surface.
+- Idle completion notifications use one replaceable timer, typed private
+  settings, control-sanitized iTerm2/Kitty/Ghostty/BEL sequences, explicit
+  multiplexer passthrough, and Notification-hook-before-delivery ordering.
+  User activity cancels the pending event. Auto mode detects those three OSC
+  terminals; other terminals can use the explicit BEL channel.
+- macOS sleep prevention is limited to active interactive work. A bounded,
+  self-expiring `caffeinate` child is restarted before expiry and synchronously
+  reaped at turn end; blocking user interaction pauses it. The implementation
+  is an inert no-op on non-macOS targets.
 - `/diff`, `/rewind`, `/resume`, `/tasks`, `/copy`, and `/export` expose their
   generic data and safe actions. `/resume` switches the active transcript,
   workspace/cwd recorders and file histories in the current terminal;
