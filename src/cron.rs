@@ -1273,7 +1273,14 @@ fn acquire_store_lock(store_path: &Path) -> Result<StoreLock> {
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&lock_path)?;
+                let metadata = match fs::symlink_metadata(&lock_path) {
+                    Ok(metadata) => metadata,
+                    // The prior owner may release and unlink the lock between
+                    // our create_new failure and this inspection. That is
+                    // normal lock handoff, not a storage failure.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error).context("无法检查 scheduled task store lock"),
+                };
                 if metadata.file_type().is_symlink() {
                     bail!("scheduled task lock 不能是 symlink")
                 }
@@ -2313,34 +2320,32 @@ mod tests {
     #[test]
     fn concurrent_durable_creates_are_serialized_without_lost_updates() {
         let temp = tempfile::tempdir().unwrap();
-        let left = service(&temp);
-        let right = service(&temp);
+        let service = service(&temp);
+        const WRITERS: usize = 16;
         std::thread::scope(|scope| {
-            let left = left.clone();
-            scope.spawn(move || {
-                left.create(CronCreateRequest {
-                    cron: "* * * * *".into(),
-                    prompt: "left".into(),
-                    recurring: true,
-                    durable: true,
-                })
-                .unwrap();
-            });
-            let right = right.clone();
-            scope.spawn(move || {
-                right
-                    .create(CronCreateRequest {
-                        cron: "* * * * *".into(),
-                        prompt: "right".into(),
-                        recurring: true,
-                        durable: true,
-                    })
-                    .unwrap();
-            });
+            for index in 0..WRITERS {
+                let service = service.clone();
+                scope.spawn(move || {
+                    service
+                        .create(CronCreateRequest {
+                            cron: "* * * * *".into(),
+                            prompt: format!("writer-{index}"),
+                            recurring: true,
+                            durable: true,
+                        })
+                        .unwrap();
+                });
+            }
         });
-        let jobs = left.list().unwrap();
-        assert_eq!(jobs.len(), 2);
-        assert_ne!(jobs[0].id, jobs[1].id);
+        let jobs = service.list().unwrap();
+        assert_eq!(jobs.len(), WRITERS);
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            WRITERS
+        );
         assert!(
             !temp
                 .path()
