@@ -363,6 +363,37 @@ fn composer_restores_terminal_around_job_control_suspend() {
 }
 
 #[test]
+fn external_termination_signals_restore_raw_and_fullscreen_terminal_modes() {
+    let _serial = serial_terminal_test();
+    for (name, signal) in [
+        ("SIGHUP", libc::SIGHUP),
+        ("SIGINT", libc::SIGINT),
+        ("SIGQUIT", libc::SIGQUIT),
+        ("SIGTERM", libc::SIGTERM),
+    ] {
+        let (mut child, mut terminal) = spawn_terminal(&[]);
+        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+        wait_for_raw_mode(&terminal, Duration::from_secs(2));
+
+        terminal.write_all(b"/tui fullscreen\r").unwrap();
+        let entered = read_until(&mut terminal, "\x1b[?1049h", Duration::from_secs(3));
+        assert!(entered.contains("\x1b[?1049h"), "{name}: {entered:?}");
+
+        // SAFETY: child.id() is the live isolated PTY child spawned above. The
+        // return value is checked and each child is reaped before the next case.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let restored = read_until(&mut terminal, "\x1b[?1049l", Duration::from_secs(3));
+        assert!(restored.contains("\x1b[?2004l"), "{name}: {restored:?}");
+        assert!(restored.contains("\x1b[?25h"), "{name}: {restored:?}");
+        assert_eq!(
+            wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).code(),
+            Some(128 + signal),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
@@ -919,9 +950,11 @@ fn active_turn_composer_ctrl_c_interrupts_and_returns_to_idle_input() {
     let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (request_ready_tx, request_ready_rx) = std::sync::mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = read_request(&mut stream);
+        request_ready_tx.send(()).unwrap();
         thread::sleep(Duration::from_millis(500));
         let response = text_stream("MUST_NOT_COMMIT");
         let _ = write!(
@@ -941,6 +974,9 @@ fn active_turn_composer_ctrl_c_interrupts_and_returns_to_idle_input() {
         "/btw asks separately",
         Duration::from_secs(5),
     );
+    request_ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("active request was not fully received before interrupt");
     terminal.write_all(b"\x03").unwrap();
     let interrupted = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
     assert!(interrupted.contains("Interrupted"));

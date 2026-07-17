@@ -124,9 +124,18 @@ The frontend comparison is grounded principally in these source files:
   repainted after model, transcript, permission, settings, task, and related
   dialogs release their own surface. Partial setup, panic, job-control resume,
   and external-editor return paths restore terminal and input modes.
+- Unix `SIGHUP`, `SIGINT`, `SIGQUIT`, and `SIGTERM` are handled by the terminal
+  owner after raw mode is installed. The bounded restore path disables
+  bracketed paste, shows the cursor, leaves the alternate screen, flushes stale
+  input, and exits with the conventional `128 + signal` status. A real-PTY
+  regression asserts the exact cleanup sequences and exit status for all four
+  registered signals.
 - Real-PTY fixtures mark the master descriptor close-on-exec, drain terminal
   output while awaiting a clean exit, and assert that controlling-PTY hangup
   cannot leave detached harness children behind.
+- The active-turn interrupt fixture waits until the mock endpoint has received
+  the complete request before sending Ctrl-C, so it exercises cancellation of
+  a genuinely in-flight turn rather than a pre-write race.
 - A real-PTY prompt-suggestion fixture delays one response until after typing,
   proves the stale generation stays hidden, then proves re-arming, Enter
   acceptance, tool-free registration, and delivery into the next main request.

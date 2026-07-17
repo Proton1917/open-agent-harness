@@ -7610,6 +7610,40 @@ fn install_terminal_panic_restore() {
     });
 }
 
+#[cfg(unix)]
+fn install_terminal_signal_restore() -> Result<()> {
+    static INSTALL: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INSTALL
+        .get_or_init(|| {
+            let mut signals = signal_hook::iterator::Signals::new([
+                signal_hook::consts::signal::SIGHUP,
+                signal_hook::consts::signal::SIGINT,
+                signal_hook::consts::signal::SIGQUIT,
+                signal_hook::consts::signal::SIGTERM,
+            ])
+            .map_err(|error| format!("cannot register terminal restore signals: {error}"))?;
+            std::thread::Builder::new()
+                .name("terminal-signal-restore".to_owned())
+                .spawn(move || {
+                    if let Some(signal) = signals.forever().next() {
+                        force_restore_terminal();
+                        flush_terminal_input_buffer();
+                        std::process::exit(128 + signal);
+                    }
+                })
+                .map_err(|error| format!("cannot start terminal restore signal worker: {error}"))?;
+            Ok(())
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
+#[cfg(not(unix))]
+fn install_terminal_signal_restore() -> Result<()> {
+    Ok(())
+}
+
 fn force_restore_terminal() {
     let mut raw = raw_mode_state()
         .lock()
@@ -7664,6 +7698,7 @@ fn flush_terminal_input_buffer() {}
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         install_terminal_panic_restore();
+        install_terminal_signal_restore()?;
         let mut state = raw_mode_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
