@@ -35,7 +35,7 @@ fn configured_unbind_command_and_chord_are_live_in_the_composer() {
     );
 
     let mut session = spawn_terminal(home.path());
-    session.read_until("Shift+Tab mode", Duration::from_secs(5));
+    session.read_until("? for shortcuts", Duration::from_secs(5));
     session.wait_for_raw_mode(Duration::from_secs(2));
     session.read_available(Duration::from_millis(100));
 
@@ -62,7 +62,7 @@ fn configured_unbind_command_and_chord_are_live_in_the_composer() {
         "chord dispatched more than once: {chord:?}"
     );
 
-    session.read_until("Shift+Tab mode", Duration::from_secs(4));
+    session.read_until("? for shortcuts", Duration::from_secs(4));
     session.wait_for_raw_mode(Duration::from_secs(2));
     session.write_all(b"\x15");
     let command = session.read_until("Session status:", Duration::from_secs(4));
@@ -82,11 +82,11 @@ fn keybindings_hot_reload_invalid_retention_and_unlink_restore_defaults() {
     );
 
     let mut session = spawn_terminal(home.path());
-    session.read_until("Shift+Tab mode", Duration::from_secs(5));
+    session.read_until("? for shortcuts", Duration::from_secs(5));
     session.wait_for_raw_mode(Duration::from_secs(2));
     session.write_all(b"\x15");
     session.read_until("Session status:", Duration::from_secs(4));
-    session.read_until("Shift+Tab mode", Duration::from_secs(4));
+    session.read_until("? for shortcuts", Duration::from_secs(4));
     session.wait_for_raw_mode(Duration::from_secs(2));
 
     // Replace through rename so the watcher must handle the same atomic-save
@@ -130,7 +130,7 @@ fn vim_command_switches_modes_and_edits_the_live_composer() {
     let _serial = serial_terminal_test();
     let home = tempfile::tempdir().unwrap();
     let mut session = spawn_terminal(home.path());
-    session.read_until("Shift+Tab mode", Duration::from_secs(5));
+    session.read_until("? for shortcuts", Duration::from_secs(5));
     session.wait_for_raw_mode(Duration::from_secs(2));
 
     session.write_all(b"/vim\r");
@@ -155,7 +155,7 @@ fn modal_model_picker_and_todo_toggle_preserve_the_draft() {
     let _serial = serial_terminal_test();
     let home = tempfile::tempdir().unwrap();
     let mut session = spawn_terminal(home.path());
-    session.read_until("Shift+Tab mode", Duration::from_secs(5));
+    session.read_until("? for shortcuts", Duration::from_secs(5));
     session.wait_for_raw_mode(Duration::from_secs(2));
     session.read_available(Duration::from_millis(100));
 

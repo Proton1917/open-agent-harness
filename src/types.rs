@@ -67,7 +67,7 @@ pub struct ModelResponse {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -85,6 +85,19 @@ impl SessionUsage {
         self.cache_read_input_tokens = self
             .cache_read_input_tokens
             .saturating_add(usage.cache_read_input_tokens);
+    }
+
+    pub fn saturating_sub(&self, earlier: &Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(earlier.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(earlier.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_sub(earlier.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_sub(earlier.cache_read_input_tokens),
+        }
     }
 }
 
@@ -129,5 +142,31 @@ mod tests {
         assert_eq!(total.output_tokens, u64::MAX);
         assert_eq!(total.cache_creation_input_tokens, u64::MAX);
         assert_eq!(total.cache_read_input_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn session_usage_delta_is_per_turn_and_saturating() {
+        let before = SessionUsage {
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 10,
+        };
+        let after = SessionUsage {
+            input_tokens: 125,
+            output_tokens: 47,
+            cache_creation_input_tokens: 15,
+            cache_read_input_tokens: 13,
+        };
+
+        assert_eq!(
+            after.saturating_sub(&before),
+            SessionUsage {
+                input_tokens: 25,
+                output_tokens: 7,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 3,
+            }
+        );
     }
 }

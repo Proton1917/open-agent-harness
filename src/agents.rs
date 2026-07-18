@@ -2548,7 +2548,7 @@ fn agent_progress_sink(
             }
             QueryEvent::CompactStarted { .. } => "Compacting delegated context".to_owned(),
             QueryEvent::CompactFinished { .. } => "Delegated context compacted".to_owned(),
-            QueryEvent::TurnFinished => "Finishing delegated result".to_owned(),
+            QueryEvent::TurnFinished { .. } => "Finishing delegated result".to_owned(),
             QueryEvent::TurnInterrupted => "Delegated turn interrupted".to_owned(),
             QueryEvent::TurnFailed { .. } => "Delegated turn failed".to_owned(),
         };

@@ -255,7 +255,7 @@ fn assert_history_scope(session: &mut PtySession, scope: &str) {
 
 fn vim_session(home: &Path) -> PtySession {
     let mut session = spawn_terminal(home);
-    session.read_until("Shift+Tab mode", IO_TIMEOUT);
+    session.read_until("? for shortcuts", IO_TIMEOUT);
     session.wait_for_raw_mode(Duration::from_secs(2));
     session.drain();
     session.write_all(b"/vim\r");
@@ -363,7 +363,7 @@ impl PtySession {
     }
 
     fn wait_for_next_prompt(&mut self) {
-        self.read_until("› ", IO_TIMEOUT);
+        self.read_until("❯ ", IO_TIMEOUT);
         self.wait_for_raw_mode(Duration::from_secs(2));
     }
 
@@ -529,14 +529,12 @@ fn plain_text(output: &str) -> String {
 }
 
 fn last_composer_text(output: &str) -> Option<String> {
-    // Suggestion rows also start with `› `. Each redraw clears downward
-    // before writing its top rule, composer, bottom rule, and suggestions.
-    // Restrict parsing to the last redraw and take its first prompt-prefixed
-    // line, which is the composer rather than the selected suggestion.
+    // Suggestion rows use `› ` while the source-shaped composer uses `❯ `.
+    // Restrict parsing to the last redraw and select only the composer glyph.
     let frame = output.rsplit("\x1b[J").next().unwrap_or(output);
     plain_text(frame)
         .lines()
-        .find_map(|line| line.strip_prefix("› ").map(ToOwned::to_owned))
+        .find_map(|line| line.strip_prefix("❯ ").map(ToOwned::to_owned))
 }
 
 fn contains_inverse_sgr(output: &[u8]) -> bool {

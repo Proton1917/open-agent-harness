@@ -18,10 +18,91 @@ use std::{
 use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
+fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        let events = [
+            serde_json::json!({"type":"message_start","message":{
+                "type":"message","role":"assistant","id":"live-token-turn","content":[],
+                "usage":{"input_tokens":11,"output_tokens":0}
+            }}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"text","text":""
+            }}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"text_delta","text":"LIVE1234"
+            }}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"text_delta","text":"_TOKEN_COUNT_OK!"
+            }}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":7}
+            }),
+            serde_json::json!({"type":"message_stop"}),
+        ]
+        .into_iter()
+        .map(|value| format!("data: {value}\n\n"))
+        .collect::<Vec<_>>();
+        let content_length = events.iter().map(String::len).sum::<usize>();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+        for (index, event) in events.iter().enumerate() {
+            stream.write_all(event.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            if index == 2 || index == 3 {
+                thread::sleep(Duration::from_millis(700));
+            }
+        }
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
+
+    terminal.write_all(b"count live tokens\r").unwrap();
+    let active = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(3));
+    assert!(active.contains("esc to interrupt"), "{active}");
+    let first_count = read_until(&mut terminal, "↓ 2 tokens", Duration::from_secs(5));
+    assert!(first_count.contains("Working"), "{first_count}");
+    let second_count = read_until(&mut terminal, "↓ 6 tokens", Duration::from_secs(5));
+    assert!(second_count.contains("↓ 6 tokens"), "{second_count}");
+    let answer = read_until(
+        &mut terminal,
+        "LIVE1234_TOKEN_COUNT_OK!",
+        Duration::from_secs(5),
+    );
+    let exact = if answer.contains("↓ 7 tokens") {
+        answer
+    } else {
+        read_until(&mut terminal, "↓ 7 tokens", Duration::from_secs(3))
+    };
+    assert!(exact.contains("? for shortcuts"), "{exact}");
+    assert!(child.try_wait().unwrap().is_none());
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
 fn composer_handles_mode_help_and_double_interrupt_exit() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let mut output = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let mut output = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     assert!(output.contains("open-agent-harness"));
     assert!(output.contains("default"));
 
@@ -33,7 +114,7 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     output.push_str(&redraw);
 
     set_terminal_size(&terminal, 40, 8);
-    let resized = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let resized = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     assert!(
         !resized.contains("\x1b[2J"),
         "resize must not clear the committed transcript"
@@ -44,7 +125,7 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     set_terminal_size(&terminal, 100, 30);
     output.push_str(&read_until(
         &mut terminal,
-        "Shift+Tab mode",
+        "? for shortcuts",
         Duration::from_secs(3),
     ));
 
@@ -70,12 +151,12 @@ fn composer_handles_mode_help_and_double_interrupt_exit() {
     ));
     terminal.write_all(b"/help\r").unwrap();
     let help = read_until(&mut terminal, "Available commands:", Duration::from_secs(3));
-    let composer_ready = help.contains("Shift+Tab mode");
+    let composer_ready = help.contains("accept edits on (shift+tab to cycle)");
     output.push_str(&help);
     if !composer_ready {
         output.push_str(&read_until(
             &mut terminal,
-            "Shift+Tab mode",
+            "accept edits on (shift+tab to cycle)",
             Duration::from_secs(3),
         ));
     }
@@ -109,7 +190,7 @@ fn terminal_panel_is_explicit_and_restores_the_live_composer() {
     let shell_env = format!("SHELL={}", shell.display());
     let path_env = format!("PATH={}", programs.path().display());
     let (mut child, mut terminal) = spawn_terminal(&[&shell_env, &path_env]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
     terminal.write_all(b"\x1bj").unwrap();
@@ -129,8 +210,8 @@ fn terminal_panel_is_explicit_and_restores_the_live_composer() {
         "Updated UI setting terminalPanelEnabled.",
         Duration::from_secs(3),
     );
-    if !updated.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !updated.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x1bj").unwrap();
@@ -145,7 +226,8 @@ fn terminal_panel_is_explicit_and_restores_the_live_composer() {
         )
     };
     assert!(marker.exists());
-    assert!(restored.contains("Shift+Tab mode"), "{restored}");
+    assert!(restored.contains("❯ "), "{restored}");
+    assert!(restored.contains("Returned from direct terminal shell"));
     assert!(child.try_wait().unwrap().is_none());
 
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
@@ -163,7 +245,7 @@ fn terminal_panel_is_explicit_and_restores_the_live_composer() {
 fn context_command_renders_partitioned_usage_and_memory_status() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"/context\r").unwrap();
     let report = read_until(&mut terminal, "Workspace memory", Duration::from_secs(4));
@@ -174,12 +256,12 @@ fn context_command_renders_partitioned_usage_and_memory_status() {
     assert!(report.contains("Free before auto-compact"), "{report}");
     assert!(child.try_wait().unwrap().is_none());
 
-    let ready = if report.contains("Shift+Tab mode") {
+    let ready = if report.contains("? for shortcuts") {
         report
     } else {
-        read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3))
+        read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3))
     };
-    assert!(ready.contains("Shift+Tab mode"));
+    assert!(ready.contains("? for shortcuts"));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
@@ -195,7 +277,7 @@ fn context_command_renders_partitioned_usage_and_memory_status() {
 fn workspace_quick_open_and_global_search_insert_source_style_paths() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
     // Ctrl-X Ctrl-P is the classic-PTY fallback for Ctrl/Cmd-Shift-P.
@@ -229,7 +311,7 @@ fn workspace_quick_open_and_global_search_insert_source_style_paths() {
     let global_match = read_until(&mut terminal, "Cargo.toml:6", Duration::from_secs(5));
     assert!(global_match.contains("provider-neutral"), "{global_match}");
     terminal.write_all(b"\x1b[Z").unwrap();
-    let inserted = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let inserted = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     assert!(inserted.contains("Cargo.toml:6"), "{inserted}");
     assert!(child.try_wait().unwrap().is_none());
 
@@ -250,7 +332,7 @@ fn workspace_quick_open_and_global_search_insert_source_style_paths() {
 fn composer_exits_when_its_controlling_pty_hangs_up() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
     // The child must not inherit the PTY master. Closing the parent's only
@@ -264,7 +346,7 @@ fn composer_exits_when_its_controlling_pty_hangs_up() {
 fn composer_collapses_large_paste_expands_on_submit_and_completes_mid_input_slash() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
     terminal.write_all(b"please /mo").unwrap();
@@ -314,7 +396,7 @@ fn composer_collapses_large_paste_expands_on_submit_and_completes_mid_input_slas
 fn composer_restores_terminal_around_job_control_suspend() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     let _ = read_available(&mut terminal, Duration::from_millis(100));
 
@@ -344,12 +426,12 @@ fn composer_restores_terminal_around_job_control_suspend() {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     let resumed = read_until(&mut terminal, "\u{1b}[?2004h", Duration::from_secs(3));
     assert!(resumed.contains("\u{1b}[?2004h"));
-    let ready = if resumed.contains("Shift+Tab mode") {
+    let ready = if resumed.contains("? for shortcuts") {
         resumed
     } else {
-        read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3))
+        read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3))
     };
-    assert!(ready.contains("Shift+Tab mode"));
+    assert!(ready.contains("? for shortcuts"));
     assert!(child.try_wait().unwrap().is_none());
 
     terminal.write_all(b"\x03").unwrap();
@@ -372,7 +454,7 @@ fn external_termination_signals_restore_raw_and_fullscreen_terminal_modes() {
         ("SIGTERM", libc::SIGTERM),
     ] {
         let (mut child, mut terminal) = spawn_terminal(&[]);
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
         wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
         terminal.write_all(b"/tui fullscreen\r").unwrap();
@@ -397,15 +479,15 @@ fn external_termination_signals_restore_raw_and_fullscreen_terminal_modes() {
 fn composer_requires_bounded_double_eof_and_preserves_forward_delete() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all("a界b".as_bytes()).unwrap();
     let _ = read_until(&mut terminal, "a界b", Duration::from_secs(3));
     terminal.write_all(b"\x01\x06").unwrap();
     let _ = read_until(&mut terminal, "a界b", Duration::from_secs(3));
     terminal.write_all(b"\x04").unwrap();
-    let deleted = read_until(&mut terminal, "› ab", Duration::from_secs(3));
-    assert!(deleted.contains("› ab"));
+    let deleted = read_until(&mut terminal, "❯ ab", Duration::from_secs(3));
+    assert!(deleted.contains("❯ ab"));
     assert!(child.try_wait().unwrap().is_none());
 
     terminal.write_all(b"\x03").unwrap();
@@ -441,7 +523,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
     let settings = r#"{"models":[{"value":"model-a","displayName":"Model A","description":"Primary"},{"value":"model-b","displayName":"Model B","description":"Fallback"}]}"#;
     let (mut child, mut terminal) =
         spawn_terminal_with_args(&[], &["--model", "model-b", "--settings", settings]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     let palette = open_slash_palette(&mut terminal);
     assert_no_bare_line_feeds(palette.as_bytes());
@@ -500,7 +582,7 @@ fn slash_palette_and_model_picker_follow_interactive_command_flow() {
 fn theme_picker_previews_without_persisting_on_escape() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"/theme\r").unwrap();
     let initial = read_until(&mut terminal, "Preview · demo.rs", Duration::from_secs(3));
@@ -537,7 +619,7 @@ fn theme_picker_previews_without_persisting_on_escape() {
 fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal
         .write_all(b"/statusline grep -o '\"permissionMode\":\"[^\"]*\"'\r")
@@ -579,7 +661,7 @@ fn status_line_refreshes_while_composer_is_idle_after_mode_change() {
 fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"inspect @src/ter").unwrap();
     let palette = read_until(&mut terminal, "@src/terminal.rs", Duration::from_secs(5));
@@ -593,7 +675,7 @@ fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
         Duration::from_secs(3),
     );
     assert!(accepted.contains("inspect @src/terminal.rs"));
-    assert!(!accepted.contains("› inspect @src/terminal.rs\r\n\r\n"));
+    assert!(!accepted.contains("❯ inspect @src/terminal.rs\r\n\r\n"));
     assert!(child.try_wait().unwrap().is_none());
 
     terminal.write_all(b"\x03").unwrap();
@@ -606,26 +688,26 @@ fn file_typeahead_accepts_selection_without_submitting_the_prompt() {
 fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"/permissions\r").unwrap();
     let permissions = read_until(&mut terminal, "Workspace", Duration::from_secs(3));
     assert!(permissions.contains("Allow"));
     assert!(permissions.contains("Workspace"));
     terminal.write_all(b"\x1b").unwrap();
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
 
     terminal.write_all(b"/config\r").unwrap();
     let settings = read_until(&mut terminal, "Syntax highlighting", Duration::from_secs(3));
     assert!(settings.contains("Syntax highlighting"));
     terminal.write_all(b"\x1b").unwrap();
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
 
     terminal.write_all(b"/tasks\r").unwrap();
     let tasks = read_until(&mut terminal, "No background tasks", Duration::from_secs(3));
     assert!(tasks.contains("No background tasks"));
     terminal.write_all(b"\x1b").unwrap();
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
 
     terminal.write_all(b"\x03").unwrap();
     let _ = read_until(
@@ -641,12 +723,12 @@ fn interactive_management_commands_open_real_dialogs_and_return_to_composer() {
 fn composer_history_stash_multiline_and_transcript_shortcuts_are_live() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"/status\r").unwrap();
     let status = read_until(&mut terminal, "Session status:", Duration::from_secs(3));
-    if !status.contains("/ commands") {
-        let _ = read_until(&mut terminal, "/ commands", Duration::from_secs(3));
+    if !status.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     terminal.write_all(b"\x12").unwrap();
     let search = read_until(&mut terminal, "reverse-i-search", Duration::from_secs(3));
@@ -716,14 +798,14 @@ fn direct_shell_mode_uses_the_tool_path_and_returns_output_to_the_model() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     terminal.write_all(b"! pwd\r").unwrap();
     let output = read_until(&mut terminal, "SHELL_MODE_OK", Duration::from_secs(10));
     assert!(output.contains("$ pwd"));
     assert!(!output.contains("Permission required"));
 
-    if !output.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !output.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
@@ -793,14 +875,10 @@ fn active_turn_btw_answers_without_interrupting_or_mutating_the_main_queue() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"main objective\r").unwrap();
-    let active = read_until(
-        &mut terminal,
-        "/btw asks separately",
-        Duration::from_secs(5),
-    );
+    let active = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(5));
     assert_no_bare_line_feeds(active.as_bytes());
     terminal
         .write_all(b"/btw what is the active objective?\r")
@@ -839,8 +917,8 @@ fn active_turn_btw_answers_without_interrupting_or_mutating_the_main_queue() {
     let queued_answer = read_until(&mut terminal, "QUEUED_TURN_DONE", Duration::from_secs(10));
     assert!(queued_answer.contains("MAIN_TURN_DONE"));
 
-    if !queued_answer.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !queued_answer.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
@@ -889,7 +967,7 @@ fn active_turn_terminal_panel_suspends_and_restores_without_cancelling_the_turn(
     let shell_env = format!("SHELL={}", shell.display());
     let path_env = format!("PATH={}", programs.path().display());
     let (mut child, mut terminal) = spawn_terminal(&[&base_url, &shell_env, &path_env]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     terminal
         .write_all(b"/config terminalPanelEnabled=true\r")
         .unwrap();
@@ -898,13 +976,13 @@ fn active_turn_terminal_panel_suspends_and_restores_without_cancelling_the_turn(
         "Updated UI setting terminalPanelEnabled.",
         Duration::from_secs(3),
     );
-    if !configured.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !configured.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"keep the main turn alive\r").unwrap();
-    let active = read_until(&mut terminal, "Alt+J terminal", Duration::from_secs(5));
-    assert!(active.contains("/btw asks separately"), "{active}");
+    let active = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(5));
+    assert!(active.contains("esc to interrupt"), "{active}");
 
     terminal.write_all(b"\x1bj").unwrap();
     let shell_output = read_until(
@@ -930,8 +1008,8 @@ fn active_turn_terminal_panel_suspends_and_restores_without_cancelling_the_turn(
     assert!(completed.contains("ACTIVE_PANEL_TURN_DONE"));
     assert!(child.try_wait().unwrap().is_none());
 
-    if !completed.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !completed.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();
@@ -966,19 +1044,15 @@ fn active_turn_composer_ctrl_c_interrupts_and_returns_to_idle_input() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"cancel this active turn\r").unwrap();
-    let _ = read_until(
-        &mut terminal,
-        "/btw asks separately",
-        Duration::from_secs(5),
-    );
+    let _ = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(5));
     request_ready_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("active request was not fully received before interrupt");
     terminal.write_all(b"\x03").unwrap();
-    let interrupted = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let interrupted = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     assert!(interrupted.contains("Interrupted"));
     assert!(!interrupted.contains("MUST_NOT_COMMIT"));
 
@@ -1029,15 +1103,15 @@ fn fullscreen_active_turn_keeps_btw_composer_live() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     terminal.write_all(b"/tui fullscreen\r").unwrap();
     let entered = read_until(
         &mut terminal,
         "TUI mode: fullscreen",
         Duration::from_secs(3),
     );
-    if !entered.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !entered.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
 
@@ -1048,11 +1122,7 @@ fn fullscreen_active_turn_keeps_btw_composer_live() {
         Duration::from_secs(3),
     );
     terminal.write_all(b"\r").unwrap();
-    let _ = read_until(
-        &mut terminal,
-        "/btw asks separately",
-        Duration::from_secs(5),
-    );
+    let _ = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(5));
     terminal.write_all(b"/btw answer in fullscreen").unwrap();
     let _ = read_until(
         &mut terminal,
@@ -1112,7 +1182,7 @@ fn idle_terminal_notification_cancels_on_activity_and_rearms_after_next_turn() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal
         .write_all(b"/config preferredNotifChannel=iterm2\r")
@@ -1133,11 +1203,11 @@ fn idle_terminal_notification_cancels_on_activity_and_rearms_after_next_turn() {
 
     terminal.write_all(b"first idle turn\r").unwrap();
     let first = read_until(&mut terminal, "FIRST_IDLE_TURN", Duration::from_secs(10));
-    if !first.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !first.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     terminal.write_all(b"x").unwrap();
-    let _ = read_until(&mut terminal, "› x", Duration::from_secs(3));
+    let _ = read_until(&mut terminal, "❯ x", Duration::from_secs(3));
     let cancelled_window = read_available(&mut terminal, Duration::from_millis(1_300));
     assert!(
         !cancelled_window.contains("\x1b]9;"),
@@ -1148,8 +1218,8 @@ fn idle_terminal_notification_cancels_on_activity_and_rearms_after_next_turn() {
 
     terminal.write_all(b"second idle turn\r").unwrap();
     let second = read_until(&mut terminal, "SECOND_IDLE_TURN", Duration::from_secs(10));
-    if !second.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !second.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     let notification = read_until(
         &mut terminal,
@@ -1199,12 +1269,12 @@ fn interactive_prompt_suggestion_cancels_stale_work_rearms_and_accepts() {
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) =
         spawn_terminal_with_args(&[&base_url], &["--prompt-suggestions"]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"first turn\r").unwrap();
     let first = read_until(&mut terminal, "FIRST_TURN_DONE", Duration::from_secs(10));
-    if !first.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !first.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     let accepted_first_suggestion_request = Instant::now();
     while requests.lock().unwrap().len() < 2 {
@@ -1215,7 +1285,7 @@ fn interactive_prompt_suggestion_cancels_stale_work_rearms_and_accepts() {
         thread::sleep(Duration::from_millis(10));
     }
     terminal.write_all(b"x").unwrap();
-    let typed = read_until(&mut terminal, "› x", Duration::from_secs(3));
+    let typed = read_until(&mut terminal, "❯ x", Duration::from_secs(3));
     assert!(!typed.contains("run the tests"));
     let stale_window = read_available(&mut terminal, Duration::from_millis(1_700));
     assert!(
@@ -1291,13 +1361,13 @@ fn permission_interrupt_rolls_back_turn_and_returns_to_composer() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     terminal.write_all(b"run command\r").unwrap();
     let mut output = read_until(&mut terminal, "Permission required", Duration::from_secs(5));
     terminal.write_all(b"\x03").unwrap();
     output.push_str(&read_until(
         &mut terminal,
-        "Shift+Tab mode",
+        "? for shortcuts",
         Duration::from_secs(5),
     ));
     assert!(output.contains("Interrupted"));
@@ -1337,7 +1407,7 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
     });
     let base_url = format!("HARNESS_BASE_URL=http://{address}");
     let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
-    let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(5));
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
     terminal.write_all(b"repeat exact action\r").unwrap();
     let mut output = read_until(&mut terminal, "Permission required", Duration::from_secs(5));
     terminal.write_all(b"s").unwrap();
@@ -1349,8 +1419,8 @@ fn exact_session_permission_is_reused_without_a_second_prompt() {
     assert_eq!(output.matches("Permission required").count(), 1);
     assert!(output.contains("Allowed exact action for this session"));
 
-    if !output.contains("Shift+Tab mode") {
-        let _ = read_until(&mut terminal, "Shift+Tab mode", Duration::from_secs(3));
+    if !output.contains("? for shortcuts") {
+        let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3));
     }
     wait_for_raw_mode(&terminal, Duration::from_secs(2));
     terminal.write_all(b"\x03").unwrap();

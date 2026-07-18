@@ -115,7 +115,9 @@ pub enum QueryEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
-    TurnFinished,
+    TurnFinished {
+        usage: SessionUsage,
+    },
     TurnInterrupted,
     TurnFailed {
         message: String,
@@ -442,6 +444,7 @@ impl QueryEngine {
             bail!("归一化后的用户消息超过 {MAX_USER_CONTENT_BYTES} 字节限制")
         }
         validate_direct_user_content(&content)?;
+        let usage_checkpoint = self.usage.clone();
         self.emit(QueryEvent::TurnStarted);
         let file_checkpoint = if self.tool_context.agent_depth() == 0 {
             match user_message_id {
@@ -555,7 +558,9 @@ impl QueryEngine {
                 if hot_refresh_file_transaction {
                     self.tool_context.finish_hot_refresh_file_transaction()?;
                 }
-                self.emit(QueryEvent::TurnFinished);
+                self.emit(QueryEvent::TurnFinished {
+                    usage: self.usage.saturating_sub(&usage_checkpoint),
+                });
                 Ok(Some(result))
             }
             Some(Err(mut error)) => {

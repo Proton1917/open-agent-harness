@@ -118,6 +118,8 @@ pub struct UiSettings {
     #[serde(default = "default_true")]
     pub syntax_highlighting: bool,
     #[serde(default)]
+    pub verbose: bool,
+    #[serde(default)]
     pub prompt_suggestion_enabled: bool,
     /// Explicit local replacement for the source build's remote experiment flag.
     #[serde(default)]
@@ -144,6 +146,7 @@ impl Default for UiSettings {
             theme: ThemePreset::default(),
             copy_on_select: true,
             syntax_highlighting: true,
+            verbose: false,
             prompt_suggestion_enabled: false,
             terminal_panel_enabled: false,
             preferred_notif_channel: NotificationChannel::default(),
@@ -202,6 +205,11 @@ impl UiSettings {
                 next.syntax_highlighting = value
                     .parse::<bool>()
                     .context("syntaxHighlighting must be true or false")?;
+            }
+            "verbose" => {
+                next.verbose = value
+                    .parse::<bool>()
+                    .context("verbose must be true or false")?;
             }
             "promptSuggestionEnabled" => {
                 next.prompt_suggestion_enabled = value
@@ -417,6 +425,10 @@ pub const UI_SETTING_REGISTRY: &[UiSettingSpec] = &[
     },
     UiSettingSpec {
         key: "syntaxHighlighting",
+        value_kind: UiSettingValueKind::Boolean,
+    },
+    UiSettingSpec {
+        key: "verbose",
         value_kind: UiSettingValueKind::Boolean,
     },
     UiSettingSpec {
@@ -847,6 +859,7 @@ mod tests {
             theme: ThemePreset::DarkDaltonized,
             copy_on_select: false,
             syntax_highlighting: false,
+            verbose: true,
             prompt_suggestion_enabled: true,
             terminal_panel_enabled: true,
             preferred_notif_channel: NotificationChannel::Ghostty,

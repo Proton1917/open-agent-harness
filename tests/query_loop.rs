@@ -123,7 +123,11 @@ async fn query_engine_round_trips_tool_use_and_result() {
         event,
         QueryEvent::ToolFinished { name, is_error: false, .. } if name == "Read"
     )));
-    assert!(matches!(events.last(), Some(QueryEvent::TurnFinished)));
+    assert!(matches!(
+        events.last(),
+        Some(QueryEvent::TurnFinished { usage })
+            if usage.input_tokens == 25 && usage.output_tokens == 10
+    ));
     drop(events);
 
     let requests = requests.lock().unwrap();

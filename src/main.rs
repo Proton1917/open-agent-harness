@@ -1316,6 +1316,7 @@ async fn run(
     let mut interactive_outcome = async {
         let status_line_runner = StatusLineRunner::default();
         ui.set_syntax_highlighting(ui_settings.syntax_highlighting);
+        ui.set_verbose(ui_settings.verbose);
         ui.set_trusted_roots(command_context.trusted_roots());
         if enhanced_terminal {
             ui.replace_fullscreen_transcript(&transcript_lines(&engine.messages))?;
@@ -2587,7 +2588,7 @@ async fn run(
                         }
                         println!("{}", serde_json::to_string_pretty(&ui_settings)?);
                         println!(
-                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, promptSuggestionEnabled, preferredNotifChannel, messageIdleNotifThresholdMs, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
+                            "Mutable keys: editorMode, tuiMode, theme, copyOnSelect, syntaxHighlighting, verbose, promptSuggestionEnabled, terminalPanelEnabled, preferredNotifChannel, messageIdleNotifThresholdMs, outputStyle, statusLine, statusLine.command, statusLine.padding, statusLine.refreshInterval, statusLine.hideVimModeIndicator, permissionRules"
                         );
                         continue;
                     }
@@ -4356,14 +4357,14 @@ fn emit_query_event(
             "uuid":Uuid::new_v4(),
             "session_id":session_id
         })),
-        QueryEvent::TurnFinished if include_partial => Some(json!({
+        QueryEvent::TurnFinished { .. } if include_partial => Some(json!({
             "type":"system", "subtype":"status", "status":Value::Null,
             "uuid":Uuid::new_v4(), "session_id":session_id
         })),
         QueryEvent::TurnStarted
         | QueryEvent::RequestStarted { .. }
         | QueryEvent::RequestRetry { .. }
-        | QueryEvent::TurnFinished => None,
+        | QueryEvent::TurnFinished { .. } => None,
     };
     if let Some(message) = message {
         let message = open_agent_harness::session::sanitize_transport_value(&message, cwd);
@@ -8707,6 +8708,13 @@ fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> Sett
             value: SettingValue::Boolean(settings.syntax_highlighting),
         },
         SettingItem {
+            key: "verbose".to_owned(),
+            label: "Verbose output".to_owned(),
+            description: "Show elapsed time alongside the always-live response token count"
+                .to_owned(),
+            value: SettingValue::Boolean(settings.verbose),
+        },
+        SettingItem {
             key: "promptSuggestionEnabled".to_owned(),
             label: "Prompt suggestions".to_owned(),
             description: "Predict one tool-free next prompt after completed turns".to_owned(),
@@ -9558,6 +9566,7 @@ fn apply_ui_runtime(
         PersistedTuiMode::Fullscreen => TuiMode::Fullscreen,
     })?;
     ui.set_syntax_highlighting(settings.syntax_highlighting);
+    ui.set_verbose(settings.verbose);
     Ok(())
 }
 

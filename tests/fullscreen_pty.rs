@@ -31,7 +31,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     let _ = read_until(
         &mut terminal,
         &mut pending_output,
-        "Shift+Tab mode",
+        "? for shortcuts",
         Duration::from_secs(5),
     );
     wait_for_raw_mode(&mut terminal, Duration::from_secs(2));
@@ -106,7 +106,7 @@ fn fullscreen_tui_scrolls_and_restores_the_primary_screen() {
     let resumed = read_until(
         &mut terminal,
         &mut pending_output,
-        "Shift+Tab mode",
+        "? for shortcuts",
         INTERACTION_TIMEOUT,
     );
     assert!(

@@ -49,6 +49,7 @@ use crate::{
         PermissionManagerDialog, SettingsDialog, SettingsDialogAction, TaskDialog,
         TaskDialogAction,
     },
+    types::SessionUsage,
     ui_settings::ThemePreset,
     vim::{VimAction, VimEvent, VimKey, VimMode, VimState},
     workspace_search::{
@@ -150,6 +151,12 @@ pub struct ConversationUi {
 struct OutputState {
     assistant_open: bool,
     status_open: bool,
+    turn_started_at: Option<Instant>,
+    last_turn_duration: Option<Duration>,
+    response_chars: usize,
+    pending_stream_chars: usize,
+    last_turn_usage: SessionUsage,
+    verbose: bool,
     fullscreen: FullscreenState,
     fullscreen_guard: Option<AlternateScreenGuard>,
     fullscreen_header: String,
@@ -192,6 +199,12 @@ impl Default for OutputState {
         Self {
             assistant_open: false,
             status_open: false,
+            turn_started_at: None,
+            last_turn_duration: None,
+            response_chars: 0,
+            pending_stream_chars: 0,
+            last_turn_usage: SessionUsage::default(),
+            verbose: false,
             fullscreen: FullscreenState::new(24, 80, 1, FullscreenLimits::default()),
             fullscreen_guard: None,
             fullscreen_header: "open-agent-harness".to_owned(),
@@ -404,6 +417,27 @@ impl ConversationUi {
         });
         state.markdown_committed_lines = 0;
         state.final_markdown = None;
+    }
+
+    pub fn set_verbose(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .verbose = enabled;
+    }
+
+    fn footer_token_usage(&self) -> Option<u64> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_turn_duration.map(|_| {
+            if state.last_turn_usage.output_tokens > 0 {
+                state.last_turn_usage.output_tokens
+            } else {
+                estimated_response_tokens(state.response_chars) as u64
+            }
+        })
     }
 
     pub fn set_trusted_roots(&self, roots: Vec<PathBuf>) {
@@ -763,7 +797,7 @@ impl ConversationUi {
         &self,
         model: &str,
         cwd: &std::path::Path,
-        session: uuid::Uuid,
+        _session: uuid::Uuid,
         mode: PermissionMode,
     ) -> Result<()> {
         if self.fullscreen_active() {
@@ -773,9 +807,8 @@ impl ConversationUi {
             return Ok(());
         }
         let width = terminal::size()
-            .map(|(width, _)| usize::from(width).clamp(42, 92))
-            .unwrap_or(72);
-        let rule = "─".repeat(width.saturating_sub(2));
+            .map(|(width, _)| usize::from(width).max(20))
+            .unwrap_or(80);
         let accent = self
             .inner
             .lock()
@@ -785,6 +818,9 @@ impl ConversationUi {
             .and_then(prompt_color_value)
             .unwrap_or(Color::Cyan);
         let mut out = io::stdout().lock();
+        let text_width = width.saturating_sub(5).max(10);
+        let cwd = compact_display_path(cwd, text_width);
+        queue!(out, Print(RAW_LINE_END))?;
         if self.color {
             queue!(
                 out,
@@ -792,30 +828,37 @@ impl ConversationUi {
                 SetAttribute(Attribute::Bold)
             )?;
         }
-        queue!(out, Print(format!("╭{rule}╮\n")))?;
-        write_box_line(
-            &mut out,
-            &format!("  open-agent-harness  v{}", env!("CARGO_PKG_VERSION")),
-            width,
-        )?;
+        queue!(out, Print("  ◈  "))?;
         if self.color {
             queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
         }
-        write_field(&mut out, "model", model, width)?;
-        write_field(&mut out, "cwd", &cwd.display().to_string(), width)?;
-        write_field(&mut out, "session", &session.to_string(), width)?;
-        write_field(&mut out, "mode", mode_label(mode), width)?;
+        queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            Print("open-agent-harness"),
+            SetAttribute(Attribute::Reset),
+            Print(format!(" v{}", env!("CARGO_PKG_VERSION"))),
+            Print(RAW_LINE_END)
+        )?;
         if self.color {
             queue!(out, SetForegroundColor(Color::DarkGrey))?;
         }
-        queue!(out, Print(format!("╰{rule}╯\n")))?;
+        queue!(
+            out,
+            Print("     "),
+            Print(visible_line(
+                &format!("{} · {}", model, mode_label(mode)),
+                text_width,
+            )),
+            Print(RAW_LINE_END),
+            Print("     "),
+            Print(cwd),
+            Print(RAW_LINE_END),
+            Print(RAW_LINE_END)
+        )?;
         if self.color {
             queue!(out, ResetColor)?;
         }
-        queue!(
-            out,
-            Print("  /help for commands · Shift+Tab changes mode\n\n")
-        )?;
         out.flush()?;
         Ok(())
     }
@@ -846,6 +889,20 @@ impl ConversationUi {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match event {
+            QueryEvent::TurnStarted => {
+                state.turn_started_at = Some(Instant::now());
+                state.last_turn_duration = None;
+                state.response_chars = 0;
+                state.pending_stream_chars = 0;
+            }
+            QueryEvent::AssistantMessage { display_text, .. } => {
+                let display_chars = display_text.chars().count();
+                state.response_chars = state
+                    .response_chars
+                    .saturating_sub(state.pending_stream_chars)
+                    .saturating_add(state.pending_stream_chars.max(display_chars));
+                state.pending_stream_chars = 0;
+            }
             QueryEvent::ToolStarted { id, name, .. } => {
                 state
                     .active_tools
@@ -854,9 +911,17 @@ impl ConversationUi {
             QueryEvent::ToolFinished { id, .. } => {
                 state.active_tools.remove(id);
             }
-            QueryEvent::TurnFinished
-            | QueryEvent::TurnInterrupted
-            | QueryEvent::TurnFailed { .. } => state.active_tools.clear(),
+            QueryEvent::TurnFinished { usage } => {
+                state.active_tools.clear();
+                state.last_turn_duration = state.turn_started_at.take().map(|at| at.elapsed());
+                state.last_turn_usage = usage.clone();
+                state.pending_stream_chars = 0;
+            }
+            QueryEvent::TurnInterrupted | QueryEvent::TurnFailed { .. } => {
+                state.active_tools.clear();
+                state.turn_started_at = None;
+                state.pending_stream_chars = 0;
+            }
             _ => {}
         }
         if matches!(
@@ -913,6 +978,7 @@ impl ConversationUi {
                 state.status_open = true;
             }
             QueryEvent::AssistantMessage { .. } => {
+                clear_status(&mut out, &mut state);
                 let rendered = state.final_markdown.take().unwrap_or_default();
                 let start = state.markdown_committed_lines.min(rendered.lines.len());
                 if start < rendered.lines.len() {
@@ -997,9 +1063,19 @@ impl ConversationUi {
                     &format!("  ✓ Context {before_tokens} → {after_tokens} estimated tokens"),
                 );
             }
-            QueryEvent::TurnFinished => {
+            QueryEvent::TurnFinished { .. } => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
+                if let Some(duration) = state
+                    .last_turn_duration
+                    .filter(|duration| *duration > Duration::from_secs(30))
+                {
+                    let _ = muted_line(
+                        &mut out,
+                        self.color,
+                        &format!("  ✻ Worked for {}", format_duration(duration.as_millis())),
+                    );
+                }
                 let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::TurnInterrupted => {
@@ -1036,7 +1112,6 @@ impl ConversationUi {
     fn start_progress(&self, label: String, generation: u64) {
         let ui = self.clone();
         std::thread::spawn(move || {
-            let started = Instant::now();
             let frames = ["◐", "◓", "◑", "◒"];
             let mut frame = 0usize;
             loop {
@@ -1044,23 +1119,13 @@ impl ConversationUi {
                 if ui.progress_epoch.load(Ordering::Acquire) != generation {
                     break;
                 }
-                let elapsed = started.elapsed();
-                let stalled = (elapsed >= Duration::from_secs(30)).then_some(" · waiting");
-                ui.tick_progress(
-                    &format!(
-                        "{} {label} · {:.1}s{}",
-                        frames[frame % frames.len()],
-                        elapsed.as_secs_f64(),
-                        stalled.unwrap_or_default()
-                    ),
-                    generation,
-                );
+                ui.tick_progress(&label, frames[frame % frames.len()], generation);
                 frame = frame.saturating_add(1);
             }
         });
     }
 
-    fn tick_progress(&self, label: &str, generation: u64) {
+    fn tick_progress(&self, label: &str, glyph: &str, generation: u64) {
         if self.progress_epoch.load(Ordering::Acquire) != generation {
             return;
         }
@@ -1071,26 +1136,44 @@ impl ConversationUi {
         if self.progress_epoch.load(Ordering::Acquire) != generation {
             return;
         }
+        let elapsed = state
+            .turn_started_at
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        let show_elapsed = state.verbose || elapsed > Duration::from_secs(30);
+        let estimated_tokens = estimated_response_tokens(state.response_chars);
+        let metrics = if show_elapsed {
+            format!(
+                " ({} · ↓ {estimated_tokens} tokens)",
+                format_duration(elapsed.as_millis())
+            )
+        } else {
+            format!(" (↓ {estimated_tokens} tokens)")
+        };
+        let status = format!("{label}…{metrics}");
         if state.fullscreen_guard.is_some() {
-            state.fullscreen.set_status(Some(label));
+            state
+                .fullscreen
+                .set_status(Some(&format!("{glyph} {status}")));
             let _ = render_fullscreen_locked(&mut state, None);
             return;
         }
         let mut out = io::stdout().lock();
         let _ = suspend_inline_active_turn_input(&mut out, &mut state);
         clear_status(&mut out, &mut state);
-        let _ = styled_status(&mut out, self.color, label);
+        let _ = styled_status_frame(&mut out, self.color, glyph, &status);
         state.status_open = true;
         let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
     }
 
     pub fn text_delta(&self, delta: &str) {
-        self.progress_epoch.fetch_add(1, Ordering::AcqRel);
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delta_chars = delta.chars().count();
+        state.response_chars = state.response_chars.saturating_add(delta_chars);
+        state.pending_stream_chars = state.pending_stream_chars.saturating_add(delta_chars);
         let frame = append_bounded_fullscreen_stream(&mut state, delta);
         if state.fullscreen_guard.is_some() {
             let _ = render_fullscreen_locked(&mut state, None);
@@ -1214,7 +1297,7 @@ fn render_active_turn_input_frame(
     color: bool,
 ) -> Result<Vec<u8>> {
     let columns = terminal::size().map_or(80, |(columns, _)| usize::from(columns).max(1));
-    let prefix = if columns >= 2 { "› " } else { "›" };
+    let prefix = if columns >= 2 { "❯ " } else { "❯" };
     let prefix_width = UnicodeWidthStr::width(prefix);
     let available = columns.saturating_sub(prefix_width);
     let cursor_byte = cursor_byte.min(buffer.len());
@@ -1391,6 +1474,7 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
             single_line(reason, 80)
         ))),
         QueryEvent::AssistantMessage { display_text, .. } => {
+            state.fullscreen.set_status(None);
             state.markdown_stream.replace(display_text);
             let rendered = state.markdown_stream.finish();
             state.final_markdown = Some(rendered.clone());
@@ -1501,9 +1585,18 @@ fn apply_fullscreen_event(state: &mut OutputState, event: &QueryEvent) {
                 "✓ Context {before_tokens} → {after_tokens} estimated tokens"
             ));
         }
-        QueryEvent::TurnFinished => {
+        QueryEvent::TurnFinished { .. } => {
             finish_fullscreen_stream(state);
             state.fullscreen.set_status(None);
+            if let Some(duration) = state
+                .last_turn_duration
+                .filter(|duration| *duration > Duration::from_secs(30))
+            {
+                state.fullscreen.push_message(&format!(
+                    "✻ Worked for {}",
+                    format_duration(duration.as_millis())
+                ));
+            }
         }
         QueryEvent::TurnInterrupted => {
             finish_fullscreen_stream(state);
@@ -2009,7 +2102,7 @@ pub struct ActiveTurnInput {
 }
 
 impl ActiveTurnInput {
-    pub fn begin(ui: ConversationUi, terminal_panel_enabled: bool) -> Result<Self> {
+    pub fn begin(ui: ConversationUi, _terminal_panel_enabled: bool) -> Result<Self> {
         let raw_guard = RawModeGuard::enter()?;
         let handle = ActiveTurnInputHandle {
             state: Arc::downgrade(&ui.inner),
@@ -2032,11 +2125,7 @@ impl ActiveTurnInput {
             raw_guard: Some(raw_guard),
             buffer: String::new(),
             cursor_byte: 0,
-            hint: if terminal_panel_enabled {
-                "Agent working · /btw asks separately · Enter queues · Alt+J terminal".to_owned()
-            } else {
-                "Agent working · /btw asks separately · Enter queues".to_owned()
-            },
+            hint: "esc to interrupt".to_owned(),
             fullscreen_wheel_epoch: Instant::now(),
             active: true,
         };
@@ -4743,6 +4832,10 @@ impl InputEditor {
                         format!("{display_hint} · {attachments}")
                     };
                 }
+                let token_usage = self
+                    .ui
+                    .as_ref()
+                    .and_then(ConversationUi::footer_token_usage);
                 let render_state = InputRenderState {
                     buffer: &buffer,
                     cursor_byte,
@@ -4759,6 +4852,7 @@ impl InputEditor {
                     task_count: live_task_count,
                     status_line: live_status_line.as_deref(),
                     prompt_suggestion: live_prompt_suggestion.as_deref(),
+                    token_usage,
                     theme,
                     vim_mode,
                     vim_selection,
@@ -6771,6 +6865,7 @@ struct InputRenderState<'a> {
     task_count: usize,
     status_line: Option<&'a str>,
     prompt_suggestion: Option<&'a str>,
+    token_usage: Option<u64>,
     theme: ThemePreset,
     vim_mode: Option<VimMode>,
     vim_selection: Option<(usize, usize, bool)>,
@@ -6866,6 +6961,7 @@ impl RenderedInput {
             task_count,
             status_line,
             prompt_suggestion,
+            token_usage,
             theme,
             vim_mode,
             vim_selection,
@@ -6948,7 +7044,7 @@ impl RenderedInput {
             .take(visible_end.saturating_sub(visible_start))
         {
             let prefix = if index == 0 {
-                "› "
+                "❯ "
             } else if index == visible_start && visible_start > 0 {
                 "⋮ "
             } else {
@@ -6997,12 +7093,7 @@ impl RenderedInput {
         queue!(out, Print(&rule), Print(RAW_LINE_END))?;
         let mut footer = if wrapped_rows.len() > visible_limit {
             if hint.is_empty() {
-                format!(
-                    "  {} · line {}/{} · Shift+Tab mode · Ctrl+J newline",
-                    mode_label(mode),
-                    active_line + 1,
-                    logical_line_count
-                )
+                format!("  line {}/{}", active_line + 1, logical_line_count)
             } else {
                 format!("  {hint} · line {}/{}", active_line + 1, logical_line_count)
             }
@@ -7010,7 +7101,7 @@ impl RenderedInput {
             if let Some(status_line) = status_line {
                 format!("  {hint} · {}", plain_status_line(status_line))
             } else {
-                format!("  {hint} · Shift+Tab mode · Shift+Enter/Ctrl+J newline")
+                format!("  {hint}")
             }
         } else if show_prompt_suggestion {
             "  Suggested next prompt · Enter send · Tab/→ edit · type dismiss".to_owned()
@@ -7020,11 +7111,10 @@ impl RenderedInput {
             "  shell · permission checked · Enter run · Esc cancel · Tab history".to_owned()
         } else if let Some(argument_hint) = argument_hint {
             format!("  {argument_hint}")
+        } else if mode == PermissionMode::Default {
+            "  ? for shortcuts".to_owned()
         } else {
-            format!(
-                "  {} · Shift+Tab mode · Shift+Enter/Ctrl+J newline · / commands",
-                mode_label(mode)
-            )
+            format!("  {} on (shift+tab to cycle)", mode_label(mode))
         };
         if task_count > 0 && todos.is_none() {
             let task_status = format!(
@@ -7038,6 +7128,7 @@ impl RenderedInput {
                 format!("{footer} · {task_status}")
             };
         }
+        footer = prompt_footer_line(&footer, token_usage, width.saturating_sub(1));
         let rendered_suggestions = if !file_suggestions.is_empty() {
             let count = suggestion_limit.min(height.saturating_sub(3).max(1));
             let start = selected_file_suggestion
@@ -7756,30 +7847,33 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn write_field(out: &mut impl Write, label: &str, value: &str, width: usize) -> io::Result<()> {
-    let available = width.saturating_sub(14);
-    let value = visible_line(value, available);
-    write_box_line(out, &format!("  {label:<8} {value}"), width)
+fn compact_display_path(path: &Path, width: usize) -> String {
+    let mut display = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(relative) = path.strip_prefix(home) {
+            display = if relative.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{}", relative.display())
+            };
+        }
+    }
+    visible_line(&display, width)
 }
 
-fn write_box_line(out: &mut impl Write, content: &str, width: usize) -> io::Result<()> {
-    let inner = width.saturating_sub(2);
-    let content = visible_line(content, inner);
-    let padding = inner.saturating_sub(UnicodeWidthStr::width(content.as_str()));
-    queue!(
-        out,
-        Print("│"),
-        Print(content),
-        Print(" ".repeat(padding)),
-        Print("│\n")
-    )
+fn assistant_bullet() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⏺"
+    } else {
+        "●"
+    }
 }
 
 fn print_committed_prompt(out: &mut impl Write, text: &str) -> Result<()> {
     if std::env::var_os("NO_COLOR").is_none() {
         queue!(out, SetForegroundColor(Color::DarkGrey))?;
     }
-    queue!(out, Print("› "))?;
+    queue!(out, Print("❯ "))?;
     if std::env::var_os("NO_COLOR").is_none() {
         queue!(out, ResetColor)?;
     }
@@ -7817,17 +7911,7 @@ fn write_assistant_markdown_lines(
         return Ok(());
     }
     if !*assistant_open {
-        if color {
-            queue!(
-                out,
-                SetForegroundColor(Color::Cyan),
-                SetAttribute(Attribute::Bold)
-            )?;
-        }
-        queue!(out, Print("◆ "))?;
-        if color {
-            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-        }
+        queue!(out, Print(assistant_bullet()), Print(" "))?;
         *assistant_open = true;
     } else {
         queue!(out, Print(RAW_LINE_END))?;
@@ -7917,10 +8001,19 @@ fn close_assistant(out: &mut impl Write, state: &mut OutputState) {
 }
 
 fn styled_status(out: &mut impl Write, color: bool, label: &str) -> io::Result<()> {
+    styled_status_frame(out, color, "◐", label)
+}
+
+fn styled_status_frame(
+    out: &mut impl Write,
+    color: bool,
+    glyph: &str,
+    label: &str,
+) -> io::Result<()> {
     if color {
         queue!(out, SetForegroundColor(Color::DarkGrey))?;
     }
-    queue!(out, Print(format!("  ◐ {label}")))?;
+    queue!(out, Print(format!("  {glyph} {label}")))?;
     if color {
         queue!(out, ResetColor)?;
     }
@@ -7969,6 +8062,26 @@ fn plain_status_line(value: &str) -> String {
 fn single_line(value: &str, limit: usize) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     visible_line(&sanitize_inline(&collapsed), limit)
+}
+
+fn prompt_footer_line(left: &str, token_usage: Option<u64>, width: usize) -> String {
+    let Some(tokens) = token_usage else {
+        return visible_line(left, width);
+    };
+    let right = format!("↓ {tokens} tokens");
+    let left_width = UnicodeWidthStr::width(left);
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    if left_width.saturating_add(right_width).saturating_add(1) > width {
+        return visible_line(&format!("{left} · {right}"), width);
+    }
+    format!(
+        "{left}{}{right}",
+        " ".repeat(width.saturating_sub(left_width + right_width))
+    )
+}
+
+fn estimated_response_tokens(response_chars: usize) -> usize {
+    response_chars.saturating_add(2) / 4
 }
 
 fn visible_line(value: &str, limit: usize) -> String {
@@ -8571,6 +8684,24 @@ mod tests {
     }
 
     #[test]
+    fn live_response_tokens_follow_source_rounding_and_footer_alignment() {
+        assert_eq!(estimated_response_tokens(0), 0);
+        assert_eq!(estimated_response_tokens(1), 0);
+        assert_eq!(estimated_response_tokens(2), 1);
+        assert_eq!(estimated_response_tokens(6), 2);
+        assert_eq!(estimated_response_tokens(40), 10);
+
+        let footer = prompt_footer_line("  ? for shortcuts", Some(7), 40);
+        assert!(footer.starts_with("  ? for shortcuts"), "{footer:?}");
+        assert!(footer.ends_with("↓ 7 tokens"), "{footer:?}");
+        assert_eq!(UnicodeWidthStr::width(footer.as_str()), 40);
+
+        let narrow = prompt_footer_line("  ? for shortcuts", Some(123), 20);
+        assert_eq!(UnicodeWidthStr::width(narrow.as_str()), 20);
+        assert!(narrow.contains("tokens") || narrow.ends_with('…'));
+    }
+
+    #[test]
     fn exit_confirmation_is_key_specific_and_bounded() {
         let started = Instant::now();
         for key in [ExitKey::CtrlC, ExitKey::CtrlD] {
@@ -9032,6 +9163,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9072,6 +9204,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: Some("run the tests"),
+                    token_usage: None,
                     theme: ThemePreset::Dark,
                     vim_mode: None,
                     vim_selection: None,
@@ -9104,6 +9237,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: Some("run the tests"),
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9214,6 +9348,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9246,6 +9381,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9287,6 +9423,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9321,6 +9458,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9348,6 +9486,7 @@ mod tests {
                     task_count: 0,
                     status_line: None,
                     prompt_suggestion: None,
+                    token_usage: None,
                     theme: ThemePreset::Auto,
                     vim_mode: None,
                     vim_selection: None,
@@ -9363,7 +9502,7 @@ mod tests {
         screen.feed(&output);
         let lines = screen.lines();
         assert_eq!(lines.len(), 4, "final screen was {lines:#?}");
-        assert_eq!(lines[1], "› ab");
+        assert_eq!(lines[1], "❯ ab");
         assert!(!lines.iter().any(|line| line.contains("abc")));
     }
 

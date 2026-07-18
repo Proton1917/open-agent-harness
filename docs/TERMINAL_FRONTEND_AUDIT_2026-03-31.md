@@ -30,6 +30,10 @@ The frontend comparison is grounded principally in these source files:
 - `src/components/PromptInput/PromptInput.tsx`, `inputPaste.ts`, and the input
   buffer/history hooks for editing, history, paste references, mode changes,
   attachments, suggestions, and model selection.
+- `src/components/CondensedLogo.tsx`, `AssistantTextMessage.tsx`,
+  `SpinnerAnimationRow.tsx`, and `PromptInputFooterLeftSide.tsx` for compact
+  startup hierarchy, conversation glyphs, live response-length feedback, and
+  default/active-turn footer states.
 - `src/utils/suggestions/commandSuggestions.ts` and `src/commands.ts` for slash
   discovery, aliases, ordering, dynamic commands, and command availability.
 - `src/commands/{clear,resume,rewind,rename,branch,tag,copy,export,model,mcp,
@@ -97,6 +101,12 @@ The frontend comparison is grounded principally in these source files:
 - Streaming Markdown, code, tables, links, tool previews, parallel-tool
   activity, elapsed/stall state, retry attempts, usage, reasoning lifecycle,
   and multiline failures are rendered through bounded control-safe paths.
+- Inline startup uses a compact neutral name/model/mode/workspace hierarchy;
+  the composer and assistant rows use distinct `❯` and platform-appropriate
+  bullet glyphs. While a response streams, the spinner remains live and shows
+  `round(response characters / 4)` estimated output tokens from the first
+  request tick. At turn completion the idle footer reconciles to provider
+  `output_tokens` when available and otherwise retains the bounded estimate.
 - Normal scrollback and the optional fullscreen transcript both preserve a
   fixed composer, resize/reflow, search, scrolling, selection, clipboard copy,
   and canonical trusted actions without leaking alternate-screen state.
@@ -139,6 +149,9 @@ The frontend comparison is grounded principally in these source files:
 - A real-PTY prompt-suggestion fixture delays one response until after typing,
   proves the stale generation stays hidden, then proves re-arming, Enter
   acceptance, tool-free registration, and delivery into the next main request.
+- A real-PTY stream fixture sends two text deltas 700 ms apart and proves the
+  visible count advances from two to six estimated tokens before completion,
+  then reconciles to the endpoint's exact seven output tokens.
 - Completed interactive turns arm one bounded idle-notification timer. Any
   terminal event or next scheduled/submitted prompt cancels it; a real-PTY
   regression proves cancellation and re-arming. Delivery supports sanitized
