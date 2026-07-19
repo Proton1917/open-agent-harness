@@ -545,6 +545,7 @@ pub(crate) struct AgentRuntime {
     registry: ToolRegistry,
     model: RwLock<String>,
     effort: RwLock<Option<ReasoningEffort>>,
+    model_reasoning_profiles: RwLock<HashMap<String, Vec<ReasoningEffort>>>,
     max_tokens: u32,
     system: RwLock<String>,
     debug: bool,
@@ -723,6 +724,7 @@ impl AgentRuntime {
             registry,
             model: RwLock::new(model),
             effort: RwLock::new(None),
+            model_reasoning_profiles: RwLock::new(HashMap::new()),
             max_tokens,
             system: RwLock::new(system),
             debug,
@@ -799,6 +801,16 @@ impl AgentRuntime {
             .effort
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = effort;
+    }
+
+    pub(crate) fn set_model_reasoning_profiles(
+        &self,
+        profiles: HashMap<String, Vec<ReasoningEffort>>,
+    ) {
+        *self
+            .model_reasoning_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = profiles;
     }
 
     pub(crate) fn set_system_prompt(&self, system: String) {
@@ -1795,6 +1807,12 @@ impl AgentRuntime {
                 metrics,
             )));
         }
+        let model_reasoning_profiles = self
+            .model_reasoning_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        engine.set_model_reasoning_profiles(model_reasoning_profiles);
         engine.set_reasoning_effort(effort);
         if let Some(custom_agent) = &custom_agent {
             engine.set_max_tool_rounds(custom_agent.max_turns)?;

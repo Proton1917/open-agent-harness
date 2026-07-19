@@ -1,4 +1,8 @@
-use std::{collections::HashSet, future::Future, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -131,7 +135,9 @@ struct TurnInterrupted;
 pub struct QueryEngine {
     client: ModelClient,
     pub model: String,
+    requested_effort: Option<ReasoningEffort>,
     effort: Option<ReasoningEffort>,
+    model_reasoning_profiles: HashMap<String, Vec<ReasoningEffort>>,
     max_tokens: u32,
     system: String,
     registry: ToolRegistry,
@@ -330,7 +336,9 @@ impl QueryEngine {
         Self {
             client,
             model: options.model,
+            requested_effort: None,
             effort: None,
+            model_reasoning_profiles: HashMap::new(),
             max_tokens: options.max_tokens,
             system: options.system,
             registry,
@@ -729,22 +737,70 @@ impl QueryEngine {
     }
 
     pub fn set_model(&mut self, model: String) {
+        let effort = adapt_reasoning_effort(
+            &self.model_reasoning_profiles,
+            &model,
+            self.requested_effort,
+        );
         if let Ok(runtime) = self.tool_context.agent_runtime() {
             runtime.set_default_model(model.clone());
         }
         self.model = model;
+        self.apply_reasoning_effort(effort);
     }
 
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.effort
     }
 
+    pub fn requested_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.requested_effort
+    }
+
+    pub fn supported_reasoning_efforts(&self) -> Option<&[ReasoningEffort]> {
+        self.model_reasoning_profiles
+            .get(&self.model)
+            .map(Vec::as_slice)
+    }
+
+    pub fn set_model_reasoning_profiles(
+        &mut self,
+        profiles: HashMap<String, Vec<ReasoningEffort>>,
+    ) {
+        self.model_reasoning_profiles = profiles;
+        if let Ok(runtime) = self.tool_context.agent_runtime() {
+            runtime.set_model_reasoning_profiles(self.model_reasoning_profiles.clone());
+        }
+        let effort = adapt_reasoning_effort(
+            &self.model_reasoning_profiles,
+            &self.model,
+            self.requested_effort,
+        );
+        self.apply_reasoning_effort(effort);
+    }
+
     pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
-        self.client.set_effort(effort);
+        self.requested_effort = effort;
         if let Ok(runtime) = self.tool_context.agent_runtime() {
             runtime.set_reasoning_effort(effort);
         }
+        let effort = adapt_reasoning_effort(&self.model_reasoning_profiles, &self.model, effort);
+        self.apply_reasoning_effort(effort);
+    }
+
+    fn apply_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.client.set_effort(effort);
         self.effort = effort;
+    }
+
+    fn client_for_model(&self, model: &str) -> ModelClient {
+        let mut client = self.client.clone();
+        client.set_effort(adapt_reasoning_effort(
+            &self.model_reasoning_profiles,
+            model,
+            self.requested_effort,
+        ));
+        client
     }
 
     pub fn replace_hooks(&mut self, hooks: Arc<HookRunner>) {
@@ -1058,8 +1114,8 @@ impl QueryEngine {
                 } else {
                     self.text_delta_sink.as_deref()
                 };
-                match self
-                    .client
+                let active_client = self.client_for_model(&active_model);
+                match active_client
                     .messages(
                         &active_model,
                         self.max_tokens,
@@ -1775,6 +1831,35 @@ impl QueryEngine {
     }
 }
 
+fn adapt_reasoning_effort(
+    profiles: &HashMap<String, Vec<ReasoningEffort>>,
+    model: &str,
+    effort: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    let effort = effort?;
+    let Some(supported) = profiles.get(model) else {
+        return Some(effort);
+    };
+    if supported.contains(&effort) {
+        return Some(effort);
+    }
+    supported.iter().copied().min_by_key(|candidate| {
+        let candidate_rank = reasoning_effort_rank(*candidate);
+        let effort_rank = reasoning_effort_rank(effort);
+        (candidate_rank.abs_diff(effort_rank), candidate_rank)
+    })
+}
+
+fn reasoning_effort_rank(effort: ReasoningEffort) -> u8 {
+    match effort {
+        ReasoningEffort::Low => 0,
+        ReasoningEffort::Medium => 1,
+        ReasoningEffort::High => 2,
+        ReasoningEffort::XHigh => 3,
+        ReasoningEffort::Max => 4,
+    }
+}
+
 fn direct_user_text_bytes(content: &Value) -> Result<usize> {
     match content {
         Value::String(text) => Ok(text.len()),
@@ -2047,6 +2132,105 @@ fn validate_tool_calls(tool_uses: &[Value]) -> Result<Vec<(String, String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_adapts_to_each_model_without_losing_preference() {
+        let profiles = HashMap::from([
+            (
+                "full".to_owned(),
+                vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                    ReasoningEffort::Max,
+                ],
+            ),
+            (
+                "limited".to_owned(),
+                vec![ReasoningEffort::Low, ReasoningEffort::High],
+            ),
+            ("default-only".to_owned(), Vec::new()),
+        ]);
+
+        assert_eq!(
+            adapt_reasoning_effort(&profiles, "full", Some(ReasoningEffort::XHigh)),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            adapt_reasoning_effort(&profiles, "limited", Some(ReasoningEffort::Max)),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            adapt_reasoning_effort(&profiles, "limited", Some(ReasoningEffort::Medium)),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            adapt_reasoning_effort(&profiles, "default-only", Some(ReasoningEffort::High)),
+            None
+        );
+        assert_eq!(
+            adapt_reasoning_effort(&profiles, "unknown", Some(ReasoningEffort::XHigh)),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(adapt_reasoning_effort(&profiles, "full", None), None);
+
+        let client = ModelClient::new(crate::config::EndpointConfig {
+            token: None,
+            base_url: "http://127.0.0.1:9".to_owned(),
+            messages_path: "/v1/messages".to_owned(),
+            api_format: crate::protocol::ApiFormat::Messages,
+            stream: true,
+            chat_tokens_field: crate::protocol::ChatTokensField::MaxCompletionTokens,
+            include_stream_usage: true,
+            allow_env_proxy: false,
+        })
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = ToolContext::new(
+            temp.path().to_owned(),
+            crate::permissions::PermissionManager::new(
+                PermissionMode::Default,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let mut engine = QueryEngine::new(
+            client,
+            ToolRegistry::default(),
+            root.fork_for_agent(),
+            QueryOptions {
+                model: "full".to_owned(),
+                max_tokens: 64,
+                system: "test".to_owned(),
+                messages: Vec::new(),
+                debug: false,
+                text_delta_sink: None,
+                compact_config: None,
+            },
+        );
+        engine.set_model_reasoning_profiles(profiles);
+        engine.set_reasoning_effort(Some(ReasoningEffort::Max));
+        assert_eq!(
+            engine.requested_reasoning_effort(),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(engine.reasoning_effort(), Some(ReasoningEffort::Max));
+
+        engine.set_model("limited".to_owned());
+        assert_eq!(
+            engine.requested_reasoning_effort(),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(engine.reasoning_effort(), Some(ReasoningEffort::High));
+
+        engine.set_model("default-only".to_owned());
+        assert_eq!(engine.reasoning_effort(), None);
+
+        engine.set_model("full".to_owned());
+        assert_eq!(engine.reasoning_effort(), Some(ReasoningEffort::Max));
+    }
 
     #[test]
     fn tool_preview_marks_multiline_and_long_output_as_collapsed() {

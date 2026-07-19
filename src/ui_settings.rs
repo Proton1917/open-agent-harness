@@ -176,7 +176,7 @@ impl UiSettings {
         }
         if let Some(effort) = &self.reasoning_effort {
             if ReasoningEffort::parse(effort)?.is_none() {
-                bail!("reasoningEffort must be low, medium, high, or max when persisted")
+                bail!("reasoningEffort must be low, medium, high, xhigh, or max when persisted")
             }
         }
         self.permission_rules.validate()?;

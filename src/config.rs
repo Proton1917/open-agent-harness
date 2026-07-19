@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fmt, fs,
     io::Read,
     path::{Path, PathBuf},
@@ -10,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     permissions::PermissionMode,
-    protocol::{ApiFormat, ChatTokensField},
+    protocol::{ApiFormat, ChatTokensField, ReasoningEffort},
     sandbox::SandboxRuntime,
 };
 
@@ -105,10 +106,11 @@ fn parse_model_option(value: &Value) -> Result<ModelOption> {
     let (model, display_name, description) = match value {
         Value::String(model) => (model.as_str(), model.as_str(), ""),
         Value::Object(object) => {
-            let allowed = ["value", "displayName", "description"];
+            let allowed = ["value", "displayName", "description", "reasoningEfforts"];
             if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
                 anyhow::bail!("models option 包含未知字段 {key}")
             }
+            parse_model_reasoning_efforts(object)?;
             let model = object
                 .get("value")
                 .and_then(Value::as_str)
@@ -148,6 +150,33 @@ fn parse_model_option(value: &Value) -> Result<ModelOption> {
         display_name: display_name.to_owned(),
         description: description.to_owned(),
     })
+}
+
+fn parse_model_reasoning_efforts(
+    object: &Map<String, Value>,
+) -> Result<Option<Vec<ReasoningEffort>>> {
+    let Some(value) = object.get("reasoningEfforts") else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .context("models option.reasoningEfforts 必须是 array")?;
+    if values.len() > 8 {
+        anyhow::bail!("models option.reasoningEfforts 超过 8 个限制")
+    }
+    let mut efforts = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value
+            .as_str()
+            .context("models option.reasoningEfforts 只能包含 string")?;
+        let effort = ReasoningEffort::parse(value)?
+            .context("models option.reasoningEfforts 不接受 auto/default/none")?;
+        if efforts.contains(&effort) {
+            anyhow::bail!("models option.reasoningEfforts 包含重复值 {value}")
+        }
+        efforts.push(effort);
+    }
+    Ok(Some(efforts))
 }
 
 impl Default for Settings {
@@ -267,6 +296,34 @@ impl Settings {
             });
         }
         Ok(options)
+    }
+
+    /// Returns explicit trusted per-model effort capabilities. Missing entries
+    /// remain unknown; an explicit empty list means the model accepts only its
+    /// provider default and must not receive a named effort hint.
+    pub fn model_reasoning_profiles(&self) -> Result<HashMap<String, Vec<ReasoningEffort>>> {
+        let mut profiles = HashMap::new();
+        let Some(values) = self.raw.get("models") else {
+            return Ok(profiles);
+        };
+        let values = values.as_array().context("models 必须是 array")?;
+        if values.len() > MAX_MODEL_OPTIONS {
+            anyhow::bail!("models 超过 {MAX_MODEL_OPTIONS} 个限制")
+        }
+        for value in values {
+            let Value::Object(object) = value else {
+                continue;
+            };
+            let model = object
+                .get("value")
+                .and_then(Value::as_str)
+                .context("models option.value 必须是 string")?;
+            validate_model_id(model)?;
+            if let Some(efforts) = parse_model_reasoning_efforts(object)? {
+                profiles.insert(model.to_owned(), efforts);
+            }
+        }
+        Ok(profiles)
     }
 
     /// Returns a statically selected output style from trusted settings.
@@ -949,7 +1006,12 @@ mod tests {
             raw: serde_json::json!({
                 "models":[
                     "provider/model-a",
-                    {"value":"provider/model-b", "displayName":"Model B", "description":"Fast"}
+                    {
+                        "value":"provider/model-b",
+                        "displayName":"Model B",
+                        "description":"Fast",
+                        "reasoningEfforts":["low","high","xhigh"]
+                    }
                 ]
             }),
         };
@@ -957,6 +1019,14 @@ mod tests {
         assert_eq!(options.len(), 3);
         assert_eq!(options[1].display_name, "Model B");
         assert_eq!(options[2].description, "Current model");
+        assert_eq!(
+            settings.model_reasoning_profiles().unwrap()["provider/model-b"],
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh
+            ]
+        );
 
         for raw in [
             serde_json::json!({"models":"not-an-array"}),
@@ -964,6 +1034,9 @@ mod tests {
             serde_json::json!({"models":[{"value":"ok", "unknown":true}]}),
             serde_json::json!({"models":["bad model"]}),
             serde_json::json!({"models":[{"value":"ok", "displayName":"bad\nname"}]}),
+            serde_json::json!({"models":[{"value":"ok", "reasoningEfforts":"high"}]}),
+            serde_json::json!({"models":[{"value":"ok", "reasoningEfforts":["auto"]}]}),
+            serde_json::json!({"models":[{"value":"ok", "reasoningEfforts":["high","high"]}]}),
         ] {
             assert!(Settings { raw }.model_options("current").is_err());
         }

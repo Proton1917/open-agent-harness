@@ -1062,6 +1062,7 @@ async fn run(
     let engine_setup = (|| -> Result<()> {
         engine.install_custom_agents(agents.custom_agents)?;
         sync_agent_mcp_server_names(&engine, mcp_control.as_ref())?;
+        engine.set_model_reasoning_profiles(settings.model_reasoning_profiles()?);
         let effort = ui_settings
             .reasoning_effort
             .as_deref()
@@ -1166,7 +1167,7 @@ async fn run(
         if let Some(session) = control_session.take() {
             let control_base_settings = settings.clone();
             let control_base_user_rules = command_context.permissions.user_rules();
-            let control_base_reasoning_effort = engine.reasoning_effort();
+            let control_base_reasoning_effort = engine.requested_reasoning_effort();
             let control_base_model = engine.model.clone();
             let mut runtime = ControlRuntime {
                 store: &store,
@@ -2481,20 +2482,7 @@ async fn run(
                 }
                 CommandOutcome::ConfigureEffort(argument) => {
                     let selected = if argument.trim().is_empty() && enhanced_terminal {
-                        let options = [
-                            ("auto", "Automatic", "Do not send an explicit effort hint"),
-                            ("low", "Low", "Prefer a shorter reasoning budget"),
-                            ("medium", "Medium", "Use a balanced reasoning budget"),
-                            ("high", "High", "Prefer a larger reasoning budget"),
-                            ("max", "Maximum", "Request the largest supported reasoning budget"),
-                        ]
-                        .into_iter()
-                        .map(|(value, display_name, description)| ModelOption {
-                            value: value.to_owned(),
-                            display_name: display_name.to_owned(),
-                            description: description.to_owned(),
-                        })
-                        .collect::<Vec<_>>();
+                        let options = reasoning_effort_options(&engine);
                         let current = engine
                             .reasoning_effort()
                             .map_or("auto", ReasoningEffort::as_str);
@@ -2502,7 +2490,7 @@ async fn run(
                             &options,
                             current,
                             "Reasoning effort",
-                            "Choose a provider-neutral effort hint. Unsupported backends may reject explicit values.",
+                            "Choose an exact level supported by this model; Model default preserves the provider or preset policy.",
                         )? {
                             ModelPickerOutcome::Selected(value) => value,
                             ModelPickerOutcome::Cancelled => continue,
@@ -2510,10 +2498,13 @@ async fn run(
                         }
                     } else if argument.trim().is_empty() {
                         println!(
-                            "Reasoning effort: {}. Available: auto, low, medium, high, max",
-                            engine
-                                .reasoning_effort()
-                                .map_or("auto", ReasoningEffort::as_str)
+                            "Reasoning effort: {}. Available: {}",
+                            format_reasoning_effort(&engine),
+                            reasoning_effort_options(&engine)
+                                .iter()
+                                .map(|option| option.value.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                         continue;
                     } else {
@@ -2540,7 +2531,7 @@ async fn run(
                             }
                             println!(
                                 "Reasoning effort set to {}.",
-                                effort.map_or("auto", ReasoningEffort::as_str)
+                                format_reasoning_effort(&engine)
                             );
                         }
                         Err(error) => eprintln!("Reasoning effort unchanged: {error:#}"),
@@ -4949,13 +4940,18 @@ async fn handle_control_slash_command(
             if argument.is_empty() {
                 return handled(json!({
                     "effort":engine.reasoning_effort().map_or("auto", ReasoningEffort::as_str),
-                    "available":["auto","low","medium","high","max"],
+                    "requested":engine.requested_reasoning_effort().map_or("auto", ReasoningEffort::as_str),
+                    "available":reasoning_effort_options(engine)
+                        .into_iter()
+                        .map(|option| option.value)
+                        .collect::<Vec<_>>(),
                 }));
             }
             let effort = ReasoningEffort::parse(argument)?;
             engine.set_reasoning_effort(effort);
             handled(json!({
-                "effort":effort.map_or("auto", ReasoningEffort::as_str),
+                "effort":engine.reasoning_effort().map_or("auto", ReasoningEffort::as_str),
+                "requested":engine.requested_reasoning_effort().map_or("auto", ReasoningEffort::as_str),
                 "persisted":false,
             }))
         }
@@ -5608,6 +5604,7 @@ impl ControlRuntime<'_> {
         candidate.output_style()?;
         candidate.plugin_directories()?;
         candidate.auto_memory_settings()?;
+        let next_reasoning_profiles = candidate.model_reasoning_profiles()?;
         let sandbox = candidate
             .sandbox_runtime()?
             .with_session_workspaces(&self.command_context.trusted_roots())?;
@@ -5701,6 +5698,7 @@ impl ControlRuntime<'_> {
         self.command_context
             .permissions
             .set_user_rules(next_user_rules)?;
+        engine.set_model_reasoning_profiles(next_reasoning_profiles);
         if let Some(model) = next_model {
             engine.set_model(model);
         }
@@ -7309,6 +7307,67 @@ fn fullscreen_session_header(engine: &QueryEngine, store: &SessionStore) -> Resu
     ))
 }
 
+fn format_reasoning_effort(engine: &QueryEngine) -> String {
+    match (
+        engine.requested_reasoning_effort(),
+        engine.reasoning_effort(),
+    ) {
+        (None, _) => "model default (no explicit wire hint)".to_owned(),
+        (Some(requested), Some(effective)) if requested == effective => {
+            effective.as_str().to_owned()
+        }
+        (Some(requested), Some(effective)) => format!(
+            "{} -> {} (adapted for {})",
+            requested.as_str(),
+            effective.as_str(),
+            engine.model
+        ),
+        (Some(requested), None) => format!(
+            "{} -> model default ({} accepts no named level)",
+            requested.as_str(),
+            engine.model
+        ),
+    }
+}
+
+fn reasoning_effort_options(engine: &QueryEngine) -> Vec<ModelOption> {
+    let mut options = vec![ModelOption {
+        value: "auto".to_owned(),
+        display_name: "Model default".to_owned(),
+        description: "Preserve the selected provider/model/preset depth policy".to_owned(),
+    }];
+    let fallback = [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ];
+    let supported = engine.supported_reasoning_efforts().unwrap_or(&fallback);
+    options.extend(supported.iter().map(|effort| {
+        ModelOption {
+            value: effort.as_str().to_owned(),
+            display_name: match effort {
+                ReasoningEffort::Low => "Low",
+                ReasoningEffort::Medium => "Medium",
+                ReasoningEffort::High => "High",
+                ReasoningEffort::XHigh => "Extra high",
+                ReasoningEffort::Max => "Maximum",
+            }
+            .to_owned(),
+            description: match effort {
+                ReasoningEffort::Low => "Prefer a shorter reasoning budget",
+                ReasoningEffort::Medium => "Use a balanced reasoning budget",
+                ReasoningEffort::High => "Prefer a larger reasoning budget",
+                ReasoningEffort::XHigh => "Request the model's exact xhigh level",
+                ReasoningEffort::Max => "Request the model's exact max level",
+            }
+            .to_owned(),
+        }
+    }));
+    options
+}
+
 type PromptSuggestionCompletion = std::result::Result<Option<String>, String>;
 
 /// Owns the one replaceable interactive prompt-suggestion request. A generation check prevents a
@@ -8787,7 +8846,7 @@ fn ui_settings_snapshot(settings: &UiSettings, output_styles: &[String]) -> Sett
                 .reasoning_effort
                 .clone()
                 .unwrap_or_else(|| "auto".to_owned()),
-            options: ["auto", "low", "medium", "high", "max"]
+            options: ["auto", "low", "medium", "high", "xhigh", "max"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
@@ -9174,7 +9233,7 @@ fn available_command_suggestions(
             "effort",
             &[][..],
             "Set the provider-neutral reasoning effort hint",
-            Some("[auto|low|medium|high|max]"),
+            Some("[auto|low|medium|high|max|xhigh]"),
         ),
         (
             "diff",
@@ -9370,7 +9429,7 @@ fn available_command_suggestions(
             .into_iter()
             .map(ToOwned::to_owned)
             .collect(),
-            "effort" => ["auto", "low", "medium", "high", "max"]
+            "effort" => ["auto", "low", "medium", "high", "xhigh", "max"]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),

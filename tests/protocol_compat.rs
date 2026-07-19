@@ -10,7 +10,7 @@ use open_agent_harness::{
     api::ModelClient,
     config::EndpointConfig,
     permissions::{PermissionManager, PermissionMode},
-    protocol::{ApiFormat, ChatTokensField},
+    protocol::{ApiFormat, ChatTokensField, ReasoningEffort},
     query::{QueryEngine, QueryEvent, QueryOptions},
     tools::{ToolContext, ToolRegistry},
     types::Message,
@@ -49,6 +49,7 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
         endpoint(address, "/v1/chat/completions", ApiFormat::Auto, true),
         temp.path(),
     );
+    engine.set_reasoning_effort(Some(ReasoningEffort::XHigh));
     let emitted = Arc::new(Mutex::new(Vec::new()));
     let emitted_sink = emitted.clone();
     engine.set_event_sink(Some(Arc::new(move |event| {
@@ -85,6 +86,7 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
             "max_completion_tokens",
             "messages",
             "model",
+            "reasoning_effort",
             "stream",
             "stream_options",
             "tools",
@@ -94,6 +96,7 @@ async fn chat_completions_round_trips_tools_and_openrouter_stream_conventions() 
     assert_eq!(requests[0].body["messages"][1]["role"], "user");
     assert_eq!(requests[0].body["tools"][0]["type"], "function");
     assert_eq!(requests[0].body["max_completion_tokens"], 1024);
+    assert_eq!(requests[0].body["reasoning_effort"], "xhigh");
     assert!(requests[0].body.get("max_tokens").is_none());
     assert_eq!(requests[0].body["stream_options"]["include_usage"], true);
     assert!(
@@ -140,6 +143,7 @@ async fn responses_round_trips_stateless_reasoning_and_function_outputs() {
         endpoint(address, "/v1/responses", ApiFormat::Auto, true),
         temp.path(),
     );
+    engine.set_reasoning_effort(Some(ReasoningEffort::Max));
 
     let result = engine.run_turn("read fixture".into()).await.unwrap();
     engine.shutdown().await;
@@ -159,6 +163,7 @@ async fn responses_round_trips_stateless_reasoning_and_function_outputs() {
             "instructions",
             "max_output_tokens",
             "model",
+            "reasoning",
             "store",
             "stream",
             "tools",
@@ -170,6 +175,7 @@ async fn responses_round_trips_stateless_reasoning_and_function_outputs() {
             .is_some_and(|instructions| instructions.starts_with("test system"))
     );
     assert_eq!(requests[0].body["max_output_tokens"], 1024);
+    assert_eq!(requests[0].body["reasoning"]["effort"], "max");
     assert_eq!(requests[0].body["store"], false);
     assert_eq!(
         requests[0].body["include"][0],

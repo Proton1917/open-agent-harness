@@ -75,6 +75,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -84,6 +85,7 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         }
     }
@@ -94,8 +96,9 @@ impl ReasoningEffort {
             "low" => Ok(Some(Self::Low)),
             "medium" => Ok(Some(Self::Medium)),
             "high" => Ok(Some(Self::High)),
+            "xhigh" => Ok(Some(Self::XHigh)),
             "max" => Ok(Some(Self::Max)),
-            _ => bail!("reasoning effort must be auto, low, medium, high, or max"),
+            _ => bail!("reasoning effort must be auto, low, medium, high, xhigh, or max"),
         }
     }
 }
@@ -117,24 +120,22 @@ pub fn encode_request_with_effort(
         ApiFormat::Auto => bail!("API format 必须在编码请求前完成解析"),
     }?;
     if let Some(effort) = effort {
+        let wire_effort = effort.as_str();
         let object = body
             .as_object_mut()
             .context("encoded request must be an object")?;
         match format {
             ApiFormat::Messages => {
-                object.insert(
-                    "output_config".to_owned(),
-                    json!({"effort":effort.as_str()}),
-                );
+                object.insert("output_config".to_owned(), json!({"effort":wire_effort}));
             }
             ApiFormat::ChatCompletions => {
                 object.insert(
                     "reasoning_effort".to_owned(),
-                    Value::String(effort.as_str().to_owned()),
+                    Value::String(wire_effort.to_owned()),
                 );
             }
             ApiFormat::Responses => {
-                object.insert("reasoning".to_owned(), json!({"effort":effort.as_str()}));
+                object.insert("reasoning".to_owned(), json!({"effort":wire_effort}));
             }
             ApiFormat::Auto => unreachable!("auto format was rejected above"),
         }
@@ -3427,12 +3428,24 @@ mod tests {
             "medium"
         );
         assert_eq!(
+            encode(ApiFormat::ChatCompletions, Some(ReasoningEffort::Max))["reasoning_effort"],
+            "max"
+        );
+        assert_eq!(
             encode(ApiFormat::Responses, Some(ReasoningEffort::Max))["reasoning"]["effort"],
             "max"
+        );
+        assert_eq!(
+            encode(ApiFormat::Responses, Some(ReasoningEffort::XHigh))["reasoning"]["effort"],
+            "xhigh"
         );
         let automatic = encode(ApiFormat::Responses, None);
         assert!(automatic.get("reasoning").is_none());
         assert_eq!(ReasoningEffort::parse("auto").unwrap(), None);
+        assert_eq!(
+            ReasoningEffort::parse("xhigh").unwrap(),
+            Some(ReasoningEffort::XHigh)
+        );
         assert!(ReasoningEffort::parse("extreme").is_err());
     }
 

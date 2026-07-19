@@ -10,7 +10,7 @@ use std::{
         unix::process::CommandExt,
     },
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
     let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (release_stream, wait_for_release) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = read_request(&mut stream);
@@ -57,7 +58,11 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
         for (index, event) in events.iter().enumerate() {
             stream.write_all(event.as_bytes()).unwrap();
             stream.flush().unwrap();
-            if index == 2 || index == 3 {
+            if index == 2 {
+                wait_for_release
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            } else if index == 3 {
                 thread::sleep(Duration::from_millis(700));
             }
         }
@@ -69,8 +74,16 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
     terminal.write_all(b"count live tokens\r").unwrap();
     let active = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(3));
     assert!(active.contains("esc to interrupt"), "{active}");
+    let first_delta = if active.contains("LIVE1234") {
+        active.clone()
+    } else {
+        read_until(&mut terminal, "LIVE1234", Duration::from_secs(3))
+    };
+    assert!(first_delta.contains("LIVE1234"), "{first_delta}");
+    assert!(!first_delta.contains("_TOKEN_COUNT_OK!"), "{first_delta}");
     let first_count = read_until(&mut terminal, "↓ 2 tokens", Duration::from_secs(5));
     assert!(first_count.contains("Working"), "{first_count}");
+    release_stream.send(()).unwrap();
     let second_count = read_until(&mut terminal, "↓ 6 tokens", Duration::from_secs(5));
     assert!(second_count.contains("↓ 6 tokens"), "{second_count}");
     let answer = read_until(

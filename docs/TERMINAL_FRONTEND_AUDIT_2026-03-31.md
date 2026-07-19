@@ -98,9 +98,11 @@ The frontend comparison is grounded principally in these source files:
 
 ### Rendering, progress, and dialogs
 
-- Streaming Markdown, code, tables, links, tool previews, parallel-tool
+- Streaming Markdown renders both the immutable prefix and the growing final
+  block on every delta; the replaceable suffix is redrawn without allowing the
+  progress row to erase it. Code, tables, links, tool previews, parallel-tool
   activity, elapsed/stall state, retry attempts, usage, reasoning lifecycle,
-  and multiline failures are rendered through bounded control-safe paths.
+  and multiline failures remain on bounded control-safe paths.
 - Inline startup uses a compact neutral name/model/mode/workspace hierarchy;
   the composer and assistant rows use distinct `❯` and platform-appropriate
   bullet glyphs. While a response streams, the spinner remains live and shows
@@ -112,7 +114,12 @@ The frontend comparison is grounded principally in these source files:
   and canonical trusted actions without leaking alternate-screen state.
 - Model, theme, permission, settings, task, MCP, resume, and rewind pickers are
   terminal-sized and preserve the draft. `/effort`, `/output-style`, plugin
-  reload, and the status-line public schema are provider-neutral.
+  reload, and the status-line public schema are provider-neutral. Trusted model
+  options can declare their exact `low`/`medium`/`high`/`xhigh`/`max`
+  capabilities: switching models keeps the requested preference when possible,
+  otherwise selects the nearest supported level and restores the preference on
+  a later compatible model. Model-default mode emits no explicit hint so the
+  selected provider/model/preset retains its native depth policy.
 - `terminalPanelEnabled` is an explicit user-only, default-off setting. Alt-J
   releases raw/fullscreen ownership and opens a credential-scrubbed private
   shell; a process-instance tmux server preserves it between toggles, while a
