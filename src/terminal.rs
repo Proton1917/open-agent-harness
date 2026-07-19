@@ -77,6 +77,7 @@ const MAX_FULLSCREEN_STREAM_BYTES: usize = 64 * 1024;
 const MAX_PERMISSION_PREVIEW_BYTES: usize = 64 * 1024;
 const FULLSCREEN_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const EMPTY_TRANSCRIPT_MESSAGE: &str = "Transcript is empty.";
+const MESSAGE_GUTTER_WIDTH: usize = 2;
 const MACOS_SPINNER_FRAMES: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
 const GHOSTTY_SPINNER_FRAMES: &[&str] =
     &["·", "✢", "✳", "✶", "✻", "*", "*", "✻", "✶", "✳", "✢", "·"];
@@ -97,6 +98,11 @@ fn spinner_frames() -> &'static [&'static str] {
         std::env::var("TERM").ok().as_deref(),
         cfg!(target_os = "macos"),
     )
+}
+
+fn message_gutter(glyph: &str) -> String {
+    let padding = MESSAGE_GUTTER_WIDTH.saturating_sub(UnicodeWidthStr::width(glyph));
+    format!("{glyph}{}", " ".repeat(padding))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1030,7 +1036,7 @@ impl ConversationUi {
                 if self.color {
                     let _ = queue!(out, SetForegroundColor(Color::Cyan));
                 }
-                let _ = queue!(out, Print("  ● "), Print(name));
+                let _ = queue!(out, Print(message_gutter(assistant_bullet())), Print(name));
                 if self.color {
                     let _ = queue!(out, ResetColor, SetForegroundColor(Color::DarkGrey));
                 }
@@ -1059,7 +1065,7 @@ impl ConversationUi {
                     );
                 }
                 let symbol = if *is_error { "✗" } else { "✓" };
-                let _ = queue!(out, Print(format!("    ╰─ {symbol} {name} ")));
+                let _ = queue!(out, Print(format!("  ⎿  {symbol} {name} ")));
                 if self.color {
                     let _ = queue!(out, SetForegroundColor(Color::DarkGrey));
                 }
@@ -1092,7 +1098,10 @@ impl ConversationUi {
                 let _ = muted_line(
                     &mut out,
                     self.color,
-                    &format!("  ✓ Context {before_tokens} → {after_tokens} estimated tokens"),
+                    &format!(
+                        "{}Context {before_tokens} → {after_tokens} estimated tokens",
+                        message_gutter("✓")
+                    ),
                 );
             }
             QueryEvent::TurnFinished { .. } => {
@@ -1105,7 +1114,11 @@ impl ConversationUi {
                     let _ = muted_line(
                         &mut out,
                         self.color,
-                        &format!("  ✻ Worked for {}", format_duration(duration.as_millis())),
+                        &format!(
+                            "{}Worked for {}",
+                            message_gutter("✻"),
+                            format_duration(duration.as_millis())
+                        ),
                     );
                 }
                 let _ = queue!(out, Print(RAW_LINE_END));
@@ -1113,7 +1126,11 @@ impl ConversationUi {
             QueryEvent::TurnInterrupted => {
                 clear_status(&mut out, &mut state);
                 close_assistant(&mut out, &mut state);
-                let _ = muted_line(&mut out, self.color, "  ■ Interrupted");
+                let _ = muted_line(
+                    &mut out,
+                    self.color,
+                    &format!("{}Interrupted", message_gutter("■")),
+                );
                 let _ = queue!(out, Print(RAW_LINE_END));
             }
             QueryEvent::TurnFailed { message } => {
@@ -1234,13 +1251,11 @@ impl ConversationUi {
             preview_anchor = false;
         }
         if !frame.unstable.lines.is_empty() {
-            let starts_with_bullet = !state.assistant_open;
             let (columns, rows) = terminal::size()
                 .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
                 .unwrap_or((80, 24));
             let bounded_preview = bounded_markdown_preview(
                 &frame.unstable.lines,
-                starts_with_bullet,
                 columns,
                 rows.saturating_sub(4).max(1),
             );
@@ -1254,8 +1269,7 @@ impl ConversationUi {
                 preview_lines,
                 preview_anchor,
             );
-            state.markdown_preview_rows =
-                rendered_markdown_rows(preview_lines, starts_with_bullet, columns);
+            state.markdown_preview_rows = rendered_markdown_rows(preview_lines, columns);
         }
         let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
@@ -7199,7 +7213,8 @@ impl RenderedInput {
                 format!("{footer} · {task_status}")
             };
         }
-        footer = prompt_footer_line(&footer, token_usage, width.saturating_sub(1));
+        let footer_content_width = width.saturating_sub(2).max(1);
+        footer = prompt_footer_line(&footer, token_usage, footer_content_width);
         let rendered_suggestions = if !file_suggestions.is_empty() {
             let count = suggestion_limit.min(height.saturating_sub(3).max(1));
             let start = selected_file_suggestion
@@ -7272,7 +7287,7 @@ impl RenderedInput {
             } else {
                 queue!(
                     out,
-                    Print(visible_line(&footer, width.saturating_sub(1))),
+                    Print(visible_line(&footer, footer_content_width)),
                     Print(RAW_LINE_END)
                 )?;
                 0usize
@@ -7357,6 +7372,51 @@ impl RenderedInput {
 struct RenderedPicker {
     rows: u16,
     cursor_row: u16,
+}
+
+fn picker_label_column_width(
+    options: &[ModelOption],
+    current: &str,
+    visible_from: usize,
+    visible_to: usize,
+    index_width: usize,
+) -> usize {
+    options
+        .iter()
+        .take(visible_to)
+        .skip(visible_from)
+        .map(|option| {
+            UnicodeWidthStr::width(option.display_name.as_str())
+                .saturating_add(usize::from(option.value == current) * 2)
+        })
+        .max()
+        .unwrap_or_default()
+        .saturating_add(index_width)
+        .saturating_add(6)
+}
+
+fn picker_option_line(
+    index: usize,
+    index_width: usize,
+    marker: &str,
+    option: &ModelOption,
+    current: &str,
+    label_column_width: usize,
+) -> String {
+    let selected = if option.value == current { " ✓" } else { "" };
+    let prefix = format!(
+        "  {marker} {:>index_width$}. {}{selected}",
+        index + 1,
+        option.display_name
+    );
+    if option.description.is_empty() {
+        return prefix;
+    }
+    format!(
+        "{prefix}{}  {}",
+        " ".repeat(label_column_width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()))),
+        option.description
+    )
 }
 
 impl RenderedPicker {
@@ -7505,6 +7565,13 @@ impl RenderedPicker {
 
         let visible_to = (state.visible_from + state.visible_count).min(options.len());
         let index_width = options.len().to_string().len();
+        let label_column_width = picker_label_column_width(
+            options,
+            current,
+            state.visible_from,
+            visible_to,
+            index_width,
+        );
         for (index, option) in options
             .iter()
             .enumerate()
@@ -7526,22 +7593,14 @@ impl RenderedPicker {
                     queue!(out, SetForegroundColor(accent))?;
                 }
             }
-            let selected = if option.value == current { " ✓" } else { "" };
-            let prefix = format!(
-                "  {scroll_marker} {:>index_width$}. {}{selected}",
-                index + 1,
-                option.display_name
+            let line = picker_option_line(
+                index,
+                index_width,
+                scroll_marker,
+                option,
+                current,
+                label_column_width,
             );
-            let description = if option.description.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", option.description)
-            };
-            let line = if description.is_empty() {
-                prefix
-            } else {
-                format!("{prefix}{description}")
-            };
             queue!(
                 out,
                 Print(visible_line(&line, width.saturating_sub(1))),
@@ -7997,19 +8056,12 @@ fn clear_assistant_markdown_preview(
     Ok(true)
 }
 
-fn rendered_markdown_rows(
-    lines: &[RenderedLine],
-    starts_with_bullet: bool,
-    columns: usize,
-) -> usize {
+fn rendered_markdown_rows(lines: &[RenderedLine], columns: usize) -> usize {
     let columns = columns.max(1);
     lines
         .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix_width = usize::from(index == 0 && starts_with_bullet)
-                .saturating_mul(UnicodeWidthStr::width(assistant_bullet()).saturating_add(1));
-            prefix_width
+        .map(|line| {
+            MESSAGE_GUTTER_WIDTH
                 .saturating_add(UnicodeWidthStr::width(line.plain.as_str()))
                 .max(1)
                 .div_ceil(columns)
@@ -8019,22 +8071,19 @@ fn rendered_markdown_rows(
 
 fn bounded_markdown_preview(
     lines: &[RenderedLine],
-    starts_with_bullet: bool,
     columns: usize,
     max_rows: usize,
 ) -> Option<Vec<RenderedLine>> {
     let columns = columns.max(1);
     let max_rows = max_rows.max(1);
-    if rendered_markdown_rows(lines, starts_with_bullet, columns) <= max_rows {
+    if rendered_markdown_rows(lines, columns) <= max_rows {
         return None;
     }
     let take = lines.len().min(max_rows);
     let omitted = lines.len().saturating_sub(take);
     let mut preview = lines[omitted..].to_vec();
     for (index, line) in preview.iter_mut().enumerate() {
-        let prefix_width = usize::from(index == 0 && starts_with_bullet)
-            .saturating_mul(UnicodeWidthStr::width(assistant_bullet()).saturating_add(1));
-        let limit = columns.saturating_sub(prefix_width).max(1);
+        let limit = columns.saturating_sub(MESSAGE_GUTTER_WIDTH).max(1);
         if index == 0 && omitted > 0 {
             line.plain = format!("… {}", line.plain);
         }
@@ -8058,14 +8107,17 @@ fn write_assistant_markdown_lines_at(
         return Ok(());
     }
     if !*assistant_open {
-        queue!(out, Print(assistant_bullet()), Print(" "))?;
+        queue!(out, Print(message_gutter(assistant_bullet())))?;
         *assistant_open = true;
-    } else if !current_row_ready {
-        queue!(out, Print(RAW_LINE_END))?;
+    } else {
+        if !current_row_ready {
+            queue!(out, Print(RAW_LINE_END))?;
+        }
+        queue!(out, Print("  "))?;
     }
     for (line_index, line) in lines.iter().enumerate() {
         if line_index > 0 {
-            queue!(out, Print(RAW_LINE_END))?;
+            queue!(out, Print(RAW_LINE_END), Print("  "))?;
         }
         write_rendered_markdown_line(out, color, line)?;
     }
@@ -8160,7 +8212,7 @@ fn styled_status_frame(
     if color {
         queue!(out, SetForegroundColor(Color::DarkGrey))?;
     }
-    queue!(out, Print(format!("  {glyph} {label}")))?;
+    queue!(out, Print(message_gutter(glyph)), Print(label))?;
     if color {
         queue!(out, ResetColor)?;
     }
@@ -8959,16 +9011,16 @@ mod tests {
             plain: "live".to_owned(),
             ..RenderedLine::default()
         }];
-        assert!(bounded_markdown_preview(&short, true, 20, 4).is_none());
+        assert!(bounded_markdown_preview(&short, 20, 4).is_none());
 
         let long = vec![RenderedLine {
             plain: "abcdefghijklmnopqrstuvwxyz".to_owned(),
             ..RenderedLine::default()
         }];
-        let preview = bounded_markdown_preview(&long, true, 8, 2).unwrap();
+        let preview = bounded_markdown_preview(&long, 8, 2).unwrap();
         assert_eq!(preview.len(), 1);
         assert!(preview[0].plain.ends_with("wxyz"));
-        assert!(rendered_markdown_rows(&preview, true, 8) <= 2);
+        assert!(rendered_markdown_rows(&preview, 8) <= 2);
 
         let many = (0..10)
             .map(|index| RenderedLine {
@@ -8976,11 +9028,107 @@ mod tests {
                 ..RenderedLine::default()
             })
             .collect::<Vec<_>>();
-        let preview = bounded_markdown_preview(&many, false, 20, 3).unwrap();
+        let preview = bounded_markdown_preview(&many, 20, 3).unwrap();
         assert_eq!(preview.len(), 3);
         assert!(preview[0].plain.starts_with('…'));
         assert!(preview[2].plain.ends_with('9'));
-        assert!(rendered_markdown_rows(&preview, false, 20) <= 3);
+        assert!(rendered_markdown_rows(&preview, 20) <= 3);
+    }
+
+    #[test]
+    fn conversation_rows_share_a_two_column_message_gutter() {
+        for glyph in [assistant_bullet(), "●", "·", "✢", "✳", "✶", "✻", "✽", "*"] {
+            assert_eq!(
+                UnicodeWidthStr::width(message_gutter(glyph).as_str()),
+                MESSAGE_GUTTER_WIDTH,
+                "unexpected gutter width for {glyph:?}"
+            );
+        }
+
+        let lines = [
+            RenderedLine {
+                plain: "first".to_owned(),
+                ..RenderedLine::default()
+            },
+            RenderedLine {
+                plain: "second".to_owned(),
+                ..RenderedLine::default()
+            },
+        ];
+        let mut output = Vec::new();
+        let mut assistant_open = false;
+        write_assistant_markdown_lines_at(&mut output, false, &mut assistant_open, &lines, false)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "{}first{RAW_LINE_END}  second",
+                message_gutter(assistant_bullet())
+            )
+        );
+
+        let mut status = Vec::new();
+        styled_status_frame(&mut status, false, "✻", "Working…").unwrap();
+        assert_eq!(
+            UnicodeWidthStr::width(
+                String::from_utf8(status)
+                    .unwrap()
+                    .strip_suffix("Working…")
+                    .unwrap()
+            ),
+            MESSAGE_GUTTER_WIDTH
+        );
+    }
+
+    #[test]
+    fn picker_descriptions_start_in_one_display_column() {
+        let options = [
+            ModelOption {
+                value: "auto".to_owned(),
+                display_name: "Model default".to_owned(),
+                description: "Preserve the model policy".to_owned(),
+            },
+            ModelOption {
+                value: "low".to_owned(),
+                display_name: "Low".to_owned(),
+                description: "Prefer a shorter budget".to_owned(),
+            },
+            ModelOption {
+                value: "medium".to_owned(),
+                display_name: "Medium".to_owned(),
+                description: "Use a balanced budget".to_owned(),
+            },
+            ModelOption {
+                value: "max".to_owned(),
+                display_name: "Maximum".to_owned(),
+                description: "Request the largest budget".to_owned(),
+            },
+        ];
+        let index_width = options.len().to_string().len();
+        let label_width =
+            picker_label_column_width(&options, "auto", 0, options.len(), index_width);
+        let description_columns = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let line = picker_option_line(
+                    index,
+                    index_width,
+                    if index == 1 { "›" } else { " " },
+                    option,
+                    "auto",
+                    label_width,
+                );
+                let description_start = line.find(option.description.as_str()).unwrap();
+                UnicodeWidthStr::width(&line[..description_start])
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            description_columns
+                .windows(2)
+                .all(|columns| columns[0] == columns[1]),
+            "description columns differed: {description_columns:?}"
+        );
     }
 
     #[test]

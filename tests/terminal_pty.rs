@@ -90,6 +90,18 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
         "running status did not use a source-shaped spinner frame: {first_count}"
     );
     assert!(
+        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
+            .iter()
+            .any(|glyph| first_count.contains(&format!("{glyph} Working"))),
+        "running label did not start after the fixed two-column gutter: {first_count}"
+    );
+    assert!(
+        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
+            .iter()
+            .all(|glyph| !first_count.contains(&format!("  {glyph} Working"))),
+        "running status retained the legacy extra indentation: {first_count}"
+    );
+    assert!(
         ["◐", "◓", "◑", "◒"]
             .iter()
             .all(|glyph| !first_count.contains(glyph)),

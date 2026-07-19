@@ -111,6 +111,12 @@ The frontend comparison is grounded principally in these source files:
   first request tick. Running task rows use the source-shaped play marker. At
   turn completion the idle footer reconciles to provider `output_tokens` when
   available and otherwise retains the bounded estimate.
+- Primary assistant, spinner, tool-use, completion, and interruption rows share
+  the source-shaped two-column message gutter, including every logical Markdown
+  continuation line; nested tool results retain the source-shaped indented
+  result prefix. Picker descriptions use one measured display column rather than
+  byte-length or label-relative spacing, and the composer footer preserves two
+  terminal columns of right padding around its token counter.
 - Normal scrollback and the optional fullscreen transcript both preserve a
   fixed composer, resize/reflow, search, scrolling, selection, clipboard copy,
   and canonical trusted actions without leaking alternate-screen state.
