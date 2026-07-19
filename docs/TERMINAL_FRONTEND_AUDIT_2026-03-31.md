@@ -110,7 +110,10 @@ The frontend comparison is grounded principally in these source files:
   shows `round(response characters / 4)` estimated output tokens from the
   first request tick. Running task rows use the source-shaped play marker. At
   turn completion the idle footer reconciles to provider `output_tokens` when
-  available and otherwise retains the bounded estimate.
+  available and otherwise retains the bounded estimate. A transport-successful
+  Messages stream that ends with `stop_reason=refusal` but no text or tool call
+  is surfaced as a visible turn failure rather than disappearing as an empty
+  successful response.
 - Primary assistant, spinner, tool-use, completion, and interruption rows share
   the source-shaped two-column message gutter, including every logical Markdown
   continuation line; nested tool results retain the source-shaped indented

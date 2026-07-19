@@ -136,6 +136,51 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
 }
 
 #[test]
+fn empty_refusal_stream_is_rendered_instead_of_disappearing() {
+    let _serial = serial_terminal_test();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        let response = empty_refusal_stream();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let base_url = format!("HARNESS_BASE_URL=http://{address}");
+    let (mut child, mut terminal) = spawn_terminal(&[&base_url]);
+    let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
+
+    terminal.write_all(b"trigger refusal\r").unwrap();
+    let failure = read_until(&mut terminal, "stop_reason=refusal", Duration::from_secs(5));
+    assert!(failure.contains("Error:"), "{failure}");
+    assert!(failure.contains("没有返回可显示"), "{failure}");
+    let idle = if failure.contains("? for shortcuts") {
+        failure
+    } else {
+        read_until(&mut terminal, "? for shortcuts", Duration::from_secs(3))
+    };
+    assert!(idle.contains("? for shortcuts"), "{idle}");
+    assert!(child.try_wait().unwrap().is_none());
+
+    wait_for_raw_mode(&terminal, Duration::from_secs(2));
+    terminal.write_all(b"\x03").unwrap();
+    let _ = read_until(
+        &mut terminal,
+        "Press Ctrl-C again to exit",
+        Duration::from_secs(2),
+    );
+    terminal.write_all(b"\x03").unwrap();
+    assert!(wait_for_exit(&mut child, Some(&mut terminal), Duration::from_secs(3)).success());
+    server.join().unwrap();
+}
+
+#[test]
 fn composer_handles_mode_help_and_double_interrupt_exit() {
     let _serial = serial_terminal_test();
     let (mut child, mut terminal) = spawn_terminal(&[]);
@@ -1727,6 +1772,24 @@ fn text_stream(text: &str) -> String {
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
         serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .fold(String::new(), |mut body, value| {
+        write!(body, "data: {value}\n\n").expect("writing to a String cannot fail");
+        body
+    })
+}
+
+fn empty_refusal_stream() -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"refusal-turn","content":[],
+            "usage":{"input_tokens":11,"output_tokens":0}
+        }}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal"},
+            "usage":{"output_tokens":0}
+        }),
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()

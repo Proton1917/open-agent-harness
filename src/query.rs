@@ -1203,6 +1203,20 @@ impl QueryEngine {
                     assistant_text.push_str(text);
                 }
             }
+            if assistant_text.trim().is_empty()
+                && tool_uses.is_empty()
+                && !(self.structured_output_required && structured_output.is_none())
+            {
+                match response.stop_reason.as_deref() {
+                    Some("refusal") => bail!(
+                        "模型端点拒绝了请求（stop_reason=refusal），且没有返回可显示的 text 或 tool_use；请改写请求或切换模型"
+                    ),
+                    Some(reason) => bail!(
+                        "模型端点以 stop_reason={reason} 结束，但没有返回可显示的 text 或 tool_use"
+                    ),
+                    None => bail!("模型端点结束，但没有返回可显示的 text 或 tool_use"),
+                }
+            }
             let mut displayed_text = assistant_text.clone();
             if message_display_enabled {
                 let message_id = uuid::Uuid::new_v4().to_string();

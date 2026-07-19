@@ -151,6 +151,79 @@ async fn query_engine_round_trips_tool_use_and_result() {
 }
 
 #[tokio::test]
+async fn empty_refusal_stream_is_a_visible_turn_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_body(&mut stream);
+        let response = empty_refusal_stream();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+
+    let temp = tempdir().unwrap();
+    let client = ModelClient::new(EndpointConfig {
+        token: None,
+        base_url: format!("http://{address}"),
+        messages_path: "/v1/messages".into(),
+        api_format: ApiFormat::Messages,
+        stream: true,
+        chat_tokens_field: open_agent_harness::protocol::ChatTokensField::MaxCompletionTokens,
+        include_stream_usage: true,
+        allow_env_proxy: false,
+    })
+    .unwrap();
+    let context = ToolContext::new(
+        temp.path().to_owned(),
+        PermissionManager::new(
+            PermissionMode::BypassPermissions,
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let mut engine = QueryEngine::new(
+        client,
+        ToolRegistry::default(),
+        context,
+        QueryOptions {
+            model: "test-model".into(),
+            max_tokens: 64,
+            system: "test system".into(),
+            messages: Vec::new(),
+            debug: false,
+            text_delta_sink: None,
+            compact_config: None,
+        },
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+    engine.set_event_sink(Some(Arc::new(move |event| {
+        captured_events.lock().unwrap().push(event.clone());
+    })));
+
+    let error = engine
+        .run_turn("request that the endpoint refuses".into())
+        .await
+        .unwrap_err();
+    server.join().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("stop_reason=refusal"), "{message}");
+    assert!(message.contains("没有返回可显示"), "{message}");
+    assert!(engine.messages.is_empty());
+    assert!(matches!(
+        events.lock().unwrap().last(),
+        Some(QueryEvent::TurnFailed { message }) if message.contains("stop_reason=refusal")
+    ));
+}
+
+#[tokio::test]
 async fn external_instruction_change_is_loaded_before_the_next_model_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1897,6 +1970,22 @@ fn text_stream() -> String {
         serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"链路完成"}}),
         serde_json::json!({"type":"content_block_stop","index":0}),
         serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}),
+        serde_json::json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(sse_event)
+    .collect()
+}
+
+fn empty_refusal_stream() -> String {
+    [
+        serde_json::json!({"type":"message_start","message":{
+            "type":"message","role":"assistant","id":"msg_refusal","content":[],
+            "usage":{"input_tokens":15,"output_tokens":0}
+        }}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal"},
+            "usage":{"output_tokens":0}
+        }),
         serde_json::json!({"type":"message_stop"}),
     ]
     .into_iter()
