@@ -105,10 +105,12 @@ The frontend comparison is grounded principally in these source files:
   and multiline failures remain on bounded control-safe paths.
 - Inline startup uses a compact neutral name/model/mode/workspace hierarchy;
   the composer and assistant rows use distinct `❯` and platform-appropriate
-  bullet glyphs. While a response streams, the spinner remains live and shows
-  `round(response characters / 4)` estimated output tokens from the first
-  request tick. At turn completion the idle footer reconciles to provider
-  `output_tokens` when available and otherwise retains the bounded estimate.
+  bullet glyphs. While a response streams, the spinner uses the source-shaped
+  platform/Ghostty glyph sequence in a 120 ms forward-and-reverse cycle and
+  shows `round(response characters / 4)` estimated output tokens from the
+  first request tick. Running task rows use the source-shaped play marker. At
+  turn completion the idle footer reconciles to provider `output_tokens` when
+  available and otherwise retains the bounded estimate.
 - Normal scrollback and the optional fullscreen transcript both preserve a
   fixed composer, resize/reflow, search, scrolling, selection, clipboard copy,
   and canonical trusted actions without leaking alternate-screen state.

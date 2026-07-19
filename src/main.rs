@@ -166,7 +166,7 @@ impl TaskUiMonitor {
                     .map(|item| {
                         let marker = match item.status {
                             TaskUiStatus::Completed => "✓",
-                            TaskUiStatus::InProgress | TaskUiStatus::Tracked => "◐",
+                            TaskUiStatus::InProgress | TaskUiStatus::Tracked => "▶",
                             TaskUiStatus::Scheduled => "◷",
                             TaskUiStatus::Pending | TaskUiStatus::Unknown => "○",
                         };

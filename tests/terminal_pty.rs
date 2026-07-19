@@ -83,6 +83,18 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
     assert!(!first_delta.contains("_TOKEN_COUNT_OK!"), "{first_delta}");
     let first_count = read_until(&mut terminal, "↓ 2 tokens", Duration::from_secs(5));
     assert!(first_count.contains("Working"), "{first_count}");
+    assert!(
+        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
+            .iter()
+            .any(|glyph| first_count.contains(glyph)),
+        "running status did not use a source-shaped spinner frame: {first_count}"
+    );
+    assert!(
+        ["◐", "◓", "◑", "◒"]
+            .iter()
+            .all(|glyph| !first_count.contains(glyph)),
+        "legacy quadrant spinner leaked into running status: {first_count}"
+    );
     release_stream.send(()).unwrap();
     let second_count = read_until(&mut terminal, "↓ 6 tokens", Duration::from_secs(5));
     assert!(second_count.contains("↓ 6 tokens"), "{second_count}");

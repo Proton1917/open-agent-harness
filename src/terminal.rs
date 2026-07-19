@@ -77,6 +77,27 @@ const MAX_FULLSCREEN_STREAM_BYTES: usize = 64 * 1024;
 const MAX_PERMISSION_PREVIEW_BYTES: usize = 64 * 1024;
 const FULLSCREEN_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const EMPTY_TRANSCRIPT_MESSAGE: &str = "Transcript is empty.";
+const MACOS_SPINNER_FRAMES: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
+const GHOSTTY_SPINNER_FRAMES: &[&str] =
+    &["·", "✢", "✳", "✶", "✻", "*", "*", "✻", "✶", "✳", "✢", "·"];
+const OTHER_SPINNER_FRAMES: &[&str] = &["·", "✢", "*", "✶", "✻", "✽", "✽", "✻", "✶", "*", "✢", "·"];
+
+fn spinner_frames_for(term: Option<&str>, is_macos: bool) -> &'static [&'static str] {
+    if term == Some("xterm-ghostty") {
+        GHOSTTY_SPINNER_FRAMES
+    } else if is_macos {
+        MACOS_SPINNER_FRAMES
+    } else {
+        OTHER_SPINNER_FRAMES
+    }
+}
+
+fn spinner_frames() -> &'static [&'static str] {
+    spinner_frames_for(
+        std::env::var("TERM").ok().as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitKey {
@@ -1123,15 +1144,15 @@ impl ConversationUi {
     fn start_progress(&self, label: String, generation: u64) {
         let ui = self.clone();
         std::thread::spawn(move || {
-            let frames = ["◐", "◓", "◑", "◒"];
-            let mut frame = 0usize;
+            let frames = spinner_frames();
+            let mut frame = 1usize;
             loop {
-                std::thread::sleep(Duration::from_millis(125));
+                std::thread::sleep(Duration::from_millis(120));
                 if ui.progress_epoch.load(Ordering::Acquire) != generation {
                     break;
                 }
                 ui.tick_progress(&label, frames[frame % frames.len()], generation);
-                frame = frame.saturating_add(1);
+                frame = (frame + 1) % frames.len();
             }
         });
     }
@@ -8127,7 +8148,7 @@ fn close_assistant(out: &mut impl Write, state: &mut OutputState) {
 }
 
 fn styled_status(out: &mut impl Write, color: bool, label: &str) -> io::Result<()> {
-    styled_status_frame(out, color, "◐", label)
+    styled_status_frame(out, color, spinner_frames()[0], label)
 }
 
 fn styled_status_frame(
@@ -8850,6 +8871,22 @@ mod tests {
         let narrow = prompt_footer_line("  ? for shortcuts", Some(123), 20);
         assert_eq!(UnicodeWidthStr::width(narrow.as_str()), 20);
         assert!(narrow.contains("tokens") || narrow.ends_with('…'));
+    }
+
+    #[test]
+    fn spinner_frames_follow_source_platform_variants() {
+        assert_eq!(
+            spinner_frames_for(None, true),
+            ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"]
+        );
+        assert_eq!(
+            spinner_frames_for(Some("xterm-ghostty"), true),
+            ["·", "✢", "✳", "✶", "✻", "*", "*", "✻", "✶", "✳", "✢", "·"]
+        );
+        assert_eq!(
+            spinner_frames_for(None, false),
+            ["·", "✢", "*", "✶", "✻", "✽", "✽", "✻", "✶", "*", "✢", "·"]
+        );
     }
 
     #[test]
