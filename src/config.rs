@@ -21,9 +21,12 @@ const MAX_PLUGIN_DIRECTORIES: usize = 32;
 const MAX_EXTENSION_PATH_BYTES: usize = 4096;
 const MAX_OUTPUT_STYLE_NAME_BYTES: usize = 128;
 const MAX_MODEL_OPTIONS: usize = 64;
+const MAX_MODEL_BACKENDS: usize = 16;
 const MAX_MODEL_ID_BYTES: usize = 512;
+const MAX_MODEL_BACKEND_NAME_BYTES: usize = 128;
 const MAX_MODEL_DISPLAY_BYTES: usize = 256;
 const MAX_MODEL_DESCRIPTION_BYTES: usize = 1024;
+const MAX_MODEL_ENDPOINT_BYTES: usize = 4096;
 const MAX_AGENT_SETTING_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +109,13 @@ fn parse_model_option(value: &Value) -> Result<ModelOption> {
     let (model, display_name, description) = match value {
         Value::String(model) => (model.as_str(), model.as_str(), ""),
         Value::Object(object) => {
-            let allowed = ["value", "displayName", "description", "reasoningEfforts"];
+            let allowed = [
+                "value",
+                "displayName",
+                "description",
+                "reasoningEfforts",
+                "backend",
+            ];
             if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
                 anyhow::bail!("models option 包含未知字段 {key}")
             }
@@ -115,6 +124,12 @@ fn parse_model_option(value: &Value) -> Result<ModelOption> {
                 .get("value")
                 .and_then(Value::as_str)
                 .context("models option.value 必须是 string")?;
+            if let Some(backend) = object.get("backend") {
+                let backend = backend
+                    .as_str()
+                    .context("models option.backend 必须是 string")?;
+                validate_model_backend_name(backend)?;
+            }
             let display_name = object
                 .get("displayName")
                 .map(|value| {
@@ -150,6 +165,29 @@ fn parse_model_option(value: &Value) -> Result<ModelOption> {
         display_name: display_name.to_owned(),
         description: description.to_owned(),
     })
+}
+
+fn validate_model_backend_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_MODEL_BACKEND_NAME_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        anyhow::bail!("model backend 名称为空、过长或包含非法字符")
+    }
+    Ok(())
+}
+
+fn validate_model_endpoint_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.len() > MAX_MODEL_ENDPOINT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("model backend {field} 为空、过长或包含空白/控制字符")
+    }
+    Ok(())
 }
 
 fn parse_model_reasoning_efforts(
@@ -236,7 +274,10 @@ impl Settings {
             return;
         };
         root.retain(|key, _| {
-            matches!(key.as_str(), "model" | "models" | "permissions" | "sandbox")
+            matches!(
+                key.as_str(),
+                "model" | "models" | "modelBackends" | "permissions" | "sandbox"
+            )
         });
     }
 
@@ -296,6 +337,128 @@ impl Settings {
             });
         }
         Ok(options)
+    }
+
+    /// Returns trusted per-model endpoint routes. Alternate routes never inherit
+    /// the default endpoint credential, preventing a model catalog entry from
+    /// forwarding that secret to another origin.
+    pub fn model_endpoint_routes(&self) -> Result<HashMap<String, EndpointConfig>> {
+        let mut backends = HashMap::new();
+        if let Some(value) = self.raw.get("modelBackends") {
+            let values = value.as_object().context("modelBackends 必须是 object")?;
+            if values.len() > MAX_MODEL_BACKENDS {
+                anyhow::bail!("modelBackends 超过 {MAX_MODEL_BACKENDS} 个限制")
+            }
+            for (name, value) in values {
+                validate_model_backend_name(name)?;
+                let object = value
+                    .as_object()
+                    .with_context(|| format!("modelBackends.{name} 必须是 object"))?;
+                let allowed = [
+                    "baseUrl",
+                    "apiPath",
+                    "apiFormat",
+                    "stream",
+                    "chatTokensField",
+                    "includeStreamUsage",
+                    "allowEnvProxy",
+                ];
+                if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+                    anyhow::bail!("modelBackends.{name} 包含未知字段 {key}")
+                }
+                let base_url = object
+                    .get("baseUrl")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("modelBackends.{name}.baseUrl 必须是 string"))?;
+                let api_path = object
+                    .get("apiPath")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("modelBackends.{name}.apiPath 必须是 string"))?;
+                validate_model_endpoint_text(base_url, "baseUrl")?;
+                validate_model_endpoint_text(api_path, "apiPath")?;
+                let api_format = object
+                    .get("apiFormat")
+                    .map(|value| {
+                        let value = value.as_str().with_context(|| {
+                            format!("modelBackends.{name}.apiFormat 必须是 string")
+                        })?;
+                        ApiFormat::from_str(value, true).map_err(|error| {
+                            anyhow::anyhow!("modelBackends.{name}.apiFormat 无效: {error}")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(ApiFormat::Auto);
+                let chat_tokens_field = object
+                    .get("chatTokensField")
+                    .map(|value| {
+                        let value = value.as_str().with_context(|| {
+                            format!("modelBackends.{name}.chatTokensField 必须是 string")
+                        })?;
+                        ChatTokensField::from_str(value, true).map_err(|error| {
+                            anyhow::anyhow!("modelBackends.{name}.chatTokensField 无效: {error}")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(ChatTokensField::MaxCompletionTokens);
+                let bool_value = |key: &str, default: bool| -> Result<bool> {
+                    object
+                        .get(key)
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .with_context(|| format!("modelBackends.{name}.{key} 必须是 bool"))
+                        })
+                        .transpose()
+                        .map(|value| value.unwrap_or(default))
+                };
+                backends.insert(
+                    name.clone(),
+                    EndpointConfig {
+                        token: None,
+                        base_url: base_url.trim_end_matches('/').to_owned(),
+                        messages_path: api_path.to_owned(),
+                        api_format,
+                        stream: bool_value("stream", true)?,
+                        chat_tokens_field,
+                        include_stream_usage: bool_value("includeStreamUsage", true)?,
+                        allow_env_proxy: bool_value("allowEnvProxy", false)?,
+                    },
+                );
+            }
+        }
+
+        let mut routes = HashMap::new();
+        let Some(models) = self.raw.get("models") else {
+            return Ok(routes);
+        };
+        let models = models.as_array().context("models 必须是 array")?;
+        if models.len() > MAX_MODEL_OPTIONS {
+            anyhow::bail!("models 超过 {MAX_MODEL_OPTIONS} 个限制")
+        }
+        for value in models {
+            let Value::Object(object) = value else {
+                continue;
+            };
+            let Some(backend) = object.get("backend") else {
+                continue;
+            };
+            let backend = backend
+                .as_str()
+                .context("models option.backend 必须是 string")?;
+            validate_model_backend_name(backend)?;
+            let model = object
+                .get("value")
+                .and_then(Value::as_str)
+                .context("models option.value 必须是 string")?;
+            validate_model_id(model)?;
+            let endpoint = backends
+                .get(backend)
+                .with_context(|| format!("model {model} 引用了不存在的 backend {backend}"))?;
+            if routes.insert(model.to_owned(), endpoint.clone()).is_some() {
+                anyhow::bail!("models 包含重复 model id: {model}")
+            }
+        }
+        Ok(routes)
     }
 
     /// Returns explicit trusted per-model effort capabilities. Missing entries
@@ -840,6 +1003,7 @@ mod tests {
                 },
                 "sandbox": {"enabled": true, "failIfUnavailable": false},
                 "model": "project-model",
+                "modelBackends": {"redirect":{"baseUrl":"https://untrusted.invalid","apiPath":"/responses"}},
                 "commands": {"unsafe":"run this"},
                 "plugins": {"directories":["/tmp/untrusted"]},
                 "memory": {"enabled":true},
@@ -861,6 +1025,7 @@ mod tests {
             serde_json::json!(["Bash(git push *)", "Write(secrets/**)"])
         );
         assert_eq!(trusted["model"], "trusted-model");
+        assert!(trusted.get("modelBackends").is_none());
         assert!(trusted.get("commands").is_none());
         assert!(trusted.get("plugins").is_none());
         assert!(trusted.get("memory").is_none());
@@ -971,6 +1136,7 @@ mod tests {
             raw: serde_json::json!({
                 "model":"model-id",
                 "models":["model-id", {"value":"other", "displayName":"Other", "description":"Fallback"}],
+                "modelBackends":{"local":{"baseUrl":"http://127.0.0.1:8080","apiPath":"/v1/messages"}},
                 "permissions":{"defaultMode":"dontAsk", "deny":["Bash(rm:*)"]},
                 "sandbox":{"enabled":true, "allowedDomains":["example.com"]},
                 "env":{"SECRET":"must-not-apply"},
@@ -989,11 +1155,12 @@ mod tests {
         };
         settings.retain_safe_mode_core();
         let root = settings.raw.as_object().unwrap();
-        assert_eq!(root.len(), 4);
+        assert_eq!(root.len(), 5);
         assert_eq!(settings.model(), Some("model-id"));
         assert_eq!(settings.model_options("model-id").unwrap().len(), 2);
         assert_eq!(settings.deny_rules(), vec!["Bash(rm:*)"]);
         assert!(root.contains_key("sandbox"));
+        assert!(root.contains_key("modelBackends"));
         assert!(!root.contains_key("env"));
         assert!(!root.contains_key("plugins"));
         assert!(!root.contains_key("mcpServers"));
@@ -1052,5 +1219,67 @@ mod tests {
             MAX_MODEL_OPTIONS
         );
         assert!(settings.model_options("missing-current").is_err());
+    }
+
+    #[test]
+    fn model_endpoint_routes_are_typed_bounded_and_never_inherit_auth() {
+        let settings = Settings {
+            raw: serde_json::json!({
+                "modelBackends": {
+                    "local-responses": {
+                        "baseUrl": "http://127.0.0.1:43177/root/",
+                        "apiPath": "/v1/responses",
+                        "apiFormat": "responses",
+                        "stream": false,
+                        "chatTokensField": "max-tokens",
+                        "includeStreamUsage": false,
+                        "allowEnvProxy": false
+                    }
+                },
+                "models": [
+                    {"value":"default-model", "displayName":"Default"},
+                    {"value":"routed-model", "backend":"local-responses"}
+                ]
+            }),
+        };
+        assert_eq!(settings.model_options("default-model").unwrap().len(), 2);
+        let routes = settings.model_endpoint_routes().unwrap();
+        assert_eq!(routes.len(), 1);
+        let route = &routes["routed-model"];
+        assert_eq!(route.base_url, "http://127.0.0.1:43177/root");
+        assert_eq!(route.messages_path, "/v1/responses");
+        assert_eq!(route.api_format, ApiFormat::Responses);
+        assert_eq!(route.chat_tokens_field, ChatTokensField::MaxTokens);
+        assert!(!route.stream);
+        assert!(!route.include_stream_usage);
+        assert!(!route.allow_env_proxy);
+        assert!(route.token.is_none());
+
+        for raw in [
+            serde_json::json!({"modelBackends":[]}),
+            serde_json::json!({"modelBackends":{"bad name":{"baseUrl":"http://127.0.0.1","apiPath":"/"}}}),
+            serde_json::json!({"modelBackends":{"local":{"baseUrl":"http://127.0.0.1","apiPath":"/","token":"secret"}}}),
+            serde_json::json!({"modelBackends":{"local":{"baseUrl":"http://127.0.0.1","apiPath":"/","stream":"yes"}}}),
+            serde_json::json!({"models":[{"value":"model", "backend":"missing"}]}),
+            serde_json::json!({"models":[{"value":"model", "backend":"bad name"}]}),
+        ] {
+            assert!(Settings { raw }.model_endpoint_routes().is_err());
+        }
+
+        let too_many = (0..=MAX_MODEL_BACKENDS)
+            .map(|index| {
+                (
+                    format!("backend-{index}"),
+                    serde_json::json!({"baseUrl":"http://127.0.0.1","apiPath":"/v1/messages"}),
+                )
+            })
+            .collect::<Map<String, Value>>();
+        assert!(
+            Settings {
+                raw: serde_json::json!({"modelBackends":too_many})
+            }
+            .model_endpoint_routes()
+            .is_err()
+        );
     }
 }

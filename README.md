@@ -198,18 +198,27 @@ custom proprietary themes, brand styling, exact wording/layout, or pixel
 identity. The frontend evidence and boundaries are tracked in
 [the March 31 source audit](docs/TERMINAL_FRONTEND_AUDIT_2026-03-31.md).
 
-Executable and network integrations are accepted only from `~/.open-agent-harness/settings.json` or an explicit `--settings` value. A repository cannot smuggle them in through its own settings file. A compact example:
+Executable and network integrations are accepted only from `~/.open-agent-harness/settings.json` or an explicit `--settings` value. A repository cannot smuggle them in through its own settings file. A model can reference a trusted `modelBackends` entry to switch endpoint and wire protocol with `/model`; alternate routes never inherit the default bearer token. A compact example:
 
 ```json
 {
   "strictMcpConfig": true,
   "model": "provider/model-a",
+  "modelBackends": {
+    "local": {
+      "baseUrl": "http://127.0.0.1:8080",
+      "apiPath": "/v1/messages",
+      "apiFormat": "messages",
+      "stream": true
+    }
+  },
   "models": [
     "provider/model-a",
     {
       "value": "provider/model-b",
       "displayName": "Model B",
-      "description": "Configured fallback"
+      "description": "Configured fallback",
+      "backend": "local"
     }
   ],
   "plugins": {"directories": ["/absolute/path/to/plugin"]},
@@ -502,18 +511,27 @@ open-agent-harness plugin list
 
 开放边界同样明确：OAuth 不会启动、控制或内嵌浏览器，也不会暗开 callback listener；authorization URL 与 callback 通过显式私有文件/环境值交接。进程内动态修改 plugin/MCP、任意 transcript 注入/replay 与厂商 callback 控制不属于 stream-JSON 契约；plugin lifecycle 是影响后续进程的独立 CLI 操作。`RunWorkflow` 是声明式 DAG，不是 JavaScript 或下载代码 runtime。协作运行的 harness 进程会用私有锁文件串行 auto-memory 写入；file-history rollback journal 仍是进程内的，不能为独立 OS 进程的编辑排序。MCP elicitation 等待用户响应时会串行该 server 的 RPC reader；headless interaction 与 root 本地 TTY 共用不超过 120 秒的配置上限，超时不会遗留抢读 stdin 的 detached reader。精确的非声明项见 [3 月 31 日通用行为审校](docs/GENERIC_PARITY_2026-03-31.md)。
 
-可执行与网络集成只接受 `~/.open-agent-harness/settings.json` 或显式 `--settings`；仓库不能借自己的 settings 偷渡它们。精简示例：
+可执行与网络集成只接受 `~/.open-agent-harness/settings.json` 或显式 `--settings`；仓库不能借自己的 settings 偷渡它们。模型可引用可信 `modelBackends`，使 `/model` 同步切换 endpoint 与协议；备用路由绝不继承默认 bearer token。精简示例：
 
 ```json
 {
   "strictMcpConfig": true,
   "model": "provider/model-a",
+  "modelBackends": {
+    "local": {
+      "baseUrl": "http://127.0.0.1:8080",
+      "apiPath": "/v1/messages",
+      "apiFormat": "messages",
+      "stream": true
+    }
+  },
   "models": [
     "provider/model-a",
     {
       "value": "provider/model-b",
       "displayName": "Model B",
-      "description": "Configured fallback"
+      "description": "Configured fallback",
+      "backend": "local"
     }
   ],
   "plugins": {"directories": ["/absolute/path/to/plugin"]},

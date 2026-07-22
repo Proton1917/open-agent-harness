@@ -18,7 +18,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
-fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
+fn streamed_response_appends_once_and_reconciles_exact_output_usage() {
     let _serial = serial_terminal_test();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -72,55 +72,39 @@ fn streamed_response_shows_live_tokens_and_reconciles_exact_output_usage() {
     let _ = read_until(&mut terminal, "? for shortcuts", Duration::from_secs(5));
 
     terminal.write_all(b"count live tokens\r").unwrap();
-    let active = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(3));
-    assert!(active.contains("esc to interrupt"), "{active}");
-    let first_delta = if active.contains("LIVE1234") {
-        active.clone()
-    } else {
-        read_until(&mut terminal, "LIVE1234", Duration::from_secs(3))
-    };
-    assert!(first_delta.contains("LIVE1234"), "{first_delta}");
-    assert!(!first_delta.contains("_TOKEN_COUNT_OK!"), "{first_delta}");
-    let first_count = read_until(&mut terminal, "↓ 2 tokens", Duration::from_secs(5));
-    assert!(first_count.contains("Working"), "{first_count}");
-    assert!(
-        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
-            .iter()
-            .any(|glyph| first_count.contains(glyph)),
-        "running status did not use a source-shaped spinner frame: {first_count}"
-    );
-    assert!(
-        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
-            .iter()
-            .any(|glyph| first_count.contains(&format!("{glyph} Working"))),
-        "running label did not start after the fixed two-column gutter: {first_count}"
-    );
-    assert!(
-        ["·", "✢", "✳", "✶", "✻", "✽", "*"]
-            .iter()
-            .all(|glyph| !first_count.contains(&format!("  {glyph} Working"))),
-        "running status retained the legacy extra indentation: {first_count}"
-    );
-    assert!(
-        ["◐", "◓", "◑", "◒"]
-            .iter()
-            .all(|glyph| !first_count.contains(glyph)),
-        "legacy quadrant spinner leaked into running status: {first_count}"
-    );
+    let mut output = read_until(&mut terminal, "esc to interrupt", Duration::from_secs(3));
+    assert!(output.contains("esc to interrupt"), "{output}");
+    if !output.contains("LIVE1234") {
+        output.push_str(&read_until(
+            &mut terminal,
+            "LIVE1234",
+            Duration::from_secs(3),
+        ));
+    }
+    assert!(output.contains("LIVE1234"), "{output}");
+    assert!(!output.contains("_TOKEN_COUNT_OK!"), "{output}");
+    let quiet = read_available(&mut terminal, Duration::from_millis(700));
+    assert!(!quiet.contains("LIVE1234"), "{quiet}");
+    assert!(!quiet.contains("Working"), "{quiet}");
+    output.push_str(&quiet);
     release_stream.send(()).unwrap();
-    let second_count = read_until(&mut terminal, "↓ 6 tokens", Duration::from_secs(5));
-    assert!(second_count.contains("↓ 6 tokens"), "{second_count}");
-    let answer = read_until(
+    output.push_str(&read_until(
         &mut terminal,
-        "LIVE1234_TOKEN_COUNT_OK!",
+        "_TOKEN_COUNT_OK!",
         Duration::from_secs(5),
-    );
-    let exact = if answer.contains("↓ 7 tokens") {
-        answer
-    } else {
-        read_until(&mut terminal, "↓ 7 tokens", Duration::from_secs(3))
-    };
-    assert!(exact.contains("? for shortcuts"), "{exact}");
+    ));
+    if !output.contains("↓ 7 tokens") {
+        output.push_str(&read_until(
+            &mut terminal,
+            "↓ 7 tokens",
+            Duration::from_secs(3),
+        ));
+    }
+    assert_eq!(output.matches("LIVE1234").count(), 1, "{output}");
+    assert_eq!(output.matches("_TOKEN_COUNT_OK!").count(), 1, "{output}");
+    assert_eq!(output.matches("Working").count(), 1, "{output}");
+    assert!(output.contains("↓ 7 tokens"), "{output}");
+    assert!(output.contains("? for shortcuts"), "{output}");
     assert!(child.try_wait().unwrap().is_none());
 
     wait_for_raw_mode(&terminal, Duration::from_secs(2));

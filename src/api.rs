@@ -1,4 +1,9 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -24,8 +29,16 @@ pub struct ModelClient {
     http: Client,
     endpoint: EndpointConfig,
     messages_url: reqwest::Url,
+    model_routes: Arc<RwLock<HashMap<String, ModelRoute>>>,
     effort: Option<ReasoningEffort>,
     retry_sink: Option<Arc<dyn Fn(ApiRetryEvent) + Send + Sync>>,
+}
+
+#[derive(Clone)]
+struct ModelRoute {
+    http: Client,
+    endpoint: EndpointConfig,
+    messages_url: reqwest::Url,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,25 +150,31 @@ pub fn is_size_rejection(error: &anyhow::Error) -> bool {
 
 impl ModelClient {
     pub fn new(endpoint: EndpointConfig) -> Result<Self> {
-        let messages_url = build_messages_url(&endpoint)?;
-        let mut endpoint = endpoint;
-        endpoint.api_format = endpoint.api_format.infer(&endpoint.messages_path);
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(600))
-            .redirect(reqwest::redirect::Policy::none());
-        if !endpoint.allow_env_proxy {
-            builder = builder.no_proxy();
-        }
-        builder = process_network_trust().apply_reqwest(builder)?;
-        let http = builder.build().context("无法创建 HTTP client")?;
+        let route = build_model_route(endpoint)?;
         Ok(Self {
-            http,
-            endpoint,
-            messages_url,
+            http: route.http,
+            endpoint: route.endpoint,
+            messages_url: route.messages_url,
+            model_routes: Arc::new(RwLock::new(HashMap::new())),
             effort: None,
             retry_sink: None,
         })
+    }
+
+    pub fn set_model_routes(&self, routes: HashMap<String, EndpointConfig>) -> Result<()> {
+        if routes.len() > 64 {
+            bail!("model endpoint routes 超过 64 个限制")
+        }
+        let mut built = HashMap::with_capacity(routes.len());
+        for (model, endpoint) in routes {
+            crate::config::validate_model_id(&model)?;
+            built.insert(model, build_model_route(endpoint)?);
+        }
+        *self
+            .model_routes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = built;
+        Ok(())
     }
 
     pub fn set_effort(&mut self, effort: Option<ReasoningEffort>) {
@@ -186,17 +205,28 @@ impl ModelClient {
         tools: &[Value],
         on_text_delta: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<MessageResult> {
+        let selected_route = self
+            .model_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model)
+            .cloned();
+        let (http, endpoint, messages_url) = selected_route
+            .as_ref()
+            .map_or((&self.http, &self.endpoint, &self.messages_url), |route| {
+                (&route.http, &route.endpoint, &route.messages_url)
+            });
         let body = encode_request_with_effort(
-            self.endpoint.api_format,
+            endpoint.api_format,
             RequestParts {
                 model,
                 max_tokens,
                 system,
                 messages,
                 tools,
-                stream: self.endpoint.stream,
-                chat_tokens_field: self.endpoint.chat_tokens_field,
-                include_stream_usage: self.endpoint.include_stream_usage,
+                stream: endpoint.stream,
+                chat_tokens_field: endpoint.chat_tokens_field,
+                include_stream_usage: endpoint.include_stream_usage,
             },
             self.effort,
         )?;
@@ -206,12 +236,11 @@ impl ModelClient {
         }
         let mut last_error = None;
         for attempt in 0..4u32 {
-            let mut request = self
-                .http
-                .post(self.messages_url.clone())
+            let mut request = http
+                .post(messages_url.clone())
                 .header("content-type", "application/json")
                 .body(encoded_body.clone());
-            if let Some(token) = &self.endpoint.token {
+            if let Some(token) = &endpoint.token {
                 request = request.bearer_auth(token);
             }
             let response = match request.send().await {
@@ -234,9 +263,9 @@ impl ModelClient {
                 if is_sse {
                     return parse_sse(
                         response,
-                        self.endpoint.api_format,
+                        endpoint.api_format,
                         on_text_delta,
-                        self.endpoint.token.as_deref(),
+                        endpoint.token.as_deref(),
                     )
                     .await;
                 }
@@ -247,16 +276,16 @@ impl ModelClient {
                         truncate(
                             &redact_text(
                                 &String::from_utf8_lossy(&bytes),
-                                self.endpoint.token.as_deref()
+                                endpoint.token.as_deref()
                             ),
                             1000
                         )
                     )
                 })?;
-                redact_value(&mut value, self.endpoint.token.as_deref());
-                let mut response = parse_response(self.endpoint.api_format, value)
+                redact_value(&mut value, endpoint.token.as_deref());
+                let mut response = parse_response(endpoint.api_format, value)
                     .context("API 返回了无效的 model response")?;
-                redact_response(&mut response, self.endpoint.token.as_deref());
+                redact_response(&mut response, endpoint.token.as_deref());
                 return Ok(MessageResult {
                     response,
                     streamed_text: false,
@@ -264,7 +293,7 @@ impl ModelClient {
             }
             let bytes = read_body_limited(response, MAX_ERROR_BYTES, "API 错误响应").await?;
             let text = String::from_utf8_lossy(&bytes);
-            let error = api_error(status, &text, self.endpoint.token.as_deref());
+            let error = api_error(status, &text, endpoint.token.as_deref());
             if retryable(status) && attempt < 3 {
                 last_error = Some(error);
                 let delay = retry_after
@@ -278,6 +307,25 @@ impl ModelClient {
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("API 请求失败")))
     }
+}
+
+fn build_model_route(mut endpoint: EndpointConfig) -> Result<ModelRoute> {
+    let messages_url = build_messages_url(&endpoint)?;
+    endpoint.api_format = endpoint.api_format.infer(&endpoint.messages_path);
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::none());
+    if !endpoint.allow_env_proxy {
+        builder = builder.no_proxy();
+    }
+    builder = process_network_trust().apply_reqwest(builder)?;
+    let http = builder.build().context("无法创建 HTTP client")?;
+    Ok(ModelRoute {
+        http,
+        endpoint,
+        messages_url,
+    })
 }
 
 async fn parse_sse(
@@ -885,6 +933,132 @@ mod tests {
                 reason: "HTTP 503".to_owned(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn model_routes_switch_endpoint_protocol_and_keep_default_token_isolated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(
+            listener: tokio::net::TcpListener,
+            expected_auth: Option<&'static str>,
+            body_marker: &'static str,
+            response: &'static str,
+        ) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let header_end = loop {
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains(body_marker), "{request}");
+            match expected_auth {
+                Some(value) => assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains(&format!("authorization: bearer {value}")),
+                    "{request}"
+                ),
+                None => assert!(
+                    !request.to_ascii_lowercase().contains("authorization:"),
+                    "{request}"
+                ),
+            }
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let default_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let routed_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let default_address = default_listener.local_addr().unwrap();
+        let routed_address = routed_listener.local_addr().unwrap();
+        let default_server = tokio::spawn(serve_once(
+            default_listener,
+            Some("base-route-secret"),
+            "\"messages\"",
+            r#"{"id":"base-response","type":"message","role":"assistant","content":[{"type":"text","text":"base"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ));
+        let routed_server = tokio::spawn(serve_once(
+            routed_listener,
+            None,
+            "\"input\"",
+            r#"{"id":"routed-response","status":"completed","output":[{"type":"message","id":"routed-message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"routed"}]}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ));
+
+        let mut default_endpoint = endpoint(&format!("http://{default_address}"), "/v1/messages");
+        default_endpoint.token = Some("base-route-secret".to_owned());
+        default_endpoint.api_format = ApiFormat::Messages;
+        default_endpoint.stream = false;
+        let client = ModelClient::new(default_endpoint).unwrap();
+        let mut routed_endpoint = endpoint(&format!("http://{routed_address}"), "/v1/responses");
+        routed_endpoint.api_format = ApiFormat::Responses;
+        routed_endpoint.stream = false;
+        client
+            .set_model_routes(HashMap::from([(
+                "routed-model".to_owned(),
+                routed_endpoint,
+            )]))
+            .unwrap();
+
+        let routed = client
+            .messages(
+                "routed-model",
+                32,
+                "",
+                &[Message::user_text("route me")],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed.response.id, "routed-response");
+        let base = client
+            .messages(
+                "base-model",
+                32,
+                "",
+                &[Message::user_text("use base")],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(base.response.id, "base-response");
+        routed_server.await.unwrap();
+        default_server.await.unwrap();
     }
 
     #[test]

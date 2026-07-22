@@ -195,6 +195,8 @@ struct OutputState {
     markdown_committed_lines: usize,
     markdown_preview_rows: usize,
     final_markdown: Option<RenderedMarkdown>,
+    inline_streamed_raw: bool,
+    inline_stream_at_line_start: bool,
     syntax_highlighting: bool,
     trusted_roots: Vec<PathBuf>,
     prompt_color: Option<String>,
@@ -245,6 +247,8 @@ impl Default for OutputState {
             markdown_committed_lines: 0,
             markdown_preview_rows: 0,
             final_markdown: None,
+            inline_streamed_raw: false,
+            inline_stream_at_line_start: true,
             syntax_highlighting: true,
             trusted_roots: Vec::new(),
             prompt_color: None,
@@ -926,6 +930,8 @@ impl ConversationUi {
                 state.last_turn_duration = None;
                 state.response_chars = 0;
                 state.pending_stream_chars = 0;
+                state.inline_streamed_raw = false;
+                state.inline_stream_at_line_start = true;
             }
             QueryEvent::AssistantMessage { display_text, .. } => {
                 let display_chars = display_text.chars().count();
@@ -1016,15 +1022,17 @@ impl ConversationUi {
                 let rendered = state.final_markdown.take().unwrap_or_default();
                 let preview_anchor =
                     clear_assistant_markdown_preview(&mut out, &mut state).unwrap_or(false);
-                let start = state.markdown_committed_lines.min(rendered.lines.len());
-                if start < rendered.lines.len() {
-                    let _ = write_assistant_markdown_lines_at(
-                        &mut out,
-                        self.color,
-                        &mut state.assistant_open,
-                        &rendered.lines[start..],
-                        preview_anchor,
-                    );
+                if !state.inline_streamed_raw {
+                    let start = state.markdown_committed_lines.min(rendered.lines.len());
+                    if start < rendered.lines.len() {
+                        let _ = write_assistant_markdown_lines_at(
+                            &mut out,
+                            self.color,
+                            &mut state.assistant_open,
+                            &rendered.lines[start..],
+                            preview_anchor,
+                        );
+                    }
                 }
                 state.markdown_committed_lines = rendered.lines.len();
             }
@@ -1153,9 +1161,6 @@ impl ConversationUi {
         let _ = out.flush();
         drop(out);
         drop(state);
-        if let Some(label) = progress_label.filter(|_| self.interactive()) {
-            self.start_progress(label, generation);
-        }
     }
 
     fn start_progress(&self, label: String, generation: u64) {
@@ -1228,49 +1233,26 @@ impl ConversationUi {
         let delta_chars = delta.chars().count();
         state.response_chars = state.response_chars.saturating_add(delta_chars);
         state.pending_stream_chars = state.pending_stream_chars.saturating_add(delta_chars);
-        let frame = append_bounded_fullscreen_stream(&mut state, delta);
+        let inline_delta = sanitize_multiline(delta);
+        append_bounded_fullscreen_stream(&mut state, delta);
         if state.fullscreen_guard.is_some() {
             let _ = render_fullscreen_locked(&mut state, None);
             return;
         }
+        self.progress_epoch.fetch_add(1, Ordering::AcqRel);
         let mut out = io::stdout().lock();
         let _ = suspend_inline_active_turn_input(&mut out, &mut state);
         clear_status(&mut out, &mut state);
-        let mut preview_anchor =
-            clear_assistant_markdown_preview(&mut out, &mut state).unwrap_or(false);
-        let start = state.markdown_committed_lines.min(frame.stable.lines.len());
-        if start < frame.stable.lines.len() {
-            let _ = write_assistant_markdown_lines_at(
-                &mut out,
-                self.color,
-                &mut state.assistant_open,
-                &frame.stable.lines[start..],
-                preview_anchor,
-            );
-            state.markdown_committed_lines = frame.stable.lines.len();
-            preview_anchor = false;
-        }
-        if !frame.unstable.lines.is_empty() {
-            let (columns, rows) = terminal::size()
-                .map(|(columns, rows)| (usize::from(columns), usize::from(rows)))
-                .unwrap_or((80, 24));
-            let bounded_preview = bounded_markdown_preview(
-                &frame.unstable.lines,
-                columns,
-                rows.saturating_sub(4).max(1),
-            );
-            let preview_lines = bounded_preview
-                .as_deref()
-                .unwrap_or(frame.unstable.lines.as_slice());
-            let _ = write_assistant_markdown_lines_at(
-                &mut out,
-                self.color,
-                &mut state.assistant_open,
-                preview_lines,
-                preview_anchor,
-            );
-            state.markdown_preview_rows = rendered_markdown_rows(preview_lines, columns);
-        }
+        let _ = clear_assistant_markdown_preview(&mut out, &mut state);
+        let mut at_line_start = state.inline_stream_at_line_start;
+        let _ = write_assistant_stream_delta(
+            &mut out,
+            &mut state.assistant_open,
+            &mut at_line_start,
+            &inline_delta,
+        );
+        state.inline_stream_at_line_start = at_line_start;
+        state.inline_streamed_raw |= !inline_delta.is_empty();
         let _ = resume_inline_active_turn_input(&mut out, &mut state);
         let _ = out.flush();
     }
@@ -1507,6 +1489,8 @@ fn reset_markdown_stream(state: &mut OutputState) {
     state.markdown_committed_lines = 0;
     state.markdown_preview_rows = 0;
     state.final_markdown = None;
+    state.inline_streamed_raw = false;
+    state.inline_stream_at_line_start = true;
 }
 
 fn append_bounded_fullscreen_stream(
@@ -8056,44 +8040,32 @@ fn clear_assistant_markdown_preview(
     Ok(true)
 }
 
-fn rendered_markdown_rows(lines: &[RenderedLine], columns: usize) -> usize {
-    let columns = columns.max(1);
-    lines
-        .iter()
-        .map(|line| {
-            MESSAGE_GUTTER_WIDTH
-                .saturating_add(UnicodeWidthStr::width(line.plain.as_str()))
-                .max(1)
-                .div_ceil(columns)
-        })
-        .sum()
-}
-
-fn bounded_markdown_preview(
-    lines: &[RenderedLine],
-    columns: usize,
-    max_rows: usize,
-) -> Option<Vec<RenderedLine>> {
-    let columns = columns.max(1);
-    let max_rows = max_rows.max(1);
-    if rendered_markdown_rows(lines, columns) <= max_rows {
-        return None;
+fn write_assistant_stream_delta(
+    out: &mut impl Write,
+    assistant_open: &mut bool,
+    at_line_start: &mut bool,
+    delta: &str,
+) -> io::Result<()> {
+    if delta.is_empty() {
+        return Ok(());
     }
-    let take = lines.len().min(max_rows);
-    let omitted = lines.len().saturating_sub(take);
-    let mut preview = lines[omitted..].to_vec();
-    for (index, line) in preview.iter_mut().enumerate() {
-        let limit = columns.saturating_sub(MESSAGE_GUTTER_WIDTH).max(1);
-        if index == 0 && omitted > 0 {
-            line.plain = format!("… {}", line.plain);
+    for segment in delta.split_inclusive('\n') {
+        if !*assistant_open {
+            queue!(out, Print(message_gutter(assistant_bullet())))?;
+            *assistant_open = true;
+            *at_line_start = false;
+        } else if *at_line_start {
+            queue!(out, Print("  "))?;
+            *at_line_start = false;
         }
-        if UnicodeWidthStr::width(line.plain.as_str()) > limit || (index == 0 && omitted > 0) {
-            line.plain = visible_tail_line(&line.plain, limit);
-            line.styles.clear();
-            line.links.clear();
+        if let Some(text) = segment.strip_suffix('\n') {
+            queue!(out, Print(text), Print(RAW_LINE_END))?;
+            *at_line_start = true;
+        } else {
+            queue!(out, Print(segment))?;
         }
     }
-    Some(preview)
+    Ok(())
 }
 
 fn write_assistant_markdown_lines_at(
@@ -8302,31 +8274,6 @@ fn visible_line(value: &str, limit: usize) -> String {
         width = width.saturating_add(grapheme_width);
     }
     output.push('…');
-    output
-}
-
-fn visible_tail_line(value: &str, limit: usize) -> String {
-    let value = sanitize_inline(value);
-    if UnicodeWidthStr::width(value.as_str()) <= limit {
-        return value;
-    }
-    if limit == 0 {
-        return String::new();
-    }
-    let mut graphemes = Vec::new();
-    let mut width = 0usize;
-    for grapheme in value.graphemes(true).rev() {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if width.saturating_add(grapheme_width).saturating_add(1) > limit {
-            break;
-        }
-        graphemes.push(grapheme);
-        width = width.saturating_add(grapheme_width);
-    }
-    let mut output = String::from("…");
-    for grapheme in graphemes.into_iter().rev() {
-        output.push_str(grapheme);
-    }
     output
 }
 
@@ -8977,9 +8924,7 @@ mod tests {
     #[test]
     fn long_status_is_bounded() {
         assert_eq!(visible_line("abcdefgh", 5), "abcd…");
-        assert_eq!(visible_tail_line("abcdefgh", 5), "…efgh");
         assert_eq!(visible_line("你好世界", 5), "你好…");
-        assert_eq!(visible_tail_line("你好世界", 5), "…世界");
         assert_eq!(single_line("a\n b\t c", 20), "a b c");
         assert_eq!(visible_around_cursor("abcdefgh", 7, 5), ("defgh".into(), 4));
         assert_eq!(sanitize_inline("safe\u{1b}[2Jtext"), "safe�[2Jtext");
@@ -9006,33 +8951,49 @@ mod tests {
     }
 
     #[test]
-    fn growing_markdown_preview_is_bounded_to_visible_terminal_rows() {
-        let short = vec![RenderedLine {
-            plain: "live".to_owned(),
-            ..RenderedLine::default()
-        }];
-        assert!(bounded_markdown_preview(&short, 20, 4).is_none());
+    fn inline_stream_deltas_append_once_without_prefix_redraws() {
+        let mut output = Vec::new();
+        let mut assistant_open = false;
+        let mut at_line_start = true;
+        write_assistant_stream_delta(
+            &mut output,
+            &mut assistant_open,
+            &mut at_line_start,
+            "本机走了",
+        )
+        .unwrap();
+        write_assistant_stream_delta(
+            &mut output,
+            &mut assistant_open,
+            &mut at_line_start,
+            " VPN\n继续",
+        )
+        .unwrap();
+        write_assistant_stream_delta(&mut output, &mut assistant_open, &mut at_line_start, "检查")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "{}本机走了 VPN{RAW_LINE_END}  继续检查",
+                message_gutter(assistant_bullet())
+            )
+        );
+        assert!(!at_line_start);
+    }
 
-        let long = vec![RenderedLine {
-            plain: "abcdefghijklmnopqrstuvwxyz".to_owned(),
-            ..RenderedLine::default()
-        }];
-        let preview = bounded_markdown_preview(&long, 8, 2).unwrap();
-        assert_eq!(preview.len(), 1);
-        assert!(preview[0].plain.ends_with("wxyz"));
-        assert!(rendered_markdown_rows(&preview, 8) <= 2);
-
-        let many = (0..10)
-            .map(|index| RenderedLine {
-                plain: format!("line {index}"),
-                ..RenderedLine::default()
-            })
-            .collect::<Vec<_>>();
-        let preview = bounded_markdown_preview(&many, 20, 3).unwrap();
-        assert_eq!(preview.len(), 3);
-        assert!(preview[0].plain.starts_with('…'));
-        assert!(preview[2].plain.ends_with('9'));
-        assert!(rendered_markdown_rows(&preview, 20) <= 3);
+    #[test]
+    fn inline_stream_delta_is_not_truncated_by_fullscreen_cache_limit() {
+        let mut output = Vec::new();
+        let mut assistant_open = false;
+        let mut at_line_start = true;
+        let delta = format!("{}TAIL", "x".repeat(MAX_FULLSCREEN_STREAM_BYTES + 1));
+        write_assistant_stream_delta(&mut output, &mut assistant_open, &mut at_line_start, &delta)
+            .unwrap();
+        assert!(output.ends_with(b"TAIL"));
+        assert_eq!(
+            output.len(),
+            message_gutter(assistant_bullet()).len() + delta.len()
+        );
     }
 
     #[test]

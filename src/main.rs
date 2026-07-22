@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
@@ -603,6 +603,7 @@ fn bootstrap() -> Result<()> {
     if let Some(chat_tokens_field) = cli.chat_tokens_field {
         endpoint.chat_tokens_field = chat_tokens_field;
     }
+    let model_routes = settings.model_endpoint_routes()?;
     // SAFETY: bootstrap is still single-threaded. Keep endpoint credentials only in memory so
     // subprocess tools cannot inherit them after the runtime starts.
     unsafe {
@@ -616,7 +617,7 @@ fn bootstrap() -> Result<()> {
         .enable_all()
         .build()
         .context("无法创建 async runtime")?;
-    runtime.block_on(run(cli, cwd, settings, endpoint))
+    runtime.block_on(run(cli, cwd, settings, endpoint, model_routes))
 }
 
 fn bootstrap_mcp_serve(args: McpServeArgs) -> Result<()> {
@@ -648,6 +649,7 @@ async fn run(
     cwd: PathBuf,
     mut settings: Settings,
     endpoint: EndpointConfig,
+    model_routes: HashMap<String, EndpointConfig>,
 ) -> Result<()> {
     validate_cli_modes(&cli)?;
     let session_state_root = cli
@@ -1011,6 +1013,7 @@ async fn run(
             control_handle.clone(),
         );
         let client = ModelClient::new(endpoint)?;
+        client.set_model_routes(model_routes)?;
         for failure in tool_context.start_always_plugin_monitors().await {
             if cli.debug {
                 eprintln!("[debug] plugin monitor was not started: {failure}");
